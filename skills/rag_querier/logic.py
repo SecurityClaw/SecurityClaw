@@ -62,7 +62,7 @@ def run(context: dict) -> dict:
     raw_logs = []
     search_terms_used = []
     try:
-        raw_logs, search_terms_used = _search_raw_logs(user_question, db, logs_index, cfg)
+        raw_logs, search_terms_used = _search_raw_logs(user_question, db, logs_index, llm)
         logger.info(
             "[%s] Found %d matching records in logs (search terms: %s).",
             SKILL_NAME, len(raw_logs), search_terms_used
@@ -118,17 +118,18 @@ def run(context: dict) -> dict:
     }
 
 
-def _search_raw_logs(question: str, db: Any, logs_index: str, cfg: Any) -> tuple[list[dict], list[str]]:
+def _search_raw_logs(question: str, db: Any, logs_index: str, llm: Any = None) -> tuple[list[dict], list[str]]:
     """
     Search raw logs for data matching the user question.
-    SCHEMA-AGNOSTIC: Uses field mappings from config to adapt to any data format.
+    DATA-AGNOSTIC: Tries field names from RAG schema observations or falls back to common formats.
     
     Returns (logs, search_terms_used) tuple so caller knows what was searched.
-    Supports any log format: Suricata EVE, ECS, Zeek, NetFlow, etc.
-    Field mapping defined in config.yaml under db.field_mappings
     
     Intelligently extracts keywords from the question and searches,
     including geographic, temporal, and pattern-based queries.
+    
+    Supports any log format by trying common field names from multiple formats
+    (Suricata EVE, ECS, Zeek, NetFlow, etc.)
     """
     # Extract potential search terms from the question
     search_terms = _extract_search_terms(question)
@@ -136,22 +137,8 @@ def _search_raw_logs(question: str, db: Any, logs_index: str, cfg: Any) -> tuple
     if not search_terms:
         return [], []
     
-    # Get field mappings for the configured schema
-    logs_schema = cfg.get("db", "logs_schema", default="suricata")
-    field_mappings = cfg.get("db", "field_mappings", default={})
-    schema_fields = field_mappings.get(logs_schema, field_mappings.get("suricata", {}))
-    
-    if not schema_fields:
-        logger.warning(
-            "[%s] No field mappings found for schema '%s'; skipping log search",
-            SKILL_NAME, logs_schema
-        )
-        return [], []
-    
-    # Helper to get the actual field name for a logical concept
-    def get_field(logical_name: str) -> str:
-        """Resolve logical field name to actual field name based on schema."""
-        return schema_fields.get(logical_name, logical_name)
+    # TODO: Query RAG for schema observations to determine actual field names
+    # For now, use multi-format fallback approach
     
     import re as _re
     ip_pattern = r'^(?:\d{1,3}\.){3}\d{1,3}$'
@@ -166,57 +153,55 @@ def _search_raw_logs(question: str, db: Any, logs_index: str, cfg: Any) -> tuple
         'uae', 'saudi arabia', 'iran', 'iraq', 'afghanistan', 'pakistan',
     }
 
-    # Get actual field names from schema mapping
-    src_ip_field = get_field("source_ip")
-    dst_ip_field = get_field("destination_ip")
-    src_port_field = get_field("source_port")
-    dst_port_field = get_field("destination_port")
-    proto_field = get_field("protocol")
-    app_proto_field = get_field("application_protocol")
-    country_field = get_field("country_name")
-    timestamp_field = get_field("timestamp")
-
-    # Build a broad should query using schema-mapped field names
+    # Build should_clauses with multiple field format attempts
+    # This allows search to work regardless of whether data is in Suricata/ECS/Zeek format
     should_clauses = []
 
     for term in search_terms:
         if _re.match(ip_pattern, term):
-            # IP addresses — use mapped field names
-            should_clauses += [
-                {"term": {dst_ip_field: term}},
-                {"term": {src_ip_field: term}},
-                {"term": {f"{dst_ip_field}.keyword": term}},
-                {"term": {f"{src_ip_field}.keyword": term}},
-            ]
+            # IP addresses — try all common field name formats
+            for src_field in ["src_ip", "source.ip", "id.orig_h"]:
+                for dst_field in ["dest_ip", "destination.ip", "id.resp_h"]:
+                    should_clauses += [
+                        {"term": {dst_field: term}},
+                        {"term": {src_field: term}},
+                        {"term": {f"{dst_field}.keyword": term}},
+                        {"term": {f"{src_field}.keyword": term}},
+                    ]
         elif _re.match(port_pattern, term):
-            # Port numbers — use mapped field names
+            # Port numbers — try all common field name formats
             try:
                 port_int = int(term)
-                should_clauses += [
-                    {"term": {dst_port_field: port_int}},
-                    {"term": {src_port_field: port_int}},
-                ]
+                for src_port in ["src_port", "source.port", "id.orig_p"]:
+                    for dst_port in ["dest_port", "destination.port", "id.resp_p"]:
+                        should_clauses += [
+                            {"term": {dst_port: port_int}},
+                            {"term": {src_port: port_int}},
+                        ]
             except ValueError:
                 pass
         elif term.lower() in protocol_names:
-            # Protocols — use mapped field name (may be 'TCP', 'tcp', 'proto', etc.)
-            should_clauses += [
-                {"term": {proto_field: term.upper()}},
-                {"term": {f"{proto_field}.keyword": term.upper()}},
-                {"match": {proto_field: term.lower()}},
-            ]
+            # Protocols — try common field names (TCP/tcp, proto, etc.)
+            for proto_field in ["proto", "protocol", "network.protocol", "service"]:
+                should_clauses += [
+                    {"term": {proto_field: term.upper()}},
+                    {"term": {f"{proto_field}.keyword": term.upper()}},
+                    {"match": {proto_field: term.lower()}},
+                ]
         elif term.lower() in country_names:
-            # Geographic queries — use mapped country field
-            should_clauses += [
-                {"term": {f"{country_field}.keyword": term.capitalize() if len(term) > 3 else term.upper()}},
-                {"match": {country_field: {"query": term}}},
-            ]
+            # Geographic queries — try common GeoIP field names
+            for country_field in ["geoip.country_name", "destination.geo.country_name", "source.geo.country_name"]:
+                should_clauses += [
+                    {"term": {f"{country_field}.keyword": term.capitalize() if len(term) > 3 else term.upper()}},
+                    {"match": {country_field: {"query": term}}},
+                ]
         else:
-            # Hostnames, domains, other strings — full-text match on app protocol
-            should_clauses += [
-                {"match": {app_proto_field: {"query": term}}},
-                {"wildcard": {f"{app_proto_field}.keyword": {"value": f"*{term}*"}}},
-            ]
+            # Hostnames, domains, other strings — try common app protocol fields
+            for app_field in ["app_proto", "network.application", "service", "application_protocol"]:
+                should_clauses += [
+                    {"match": {app_field: {"query": term}}},
+                    {"wildcard": {f"{app_field}.keyword": {"value": f"*{term}*"}}},
+                ]
 
     if not should_clauses:
         return [], []
@@ -228,7 +213,7 @@ def _search_raw_logs(question: str, db: Any, logs_index: str, cfg: Any) -> tuple
                 "minimum_should_match": 1,
                 "filter": {
                     "range": {
-                        timestamp_field: {"gte": "now-90d"}  # Broader window for testing/demo data
+                        "@timestamp": {"gte": "now-90d"}  # Broader window for testing/demo data
                     }
                 },
             }
@@ -237,8 +222,8 @@ def _search_raw_logs(question: str, db: Any, logs_index: str, cfg: Any) -> tuple
     }
     
     logger.info(
-        "[%s] Using schema '%s' with fields: src=%s, dst=%s, proto=%s, country=%s",
-        SKILL_NAME, logs_schema, src_ip_field, dst_ip_field, proto_field, country_field
+        "[%s] DATA-AGNOSTIC search: trying multiple field formats for terms: %s",
+        SKILL_NAME, search_terms
     )
     
     try:

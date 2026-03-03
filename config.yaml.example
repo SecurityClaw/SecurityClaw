@@ -1,0 +1,37 @@
+agent:
+  name: SecurityClaw
+  version: 1.0.0
+  situation_file: SITUATION.md
+  skills_dir: skills
+  log_level: INFO
+scheduler:
+  heartbeat_interval_seconds: 60
+  memory_build_interval_hours: 6
+db:
+  provider: opensearch
+  host: 192.168.0.17
+  port: 9200
+  index_prefix: securityclaw
+  vector_index: securityclaw-vectors
+  anomaly_index: securityclaw-anomalies
+  logs_index: logstash*
+  use_ssl: true
+  verify_certs: false
+  # Credentials loaded from .env: DB_USERNAME, DB_PASSWORD
+llm:
+  provider: ollama
+  ollama_base_url: http://localhost:11434
+  ollama_model: qwen2.5:7b-instruct-q4_K_M
+  ollama_embed_model: tinyllama
+  openai_model: gpt-4o
+  # API key loaded from .env: OPENAI_API_KEY
+  temperature: 0.2
+  max_tokens: 2048
+rag:
+  embedding_model: all-MiniLM-L6-v2
+  top_k: 5
+  similarity_threshold: 0.65
+anomaly:
+  poll_interval_seconds: 60
+  severity_threshold: 0.7
+  max_findings_per_poll: 50

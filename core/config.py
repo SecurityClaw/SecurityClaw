@@ -43,12 +43,14 @@ class Config:
         with open(_CONFIG_PATH) as f:
             self._data = yaml.safe_load(f)
 
-        # Env overrides
+        # Env overrides (credentials from .env)
         env_overrides: dict = {}
-        if os.getenv("OPENSEARCH_USERNAME"):
-            env_overrides.setdefault("db", {})["username"] = os.getenv("OPENSEARCH_USERNAME")
-        if os.getenv("OPENSEARCH_PASSWORD"):
-            env_overrides.setdefault("db", {})["password"] = os.getenv("OPENSEARCH_PASSWORD")
+        if os.getenv("DB_USERNAME"):
+            env_overrides.setdefault("db", {})["username"] = os.getenv("DB_USERNAME")
+        if os.getenv("DB_PASSWORD"):
+            env_overrides.setdefault("db", {})["password"] = os.getenv("DB_PASSWORD")
+        if os.getenv("OPENAI_API_KEY"):
+            env_overrides.setdefault("llm", {})["openai_api_key"] = os.getenv("OPENAI_API_KEY")
         if os.getenv("OLLAMA_BASE_URL"):
             env_overrides.setdefault("llm", {})["ollama_base_url"] = os.getenv("OLLAMA_BASE_URL")
 

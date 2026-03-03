@@ -151,7 +151,7 @@ def onboard():
         os.environ["OPENAI_API_KEY"] = openai_key
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Phase 3: Write Configuration
+    # Phase 3: Write Configuration & Create Initial Files
     # ──────────────────────────────────────────────────────────────────────────
     console.print("[bold green]Step 3: Saving Configuration[/]\n")
     _write_config(
@@ -159,6 +159,9 @@ def onboard():
         logs_index, anomaly_index, vector_index,
         llm_provider, llm_config
     )
+
+    # Create SITUATION.md if it doesn't exist
+    _create_situation_file()
 
     console.print("[green bold]✓ Configuration complete![/]")
     console.print("\n[cyan]You can now run:[/]")
@@ -404,7 +407,7 @@ def _write_config(
     llm_provider: str,
     llm_config: dict,
 ) -> None:
-    """Update config.yaml and .env with user settings."""
+    """Update config.yaml and .env with user settings(Credentials only in .env)."""
     config_path = Path(__file__).parent / "config.yaml"
     env_path = Path(__file__).parent / ".env"
 
@@ -412,14 +415,12 @@ def _write_config(
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
-    # Update DB section
+    # Update DB section (NO credentials in config — only in .env)
     config["db"]["provider"] = db_provider
     config["db"]["host"] = db_host
     config["db"]["port"] = int(db_port)
     config["db"]["use_ssl"] = use_ssl
     config["db"]["verify_certs"] = verify_certs
-    config["db"]["username"] = db_user
-    config["db"]["password"] = db_pass
     config["db"]["logs_index"] = logs_index
     config["db"]["anomaly_index"] = anomaly_index
     config["db"]["vector_index"] = vector_index
@@ -435,21 +436,51 @@ def _write_config(
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
     console.print(f"  [dim]Written to {config_path.name}[/]")
 
-    # Write .env
+    # Write .env with credentials
     env_lines = []
     if db_user:
-        env_lines.append(f"OPENSEARCH_USERNAME={db_user}")
+        env_lines.append(f"DB_USERNAME={db_user}")
     if db_pass:
-        env_lines.append(f"OPENSEARCH_PASSWORD={db_pass}")
+        env_lines.append(f"DB_PASSWORD={db_pass}")
     if llm_provider == "openai" and "OPENAI_API_KEY" in os.environ:
         env_lines.append(f"OPENAI_API_KEY={os.environ['OPENAI_API_KEY']}")
 
     if env_lines:
         env_path.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
-        console.print(f"  [dim]Written to {env_path.name}[/]")
+        console.print(f"  [dim]Written to {env_path.name} (credentials)[/]")
 
     # Clear the Config singleton so it reloads on next use
     Config.reset()
+
+
+def _create_situation_file() -> None:
+    """Create SITUATION.md with initialization status if it doesn't exist."""
+    situation_path = Path(__file__).parent / "SITUATION.md"
+    
+    if situation_path.exists():
+        return  # Don't overwrite existing
+    
+    initial_situation = """# SecurityClaw Situation Report
+
+## Status
+Agent initialized and ready.
+
+## Current Focus
+- None (awaiting input)
+
+## Recent Findings
+- System online
+- RAG index ready
+- Baseline generation available
+
+## Notes
+- This file is automatically updated by the agent as it runs
+- Key findings and escalations tracked here
+- Regenerated on each major discovery or escalation
+"""
+    
+    situation_path.write_text(initial_situation, encoding="utf-8")
+    console.print(f"  [dim]Created {situation_path.name}[/]")
 
 
 if __name__ == "__main__":
