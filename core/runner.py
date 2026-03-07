@@ -33,20 +33,12 @@ class Runner:
         3. Build a context factory that injects shared services.
         4. Start the scheduler and enter a blocking loop.
         5. On SIGINT/SIGTERM, flush memory and shut down gracefully.
-    """
 
-    # Hard-coded fallback intervals (seconds) for known skills
-    # On-demand (interactive) skills set to None — never auto-scheduled.
-    DEFAULT_INTERVALS: dict[str, int] = {
-        "anomaly_watcher": 60,          # 1-minute heartbeat
-        "network_baseliner": 6 * 3600,  # 6-hour behavioral memory builder
-        "fields_baseliner": 3600,       # 1-hour field-schema cataloguer
-        "threat_analyst": 300,          # 5-minute analysis sweep
-        # Interactive query skills — no scheduled interval
-        "baseline_querier": None,
-        "fields_querier": None,
-        "opensearch_querier": None,
-    }
+    Skills declare their own scheduling via schedule_interval_seconds or
+    schedule_cron_expr in their instruction.md front-matter. The core
+    discovers this information at load time and has no hardcoded knowledge
+    of specific skill names.
+    """
 
     def __init__(
         self,
@@ -103,11 +95,15 @@ class Runner:
                     )
             else:
                 # Use interval-based scheduling
-                interval = (
-                    skill.schedule_interval_seconds
-                    or self.DEFAULT_INTERVALS.get(name)
-                    or self.cfg.get("scheduler", "heartbeat_interval_seconds", default=60)
-                )
+                # Skill provides its own interval; if not, use configurable default
+                if skill.schedule_interval_seconds is not None:
+                    interval = skill.schedule_interval_seconds
+                else:
+                    interval = self.cfg.get(
+                        "scheduler",
+                        "heartbeat_interval_seconds",
+                        default=60
+                    )
                 self.scheduler.register(
                     name=name,
                     fn=skill.run,
@@ -173,12 +169,10 @@ class Runner:
         for name, skill in self._skills.items():
             if skill.schedule_cron_expr:
                 schedule = f"cron: {skill.schedule_cron_expr}"
+            elif skill.schedule_interval_seconds is not None:
+                schedule = f"every {skill.schedule_interval_seconds}s"
             else:
-                interval = str(
-                    skill.schedule_interval_seconds
-                    or self.DEFAULT_INTERVALS.get(name, "?")
-                )
-                schedule = f"every {interval}s"
+                schedule = "manual (on-demand)"
             preview = (skill.instruction[:80] + "…") if len(skill.instruction) > 80 else skill.instruction
             table.add_row(name, schedule, preview.replace("\n", " "))
         console.print(table)
