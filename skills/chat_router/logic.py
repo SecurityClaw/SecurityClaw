@@ -434,12 +434,13 @@ def execute_skill_workflow(
             
             # ── CONTEXT ENRICHMENT: Pass previous results to this skill ──────
             # This allows skills to see what was discovered in prior steps.
-            if aggregated_results:
-                skill_context["previous_results"] = aggregated_results
+            combined_previous_results = {**aggregated_results, **results}
+            if combined_previous_results:
+                skill_context["previous_results"] = combined_previous_results
             
             # ── SPECIAL HANDLING: Enrich threat_analyst question with discovered entities ──
-            if skill_name == "threat_analyst" and aggregated_results:
-                entities = _extract_entities_from_previous_results(aggregated_results)
+            if skill_name == "threat_analyst" and combined_previous_results:
+                entities = _extract_entities_from_previous_results(combined_previous_results)
                 original_q = skill_context["parameters"].get("question", "")
                 if entities and (entities.get("ips") or entities.get("domains") or entities.get("countries")):
                     enriched_q = _build_context_aware_threat_question(original_q, entities)
@@ -1455,10 +1456,18 @@ def _format_opensearch_response(user_question: str, os_result: dict) -> str:
             ts_list.append(str(ts))
 
         # IPs
-        for v in (row.get("src_ip"), row.get("source", {}).get("ip") if isinstance(row.get("source"), dict) else None):
+        for v in (
+            row.get("src_ip"),
+            row.get("source.ip"),
+            row.get("source", {}).get("ip") if isinstance(row.get("source"), dict) else None,
+        ):
             if v:
                 ips.add(str(v))
-        for v in (row.get("dest_ip"), row.get("destination", {}).get("ip") if isinstance(row.get("destination"), dict) else None):
+        for v in (
+            row.get("dest_ip"),
+            row.get("destination.ip"),
+            row.get("destination", {}).get("ip") if isinstance(row.get("destination"), dict) else None,
+        ):
             if v:
                 ips.add(str(v))
 
@@ -1466,6 +1475,14 @@ def _format_opensearch_response(user_question: str, os_result: dict) -> str:
         geo = row.get("geoip") or {}
         if isinstance(geo, dict):
             cn = geo.get("country_name")
+            if cn:
+                countries_seen.add(str(cn))
+        for cn in (
+            row.get("geoip.country_name"),
+            row.get("country_name"),
+            row.get("source.geo.country_name"),
+            row.get("destination.geo.country_name"),
+        ):
             if cn:
                 countries_seen.add(str(cn))
 
@@ -1477,6 +1494,11 @@ def _format_opensearch_response(user_question: str, os_result: dict) -> str:
         filter_parts.append("port " + "/".join(str(p) for p in ports))
     if protocols:
         filter_parts.append("/".join(protocols))
+    if search_terms and not filter_parts:
+        shown_terms = "/".join(str(term) for term in search_terms[:3])
+        if len(search_terms) > 3:
+            shown_terms += "/…"
+        filter_parts.append(shown_terms)
     filter_desc = ", ".join(filter_parts) or "the query criteria"
 
     summary = f"Found {results_count} record(s) matching {filter_desc} in the {time_range} window."

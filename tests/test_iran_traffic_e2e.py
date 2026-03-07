@@ -173,6 +173,35 @@ class TestFormatOpenSearchResponse:
         # Should mention the Iranian IP
         assert "62.60.131.168" in result, f"Should include source IP, got: {result}"
 
+    def test_formats_flat_geoip_country_fields(self):
+        from skills.chat_router.logic import _format_opensearch_response
+
+        flat_result = {
+            "status": "ok",
+            "results_count": 1,
+            "results": [
+                {
+                    "@timestamp": "2026-02-13T10:22:10.224Z",
+                    "source.ip": "62.60.131.168",
+                    "destination.ip": "192.168.0.16",
+                    "geoip.country_name": "Iran",
+                }
+            ],
+            "countries": [],
+            "ports": [],
+            "protocols": [],
+            "time_range": "now-30d",
+            "search_terms": ["62.60.131.168"],
+        }
+
+        result = _format_opensearch_response(
+            "What countries are these IPs from?",
+            flat_result,
+        )
+
+        assert "Iran" in result, f"Should include flat geoip country fields, got: {result}"
+        assert "62.60.131.168" in result, f"Should include flat source IP, got: {result}"
+
     def test_empty_results_says_no_records(self):
         from skills.chat_router.logic import _format_opensearch_response
 

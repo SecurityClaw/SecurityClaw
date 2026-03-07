@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 INSTRUCTION_PATH = Path(__file__).parent / "instruction.md"
 SKILL_NAME = "opensearch_querier"
+_IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
 
 def _extract_json_from_response(response: str) -> dict | None:
@@ -55,6 +56,121 @@ def _extract_json_from_response(response: str) -> dict | None:
             continue
     
     return None
+
+
+def _extract_ips_from_text(text: str) -> list[str]:
+    """Extract unique IPv4 addresses from free text while preserving order."""
+    if not text:
+        return []
+
+    seen: set[str] = set()
+    ips: list[str] = []
+    for ip in _IP_PATTERN.findall(str(text)):
+        if ip not in seen:
+            seen.add(ip)
+            ips.append(ip)
+    return ips
+
+
+def _extract_ips_from_previous_results(previous_results: dict) -> list[str]:
+    """Extract IPs from previous skill results for follow-up questions."""
+    if not previous_results:
+        return []
+
+    seen: set[str] = set()
+    ips: list[str] = []
+    field_candidates = (
+        "src_ip",
+        "dest_ip",
+        "source.ip",
+        "destination.ip",
+        "source_ip",
+        "destination_ip",
+        "ip",
+    )
+
+    for skill_result in previous_results.values():
+        if not isinstance(skill_result, dict):
+            continue
+
+        for record in skill_result.get("results", []) or []:
+            if not isinstance(record, dict):
+                continue
+
+            for field in field_candidates:
+                value = record.get(field)
+                if isinstance(value, str) and value not in seen and _IP_PATTERN.fullmatch(value):
+                    seen.add(value)
+                    ips.append(value)
+
+            for value in (
+                record.get("source", {}).get("ip") if isinstance(record.get("source"), dict) else None,
+                record.get("destination", {}).get("ip") if isinstance(record.get("destination"), dict) else None,
+            ):
+                if isinstance(value, str) and value not in seen and _IP_PATTERN.fullmatch(value):
+                    seen.add(value)
+                    ips.append(value)
+
+    return ips
+
+
+def _question_asks_for_ip_geolocation(question: str) -> bool:
+    """Return True for follow-ups asking where referenced IPs are from."""
+    q = str(question or "").lower()
+    has_geo_intent = any(token in q for token in ("country", "countries", "origin", "where are", "where is", "from which country"))
+    refers_to_prior_ips = "these ip" in q or "those ip" in q or "the ip" in q or "their country" in q
+    return has_geo_intent and refers_to_prior_ips
+
+
+def _recover_followup_plan_from_context(
+    question: str,
+    query_plan: dict,
+    previous_results: dict,
+    conversation_history: list[dict],
+) -> dict:
+    """
+    Recover concrete IP criteria for follow-up country/origin questions.
+
+    Example:
+      - Prior answer listed IPs from an alert search
+      - User asks: "What countries are these IPs from?"
+      - LLM may return no search_terms because the current turn has only pronouns
+    """
+    plan = dict(query_plan or {})
+    if plan.get("search_terms") or plan.get("countries") or plan.get("ports") or plan.get("protocols"):
+        return plan
+
+    if not _question_asks_for_ip_geolocation(question):
+        return plan
+
+    candidate_ips = _extract_ips_from_previous_results(previous_results)
+    if not candidate_ips:
+        for message in reversed(conversation_history or []):
+            content = message.get("content", "") if isinstance(message, dict) else ""
+            extracted = _extract_ips_from_text(content)
+            for ip in extracted:
+                if ip not in candidate_ips:
+                    candidate_ips.append(ip)
+            if candidate_ips:
+                break
+
+    if not candidate_ips:
+        return plan
+
+    recovered_ips = candidate_ips[:12]
+    reasoning_prefix = (plan.get("reasoning") or "").strip()
+    recovery_reason = f"Recovered {len(recovered_ips)} IP(s) from prior context for geographic follow-up lookup."
+
+    plan["search_type"] = "ip"
+    plan["search_terms"] = recovered_ips
+    plan["countries"] = []
+    plan["ports"] = plan.get("ports", []) if isinstance(plan.get("ports"), list) else []
+    plan["protocols"] = plan.get("protocols", []) if isinstance(plan.get("protocols"), list) else []
+    plan["matching_strategy"] = "term"
+    plan["time_range"] = plan.get("time_range") or "now-90d"
+    plan["field_analysis"] = "Using contextual IP addresses from previous results/history because the current question is a referential follow-up."
+    plan["reasoning"] = f"{reasoning_prefix} {recovery_reason}".strip()
+    return plan
 
 
 def _execute_search_with_llm_repair(db: Any, llm: Any, index: str, query: dict, size: int = None) -> list[dict]:
@@ -180,6 +296,12 @@ def run(context: dict) -> dict:
     
     query_plan = _plan_opensearch_query_with_llm(
         question, conversation_history, field_mappings, llm
+    )
+    query_plan = _recover_followup_plan_from_context(
+        question,
+        query_plan,
+        previous_results,
+        conversation_history,
     )
     
     if not query_plan or query_plan.get("skip_search"):

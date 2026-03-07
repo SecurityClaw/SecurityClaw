@@ -73,6 +73,41 @@ def test_execute_skill_workflow_auto_chains_threat_analyst():
     assert "1194" in threat_question
 
 
+def test_execute_skill_workflow_passes_same_step_results_to_later_skills():
+    class _SequentialRunner:
+        def __init__(self):
+            self.contexts: dict[str, dict] = {}
+
+        def _build_context(self):
+            return {}
+
+        def dispatch(self, skill_name: str, context: dict):
+            self.contexts[skill_name] = context
+            if skill_name == "fields_querier":
+                return {
+                    "status": "ok",
+                    "field_mappings": {"country_fields": ["geoip.country_name"]},
+                }
+            if skill_name == "opensearch_querier":
+                return {"status": "ok", "results": [], "results_count": 0}
+            return {"status": "ok"}
+
+    runner = _SequentialRunner()
+    routing_decision = {"parameters": {"question": "What countries are these IPs from?"}}
+
+    execute_skill_workflow(
+        ["fields_querier", "opensearch_querier"],
+        runner,
+        {},
+        routing_decision,
+        conversation_history=[{"role": "assistant", "content": "IPs: 1.2.3.4"}],
+    )
+
+    previous_results = runner.contexts["opensearch_querier"].get("previous_results", {})
+    assert "fields_querier" in previous_results
+    assert previous_results["fields_querier"]["field_mappings"]["country_fields"] == ["geoip.country_name"]
+
+
 def test_format_response_forensic_is_detailed_and_multi_paragraph():
     routing = {"skills": ["forensic_examiner"]}
     skill_results = {
