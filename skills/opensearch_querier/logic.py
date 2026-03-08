@@ -395,7 +395,7 @@ def _execute_search_with_llm_repair(db: Any, llm: Any, index: str, query: dict, 
     Retries up to 3 times with progressively detailed prompts.
     """
     if size is None:
-        size = query.get("size", 50)
+        size = query.get("size", 200)
     
     try:
         logger.debug("[%s] Executing search query on index: %s", SKILL_NAME, index)
@@ -551,7 +551,7 @@ def run(context: dict) -> dict:
         field_mappings=field_mappings,
         matching_strategy=matching_strategy,
     )
-    query["size"] = parameters.get("size", 50)
+    query["size"] = parameters.get("size", 200)
 
     logger.debug("[%s] Built query: %s", SKILL_NAME, str(query)[:500])
     logger.info(
@@ -623,7 +623,7 @@ def run(context: dict) -> dict:
                     field_mappings=field_mappings,
                     matching_strategy=recovery_strategy,
                 )
-                recovery_query["size"] = parameters.get("size", 50)
+                recovery_query["size"] = parameters.get("size", 200)
                 
                 recovery_results = _execute_search_with_llm_repair(db, llm, index, recovery_query)
                 
@@ -677,7 +677,7 @@ def run(context: dict) -> dict:
                     matching_strategy=recovery_strategy,
                 )
                 if recovery_query:
-                    recovery_query["size"] = parameters.get("size", 50)
+                    recovery_query["size"] = parameters.get("size", 200)
                     results = _execute_search_with_llm_repair(db, llm, index, recovery_query)
                     if results:
                         logger.info("[%s] Recovery successful: got %d results after strategy switch", 
@@ -696,7 +696,7 @@ def run(context: dict) -> dict:
                     relaxed=True,
                 )
                 if recovery:
-                    recovery["size"] = parameters.get("size", 50)
+                    recovery["size"] = parameters.get("size", 200)
                     results = _execute_search_with_llm_repair(db, llm, index, recovery)
                     if results:
                         logger.info("[%s] Relaxed recovery succeeded: got %d results", SKILL_NAME, len(results))
@@ -1196,7 +1196,7 @@ def _execute_explicit_query(context: dict, index: str) -> dict:
     parameters = context.get("parameters", {})
     
     query_type = parameters.get("query_type", "keyword_search")
-    size = parameters.get("size", 100)
+    size = parameters.get("size", 200)
     field_mappings = discover_field_mappings(db, llm)
     
     logger.info(

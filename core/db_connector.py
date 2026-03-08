@@ -73,7 +73,7 @@ class BaseDBConnector(ABC):
         self,
         detector_id: str,
         from_epoch_ms: Optional[int] = None,
-        size: int = 50,
+        size: int = 200,
     ) -> list[dict]:
         """Return anomaly detection findings from the DB."""
 
@@ -226,7 +226,7 @@ class OpenSearchConnector(BaseDBConnector):
         self,
         detector_id: str,
         from_epoch_ms: Optional[int] = None,
-        size: int = 50,
+        size: int = 200,
     ) -> list[dict]:
         """
         Query anomaly detection findings.

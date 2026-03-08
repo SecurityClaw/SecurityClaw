@@ -379,7 +379,7 @@ class IntelligentQueryRepair:
         self.memory = get_memory()
         self.max_retries = 10  # Increased to 10 for more resilient repair
     
-    def repair_and_retry(self, index: str, query: dict, size: int = 50) -> Tuple[bool, Optional[list], str]:
+    def repair_and_retry(self, index: str, query: dict, size: int = 200) -> Tuple[bool, Optional[list], str]:
         """
         Repair a query and retry execution.
         
