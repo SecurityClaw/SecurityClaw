@@ -1526,7 +1526,7 @@ def _append_threat_intel_summary(base_response: str, threat_result: dict) -> str
     if not verdicts:
         return base_response
 
-    per_verdict_limit = 320 if len(verdicts) == 1 else 220
+    per_verdict_limit = 600 if len(verdicts) == 1 else 350
 
     summary_parts = []
     for verdict in verdicts[:3]:
