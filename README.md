@@ -36,7 +36,7 @@ A modular, skill-based autonomous Security Operations Center (SOC) agent that mo
 The current example configuration in [config.yaml.example](config.yaml.example) uses:
 
 - `qwen2.5:7b-instruct-q4_K_M` for chat/reasoning
-- `tinyllama` as the lightweight local auxiliary model currently referenced by the sample config
+- `nomic-embed-text:latest` as the lightweight local auxiliary model for embeddings referenced by the sample config
 
 Quick setup:
 
@@ -291,7 +291,7 @@ llm:
   provider: ollama              # or: openai
   ollama_base_url: http://localhost:11434
   ollama_model: qwen2.5:7b-instruct-q4_K_M
-  ollama_embed_model: tinyllama
+  ollama_embed_model: nomic-embed-text:latest
   # or:
   # openai_model: gpt-4o
   # openai_api_key_env: OPENAI_API_KEY
@@ -622,7 +622,7 @@ Respond in JSON format with:
 
 **"Cannot connect to Ollama"**
 - Start Ollama: `ollama serve`
-- Pull the sample models: `ollama pull qwen2.5:7b-instruct-q4_K_M && ollama pull tinyllama`
+- Pull the sample models: `ollama pull qwen2.5:7b-instruct-q4_K_M && ollama pull nomic-embed-text:latest`
 - Verify base URL in config.yaml
 
 **"Skill not loading"**

@@ -34,13 +34,13 @@ The interactive configuration wizard guides you through setting up SecurityClaw 
 The current example config uses these local Ollama models:
 
 - `qwen2.5:7b-instruct-q4_K_M`
-- `tinyllama`
+- `nomic-embed-text:latest`
 
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
 ollama serve
 ollama pull qwen2.5:7b-instruct-q4_K_M
-ollama pull tinyllama
+ollama pull nomic-embed-text:latest
 ```
 
 This launches an interactive CLI that will ask you about:
@@ -181,7 +181,7 @@ llm:
   provider: ollama                  # or: openai
   ollama_base_url: http://localhost:11434
   ollama_model: qwen2.5:7b-instruct-q4_K_M
-  ollama_embed_model: tinyllama
+  ollama_embed_model: nomic-embed-text:latest
   # or:
   # openai_model: gpt-4o
   # openai_api_key_env: OPENAI_API_KEY
