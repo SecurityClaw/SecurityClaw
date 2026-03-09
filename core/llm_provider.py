@@ -7,7 +7,7 @@ Supports:
 
 Architecture:
   - Chat / generation  → ollama_model   (e.g. qwen2.5:7b)
-  - Embeddings         → ollama_embed_model (e.g. tinyllama) via a dedicated
+  - Embeddings         → ollama_embed_model (e.g. nomic-embed-text:latest) via a dedicated
                          Ollama request that does NOT share state with the
                          chat model, avoiding concurrency 400 errors.
 """

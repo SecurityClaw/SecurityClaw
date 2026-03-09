@@ -129,9 +129,9 @@ def onboard():
         ollama_model = Prompt.ask("Ollama chat model name", default="llama3")
         console.print(
             "[dim]The embed model is used exclusively for RAG vector embeddings (not for chat).\n"
-            "Use a small, fast model such as [italic]tinyllama[/italic] or [italic]nomic-embed-text[/italic].[/]"
+            "Use a small, fast model such as [italic]nomic-embed-text:latest[/italic].[/]"
         )
-        ollama_embed_model = Prompt.ask("Ollama embed model name", default="tinyllama")
+        ollama_embed_model = Prompt.ask("Ollama embed model name", default="nomic-embed-text:latest")
         llm_config = {
             "ollama_base_url": ollama_url,
             "ollama_model": ollama_model,
