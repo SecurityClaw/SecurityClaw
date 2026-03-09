@@ -81,12 +81,12 @@ PRIMARY ROUTING RULES (Use These First):
    Then use opensearch_querier with discovered field names.
 
 2. **DIRECT LOG SEARCH (known fields)**: Questions about "traffic from X", "connections to Y", 
-   "flows from Z", "logs matching X criteria" WHERE field names are known → opensearch_querier
-   Examples: "show me traffic from iran", "connections to russia on port 443", "logs from 192.168.0.x"
+    "flows from Z", "logs matching X criteria" WHERE explicit field names are already known → opensearch_querier
+    Examples: "show logs where source.ip=1.2.3.4", "filter destination.port=443", "search geoip.country_name for Iran"
    
 3. **TEMPORAL / LOCATION / PROTOCOL FILTERING**: "when did X happen", "in February", "on port 1194", 
-   "from country X" → opensearch_querier (direct query with filters)
-   Examples: "traffic from iran in the past 3 months", "connections on port 443 last week"
+    "from country X" in natural language → fields_querier FIRST, then opensearch_querier
+    Examples: "traffic from iran in the past 3 months", "connections on port 443 last week"
 
 4. **BASELINE ANALYSIS (follow-up research)**: After finding results, analyze normal/expected behavior → baseline_querier
    Use ONLY for follow-up research, not for initial question answering.
@@ -104,8 +104,8 @@ SECONDARY ROUTING RULES:
 - If asking for DEEPER ANALYSIS of found anomalies, use anomaly_triage or threat_analyst.
 - Skills can be chained if needed (e.g., opensearch_querier then threat_analyst).
 
-KEY PRIORITY: Use opensearch_querier FIRST for direct log search questions.
-Use fields_querier if you need to discover field names first.
+KEY PRIORITY: Use fields_querier FIRST for natural-language log search questions unless the user explicitly names exact fields.
+Use opensearch_querier directly only when field names are already known.
 Use baseline_querier ONLY for follow-up research/analysis after you have results.
 
 ALWAYS ANSWER WITH A JSON OBJECT (strictly, no markdown):
@@ -139,6 +139,12 @@ ALWAYS ANSWER WITH A JSON OBJECT (strictly, no markdown):
         
         # Prepend field discovery when asking about specific data types (alerts, signatures, etc.)
         result["skills"] = _prepend_field_discovery_for_data_types(
+            user_question=user_question,
+            selected_skills=result.get("skills", []),
+            available_skills=available_skills,
+            current_results={},
+        )
+        result["skills"] = _prefer_field_discovery_for_natural_language_search(
             user_question=user_question,
             selected_skills=result.get("skills", []),
             available_skills=available_skills,
@@ -259,6 +265,59 @@ def _prepend_field_discovery_for_data_types(
         return ordered
 
     return selected_skills
+
+
+def _prefer_field_discovery_for_natural_language_search(
+    user_question: str,
+    selected_skills: list[str],
+    available_skills: list[dict],
+    current_results: dict | None = None,
+) -> list[str]:
+    """Prepend fields_querier for natural-language searches unless explicit fields are named."""
+    available = {s.get("name") for s in available_skills}
+    if "fields_querier" not in available or "opensearch_querier" not in available:
+        return selected_skills
+
+    question_lower = user_question.lower().strip()
+    current_results = current_results or {}
+
+    asks_for_log_search = bool(
+        re.search(r"\b(traffic|flow|flows|connection|connections|log|logs|event|events|port|ports|protocol|country|countries|ip|ips|host|hosts)\b", question_lower)
+        and re.search(r"\b(show|find|search|check|list|get|what|which|when|who|where|display|pull|visited|visit|seen|look for)\b", question_lower)
+    )
+    explicit_field_reference = bool(
+        re.search(r"(?:^|\s)(@timestamp|[a-z_][a-z0-9_]*\.[a-z0-9_.]+)(?:\s|$|=|:)", user_question)
+        or re.search(
+            r"\b(src_ip|dest_ip|source_ip|destination_ip|src_port|dst_port|dest_port|destination_port|source\.ip|destination\.ip|destination\.port|geoip\.[a-z0-9_.]+|alert\.[a-z0-9_.]+)\b",
+            question_lower,
+        )
+    )
+
+    fields_result = current_results.get("fields_querier") or {}
+    field_discovery_already_done = bool(
+        isinstance(fields_result, dict)
+        and (
+            fields_result.get("field_mappings")
+            or (fields_result.get("findings") or {}).get("field_mappings")
+        )
+    )
+
+    if not asks_for_log_search or explicit_field_reference:
+        return selected_skills
+
+    if field_discovery_already_done:
+        ordered = [s for s in selected_skills if s != "fields_querier"]
+        if "opensearch_querier" not in ordered:
+            ordered.insert(0, "opensearch_querier")
+        return ordered
+
+    logger.info(
+        "[%s] Natural-language log search detected — prepending fields_querier before opensearch_querier",
+        SKILL_NAME,
+    )
+    ordered = ["fields_querier"] + [s for s in selected_skills if s not in {"fields_querier", "opensearch_querier"}]
+    ordered.insert(1, "opensearch_querier")
+    return ordered
 
 
 def _enforce_evidence_then_threat_intel(
@@ -529,6 +588,82 @@ def execute_skill_workflow(
     return results
 
 
+def _apply_result_aware_recovery(
+    user_question: str,
+    selected_skills: list[str],
+    available_skills: list[dict],
+    current_results: dict | None = None,
+) -> list[str]:
+    """Promote recovery skills when prior results show unmet needs."""
+    current_results = current_results or {}
+    available = {s.get("name") for s in available_skills}
+    ordered = list(selected_skills)
+    question_lower = user_question.lower()
+
+    os_result = current_results.get("opensearch_querier") or {}
+    os_issue = " ".join(
+        part for part in [
+            str(os_result.get("validation_issue", "")),
+            str((os_result.get("reasoning_chain") or {}).get("validation_issue", "")),
+            str((os_result.get("reasoning_chain") or {}).get("validation_reflection", "")),
+        ] if part
+    ).lower()
+    os_validation_failed = bool(os_result.get("validation_failed"))
+
+    asks_for_country = any(
+        token in question_lower
+        for token in ["country", "countries", "origin", "origins", "where from", "geolocation", "geoip"]
+    )
+    asks_for_reputation = any(
+        token in question_lower
+        for token in ["reputation", "threat intel", "threat intelligence", "risk", "malicious", "verdict", "score"]
+    )
+    missing_fields_or_schema = any(
+        token in os_issue
+        for token in [
+            "missing field",
+            "required fields",
+            "field information",
+            "country information",
+            "port information",
+            "do not contain the required fields",
+        ]
+    )
+
+    entities = _extract_entities_from_previous_results(current_results) if current_results else {}
+    has_ips = bool((entities or {}).get("ips"))
+
+    if os_validation_failed and missing_fields_or_schema:
+        if "fields_querier" in available and "fields_querier" not in current_results:
+            ordered = ["fields_querier"] + [s for s in ordered if s != "fields_querier"]
+            if "opensearch_querier" in available and "opensearch_querier" not in ordered:
+                ordered.append("opensearch_querier")
+            logger.info(
+                "[%s] Added fields_querier recovery after opensearch validation reported missing fields/schema",
+                SKILL_NAME,
+            )
+
+    if asks_for_country and has_ips:
+        if "geoip_lookup" in available and "geoip_lookup" not in ordered and "geoip_lookup" not in current_results:
+            ordered.append("geoip_lookup")
+            logger.info(
+                "[%s] Added geoip_lookup recovery because countries were requested and IPs are available",
+                SKILL_NAME,
+            )
+
+    if asks_for_reputation:
+        threat_result = current_results.get("threat_analyst") or {}
+        has_threat_intel = threat_result.get("status") == "ok"
+        if "threat_analyst" in available and not has_threat_intel and "threat_analyst" not in ordered:
+            ordered.append("threat_analyst")
+
+    deduped: list[str] = []
+    for skill in ordered:
+        if skill and skill not in deduped:
+            deduped.append(skill)
+    return deduped
+
+
 def orchestrate_with_supervisor(
     user_question: str,
     available_skills: list[dict],
@@ -587,6 +722,12 @@ def orchestrate_with_supervisor(
             available_skills=available_skills,
             current_results=aggregated_results,
         )
+        selected = _apply_result_aware_recovery(
+            user_question=user_question,
+            selected_skills=selected,
+            available_skills=available_skills,
+            current_results=aggregated_results,
+        )
         decision["skills"] = selected
 
         # ── Real-time callback: supervisor has decided ─────────────────────
@@ -594,11 +735,17 @@ def orchestrate_with_supervisor(
             step_callback("deciding", decision, step, max_steps)
 
         # Anti-repeat guard: if same skills chosen again and we already have
-        # results from them, stop wasting LLM calls and finalize.
+        # results from them, try a recovery plan and otherwise refuse duplicates.
         if selected and selected in previously_run_skills and aggregated_results:
             improved = _enforce_evidence_then_threat_intel(
                 user_question=user_question,
                 selected_skills=selected,
+                available_skills=available_skills,
+                current_results=aggregated_results,
+            )
+            improved = _apply_result_aware_recovery(
+                user_question=user_question,
+                selected_skills=improved,
                 available_skills=available_skills,
                 current_results=aggregated_results,
             )
@@ -611,14 +758,14 @@ def orchestrate_with_supervisor(
                 decision["skills"] = selected
             else:
                 logger.info(
-                    "[%s] Supervisor repeated identical skill set %s on step %d — forcing finalization",
+                    "[%s] Supervisor repeated identical skill set %s on step %d — blocking duplicate execution",
                     SKILL_NAME, selected, step,
                 )
                 last_eval = {
-                    "satisfied": True,
-                    "confidence": 0.7,
-                    "reasoning": "Supervisor repeated same skills with existing results — finalizing",
-                    "missing": [],
+                    "satisfied": False,
+                    "confidence": 0.4,
+                    "reasoning": "Supervisor proposed the same unsuccessful skills again; duplicate execution was blocked.",
+                    "missing": last_eval.get("missing", []) if isinstance(last_eval, dict) else [],
                 }
                 trace.append({
                     "step": step,
@@ -805,9 +952,10 @@ CRITICAL RULES:
 - **ALERT / SIGNATURE / EVENT QUERIES (ANY TYPE)**: If question asks about alerts, signals, events, signatures, Suricata/Snort rules, ET rules, or any alert data (e.g., "any alerts that are ET EXPLOIT?", "show me Suricata signatures", "top 10 alerts") — use fields_querier FIRST to discover available alert/signature fields, THEN opensearch_querier to search them.
 - **LOG SEARCH AFTER FIELD DISCOVERY**: Once fields_querier has discovered field names, use opensearch_querier to search logs with specific field criteria.
 - If the question asks ONLY about REPUTATION, THREAT INTEL, RISK, VULNERABILITY, or MALICIOUS ACTIVITY — use threat_analyst FIRST.
+- **CRITICAL**: After opensearch_querier finds evidence, if the question ASK for reputation/threat intel, immediately queue threat_analyst next.
 - If the user also asks for concrete alert/log evidence (IPs, timestamps, when it happened, which host triggered it), use opensearch_querier FIRST to gather evidence, THEN threat_analyst for enrichment.
 - If the user asks for field details/values (bytes, packets, fields) that require schema knowledge — use fields_querier FIRST to discover field names, THEN use opensearch_querier if needed.
-- If the answer is about traffic/logs from a country/IP/port, use opensearch_querier FIRST for direct search. Baseline_querier is for follow-up analysis ONLY, not initial answering.
+- If the answer is about traffic/logs from a country/IP/port in natural language, use fields_querier FIRST to identify the right schema, THEN opensearch_querier. Use opensearch_querier FIRST only when exact field names are already explicit.
 - After log search finds records, optionally enrich with threat_analyst for IP/domain reputation.
 - If the question references a previously found alert/signature and asks for details about that alert, do NOT skip opensearch_querier.
 - baseline_querier is reserved for follow-up research/analysis only. Do NOT use it to answer initial user questions.
@@ -838,12 +986,49 @@ CRITICAL RULES:
             available_skills=available_skills,
             current_results=current_results,
         )
+        parsed["skills"] = _prefer_field_discovery_for_natural_language_search(
+            user_question=user_question,
+            selected_skills=parsed.get("skills", []),
+            available_skills=available_skills,
+            current_results=current_results,
+        )
         parsed["skills"] = _enforce_evidence_then_threat_intel(
             user_question=user_question,
             selected_skills=parsed.get("skills", []),
             available_skills=available_skills,
             current_results=current_results,
         )
+        parsed["skills"] = _apply_result_aware_recovery(
+            user_question=user_question,
+            selected_skills=parsed.get("skills", []),
+            available_skills=available_skills,
+            current_results=current_results,
+        )
+        
+        # Additional rule: If opensearch_querier found results and question asks for reputation,
+        # auto-queue threat_analyst for next step
+        question_lower = user_question.lower()
+        asks_for_reputation = any(
+            term in question_lower
+            for term in ["reputation", "threat intel", "threat intelligence", "malicious", "risk", "dangerous", "score", "verdict"]
+        )
+        opensearch_has_results = bool(
+            current_results.get("opensearch_querier") and
+            current_results["opensearch_querier"].get("results_count", 0) > 0
+        )
+        has_threat_intel = bool(
+            current_results.get("threat_analyst") and
+            current_results["threat_analyst"].get("status") == "ok"
+        )
+        
+        if asks_for_reputation and opensearch_has_results and not has_threat_intel:
+            if "threat_analyst" in {s.get("name") for s in available_skills}:
+                if "threat_analyst" not in parsed.get("skills", []):
+                    parsed["skills"].append("threat_analyst")
+                    logger.info(
+                        "[%s] Auto-queueing threat_analyst: question asks for reputation and opensearch found results",
+                        SKILL_NAME
+                    )
         
         return parsed
     except Exception as exc:
@@ -865,8 +1050,8 @@ def _supervisor_evaluate_satisfaction(
     max_steps: int,
 ) -> dict:
     """Evaluate whether current aggregated results sufficiently answer the question."""
-    # ── FAST PATH: if any skill found records, treat as satisfied ──────────
-    # This prevents the supervisor from looping when data was clearly found.
+    # ── SMART FAST PATH: if records found, verify they answer the question ──
+    # Don't auto-satisfy if reputation/threat intel was asked but threat_analyst wasn't run
     total_records_found = 0
     for skill_name, result in skill_results.items():
         count = result.get("results_count") or result.get("log_records") or (
@@ -874,9 +1059,34 @@ def _supervisor_evaluate_satisfaction(
         )
         total_records_found += int(count or 0)
 
+    # Check if question asks for reputation/threat intelligence
+    question_lower = user_question.lower()
+    asks_for_reputation = any(
+        term in question_lower
+        for term in ["reputation", "threat", "malicious", "risk", "dangerous", "score", "verdict"]
+    )
+    has_threat_intel = bool(
+        skill_results.get("threat_analyst") and 
+        skill_results["threat_analyst"].get("status") == "ok"
+    )
+    
     if total_records_found > 0:
+        # If reputation was asked but we don't have threat intel yet, don't finalize
+        if asks_for_reputation and not has_threat_intel:
+            logger.info(
+                "[%s] Found %d records but reputation/threat was requested and threat_analyst not yet run — continuing",
+                SKILL_NAME, total_records_found
+            )
+            return {
+                "satisfied": False,
+                "confidence": 0.6,
+                "reasoning": f"Found {total_records_found} records but need threat intelligence enrichment.",
+                "missing": ["threat reputation and risk assessment"],
+            }
+        
+        # Records found and no actionable missing piece → satisfied
         logger.info(
-            "[%s] Evaluation fast-path: %d records found across skills — marking satisfied",
+            "[%s] Evaluation: %d records found across skills — marking satisfied",
             SKILL_NAME, total_records_found,
         )
         return {
@@ -1032,11 +1242,20 @@ def _extract_entities_from_previous_results(aggregated_results: dict) -> dict:
             for record in results_list:
                 if isinstance(record, dict):
                     # Common IP field names
-                    for ip_field in ["src_ip", "source_ip", "srcip", "src", "ip", "_source.src_ip"]:
+                    for ip_field in [
+                        "src_ip", "source_ip", "srcip", "src", "ip", "_source.src_ip",
+                        "source.ip", "dest_ip", "destination_ip", "destination.ip",
+                    ]:
                         if ip_field in record and record[ip_field]:
                             val = record[ip_field]
                             if isinstance(val, str):
                                 entities["ips"].add(val)
+                    for nested_ip in (
+                        record.get("source", {}).get("ip") if isinstance(record.get("source"), dict) else None,
+                        record.get("destination", {}).get("ip") if isinstance(record.get("destination"), dict) else None,
+                    ):
+                        if isinstance(nested_ip, str):
+                            entities["ips"].add(nested_ip)
                     
                     # Common domain field names
                     for domain_field in ["domain", "hostname", "fqdn", "src_domain"]:
@@ -1046,18 +1265,29 @@ def _extract_entities_from_previous_results(aggregated_results: dict) -> dict:
                                 entities["domains"].add(val)
                     
                     # Country extraction
-                    for country_field in ["country", "src_country", "country_name"]:
+                    for country_field in [
+                        "country", "src_country", "country_name", "geoip.country_name",
+                        "source.geo.country_name", "destination.geo.country_name",
+                    ]:
                         if country_field in record and record[country_field]:
                             val = record[country_field]
                             if isinstance(val, str):
                                 entities["countries"].add(val)
+                    geo = record.get("geoip") or {}
+                    if isinstance(geo, dict):
+                        for nested_country in (geo.get("country_name"), geo.get("country")):
+                            if isinstance(nested_country, str):
+                                entities["countries"].add(nested_country)
                     
                     # Port extraction
-                    for port_field in ["port", "dst_port", "dest_port", "dport"]:
+                    for port_field in ["port", "dst_port", "dest_port", "dport", "destination.port", "destination_port"]:
                         if port_field in record and record[port_field]:
                             val = record[port_field]
                             if isinstance(val, (int, str)):
                                 entities["ports"].add(str(val))
+                    nested_dest_port = record.get("destination", {}).get("port") if isinstance(record.get("destination"), dict) else None
+                    if isinstance(nested_dest_port, (int, str)):
+                        entities["ports"].add(str(nested_dest_port))
         
         # Also use extracted metadata
         entities["countries"].update(result.get("countries", []))
@@ -1097,7 +1327,7 @@ def _build_context_aware_threat_question(original_question: str, entities: dict)
     ips = entities.get("ips", [])
     domains = entities.get("domains", [])
     countries = entities.get("countries", [])
-    ports = entities.get("ports", [])
+    ports = [str(port) for port in entities.get("ports", [])]
     
     enriched = original_question
     
@@ -1521,6 +1751,7 @@ def _format_opensearch_response(user_question: str, os_result: dict) -> str:
     # Extract key evidence
     import re as _re
     ips: set = set()
+    source_ips: set = set()
     ts_list: list = []
     countries_seen: set = set()
 
@@ -1533,13 +1764,16 @@ def _format_opensearch_response(user_question: str, os_result: dict) -> str:
         # IPs
         for v in (
             row.get("src_ip"),
+            row.get("source_ip"),
             row.get("source.ip"),
             row.get("source", {}).get("ip") if isinstance(row.get("source"), dict) else None,
         ):
             if v:
                 ips.add(str(v))
+                source_ips.add(str(v))
         for v in (
             row.get("dest_ip"),
+            row.get("destination_ip"),
             row.get("destination.ip"),
             row.get("destination", {}).get("ip") if isinstance(row.get("destination"), dict) else None,
         ):
@@ -1578,16 +1812,41 @@ def _format_opensearch_response(user_question: str, os_result: dict) -> str:
 
     summary = f"Found {results_count} record(s) matching {filter_desc} in the {time_range} window."
 
+    # For port-specific queries, extract discovered port values from results (not just restate filter)
+    extracted_ports: set = set()
+    if ports:  # Only extract if a port was specifically queried
+        for row in results:
+            # Try both nested and flat field names
+            port_candidates = [
+                row.get("destination.port"),
+                row.get("destination", {}).get("port") if isinstance(row.get("destination"), dict) else None,
+                row.get("destination_port"),
+                row.get("dst_port"),
+                row.get("dest_port"),
+                row.get("dport"),
+                row.get("port"),
+            ]
+            for p in port_candidates:
+                if p is not None:
+                    try:
+                        extracted_ports.add(int(p))
+                    except (ValueError, TypeError):
+                        pass
+
     detail_parts = []
     if countries_seen:
         detail_parts.append(f"Countries seen: {', '.join(sorted(countries_seen))}.")
     if ips:
-        detail_parts.append(f"Source/destination IPs: {', '.join(sorted(ips)[:10])}.")
+        if ports and source_ips:
+            detail_parts.append(f"Remote peers: {', '.join(sorted(source_ips)[:10])}.")
+        else:
+            detail_parts.append(f"Source/destination IPs: {', '.join(sorted(ips)[:10])}.")
     if ts_list:
         ts_sorted = sorted(ts_list)
         detail_parts.append(f"Earliest: {ts_sorted[0]}. Latest: {ts_sorted[-1]}.")
-    if ports:
-        detail_parts.append(f"Destination port(s): {', '.join(str(p) for p in ports)}.")
+    matched_ports = extracted_ports.intersection({int(p) for p in ports if str(p).isdigit()}) if ports else extracted_ports
+    if matched_ports:
+        detail_parts.append(f"Destination port(s): {', '.join(str(p) for p in sorted(matched_ports))}.")
 
     if detail_parts:
         return summary + " " + " ".join(detail_parts)

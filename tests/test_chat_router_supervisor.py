@@ -170,6 +170,60 @@ def test_route_question_chains_field_discovery_into_opensearch_for_alert_search(
     assert result["skills"] == ["fields_querier", "opensearch_querier"]
 
 
+def test_route_question_prepends_fields_for_natural_language_port_search():
+    class _RouteLLM:
+        def chat(self, messages: list[dict]):
+            return json.dumps(
+                {
+                    "reasoning": "Port traffic search.",
+                    "skills": ["opensearch_querier"],
+                    "parameters": {},
+                }
+            )
+
+    available_skills = [
+        {"name": "fields_querier", "description": "Field schema discovery"},
+        {"name": "opensearch_querier", "description": "Direct log search"},
+    ]
+
+    result = route_question(
+        user_question="In the past week what traffic has visited my 1194 port?",
+        available_skills=available_skills,
+        llm=_RouteLLM(),
+        instruction="test",
+        conversation_history=[],
+    )
+
+    assert result["skills"] == ["fields_querier", "opensearch_querier"]
+
+
+def test_route_question_keeps_direct_opensearch_for_explicit_field_query():
+    class _RouteLLM:
+        def chat(self, messages: list[dict]):
+            return json.dumps(
+                {
+                    "reasoning": "Explicit field query.",
+                    "skills": ["opensearch_querier"],
+                    "parameters": {},
+                }
+            )
+
+    available_skills = [
+        {"name": "fields_querier", "description": "Field schema discovery"},
+        {"name": "opensearch_querier", "description": "Direct log search"},
+    ]
+
+    result = route_question(
+        user_question="show logs where destination.port=1194 and source.ip=1.2.3.4",
+        available_skills=available_skills,
+        llm=_RouteLLM(),
+        instruction="test",
+        conversation_history=[],
+    )
+
+    assert result["skills"] == ["opensearch_querier"]
+
+
 def test_supervisor_upgrades_repeated_field_discovery_to_opensearch_after_schema_results():
     class _Runner:
         def __init__(self):
