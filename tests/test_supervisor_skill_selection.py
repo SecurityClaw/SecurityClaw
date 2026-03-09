@@ -442,6 +442,25 @@ class TestSupervisorRoutingRules:
         # Should prioritize fields_querier for field discovery
         assert "fields_querier" in result.get("skills", [])
 
+    def test_natural_language_traffic_search_prefers_fields_first(self, available_skills):
+        """Natural-language traffic questions should prepend fields_querier before opensearch."""
+        llm = self._create_mock_llm(
+            '{"skills": ["opensearch_querier"], "reasoning": "traffic search"}'
+        )
+
+        result = _supervisor_next_action(
+            user_question="In the past week what traffic has visited my 1194 port?",
+            available_skills=available_skills,
+            llm=llm,
+            instruction="test",
+            conversation_history=[],
+            previous_trace=[],
+            current_results={},
+            previous_eval={"satisfied": False},
+        )
+
+        assert result.get("skills", [])[:2] == ["fields_querier", "opensearch_querier"]
+
 
 class TestSupervisorRoutingIntegration:
     """

@@ -526,7 +526,7 @@ def run(context: dict) -> dict:
     logger.info("[%s] REASONING CHAIN - Step 1: Intent Analysis", SKILL_NAME)
     logger.info("[%s]   Search Type: %s", SKILL_NAME, query_plan.get("search_type"))
     logger.info("[%s]   Matching Strategy: %s", SKILL_NAME, query_plan.get("matching_strategy"))
-    logger.info("[%s]   Reasoning: %s", SKILL_NAME, query_plan.get("reasoning", "")[:150])
+    logger.info("[%s]   Reasoning: %s", SKILL_NAME, query_plan.get("reasoning", "")[:350])
     
     search_terms = query_plan.get("search_terms", [])
     countries = query_plan.get("countries", [])
@@ -561,6 +561,7 @@ def run(context: dict) -> dict:
     )
 
     try:
+        validation: dict[str, Any] = {"is_valid": True, "issue": "", "reflection": ""}
         results = _execute_search_with_llm_repair(db, llm, index, query)
         logger.info("[%s] Raw results from opensearch: %d items", SKILL_NAME, len(results) if results else 0)
         
@@ -603,12 +604,12 @@ def run(context: dict) -> dict:
                        validation.get("is_valid"), validation.get("confidence", 0))
             if not validation.get("is_valid"):
                 logger.warning("[%s]   Issue: %s", SKILL_NAME, validation.get("issue"))
-                logger.info("[%s]   LLM Reflection: %s", SKILL_NAME, validation.get("reflection", "none")[:200])
+                logger.info("[%s]   LLM Reflection: %s", SKILL_NAME, validation.get("reflection", "none")[:500])
             
             if not validation.get("is_valid"):
                 logger.warning(
                     "[%s] LLM validation failed: %s | Reflection: %s",
-                    SKILL_NAME, validation.get("issue"), validation.get("reflection", "none")
+                    SKILL_NAME, validation.get("issue"), validation.get("reflection", "none")[:1000]
                 )
                 # Try recovery: switch matching strategy
                 recovery_strategy = "token" if matching_strategy == "phrase" else "phrase"
@@ -658,7 +659,7 @@ def run(context: dict) -> dict:
                 llm=llm,
             )
             
-            logger.info("[%s]   Suggested Recovery: %s", SKILL_NAME, diagnosis.get("suggested_recovery", "none")[:200])
+            logger.info("[%s]   Suggested Recovery: %s", SKILL_NAME, diagnosis.get("suggested_recovery", "none")[:500])
             
             # Try LLM-suggested recovery if it looks promising
             if diagnosis.get("should_try_recovery"):
@@ -711,9 +712,14 @@ def run(context: dict) -> dict:
             "protocols": protocols,
             "time_range": time_range,
             "reasoning": query_plan.get("reasoning", ""),
+            "validation_failed": bool(results and not validation.get("is_valid", True)),
+            "validation_issue": str(validation.get("issue", "")),
+            "validation_reflection": str(validation.get("reflection", "")),
             "reasoning_chain": {
                 "planning": query_plan.get("reasoning"),
                 "strategy_used": matching_strategy,
+                "validation_issue": str(validation.get("issue", "")),
+                "validation_reflection": str(validation.get("reflection", "")),
                 "recovery_performed": not results if not results else False,
             }
         }
@@ -1043,7 +1049,7 @@ Why did validation fail?"""
     
     try:
         reflection = llm.complete(reflection_prompt)
-        logger.info("[%s] REFLECTION ON VALIDATION FAILURE:\n%s", SKILL_NAME, reflection[:400])
+        logger.info("[%s] REFLECTION ON VALIDATION FAILURE:\n%s", SKILL_NAME, reflection[:1000])
         
         return {
             **validation,
