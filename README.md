@@ -6,7 +6,7 @@ A modular, skill-based autonomous Security Operations Center (SOC) agent that mo
 
 * **Skill Modularity** — Capabilities as isolated folders with `logic.py` (Python) + `instruction.md` (LLM guidance)  
 * **Heartbeat Loop** — Cron-like scheduler: 1-minute anomaly watcher, 6-hour memory builder  
-* **Provider Agnostic** — Swap OpenSearch↔Elasticsearch and Ollama↔OpenAI via config  
+* **Provider Agnostic** — Swap OpenSearch↔Elasticsearch via config  
 * **RAG-Based Memory** — Vector embeddings stored in OpenSearch; context-aware threat analysis  
 * **Working Memory** — Compact structured memory is stored locally in data/agent_memory.json with bounded sections for investigations, findings, and decisions  
 * **Conversation-based Investigations** — Allows you to investigate threats through an interactive chat interface, with LLM reasoning steps and RAG context retrieval  
@@ -27,7 +27,7 @@ A modular, skill-based autonomous Security Operations Center (SOC) agent that mo
 - **Python 3.11+** (check with `python --version`)
 - **Git** (for cloning the repo)
 - **OpenSearch 2.x or Elasticsearch 8.x** (or use mock for testing)
-- **Ollama or OpenAI API key** (for LLM provider)
+- **Ollama** (for LLM provider)
 - **4GB+ RAM** (recommended for Ollama models; 8GB+ for production)
 - **~2GB disk space** for models and vector indices
 
@@ -97,7 +97,7 @@ python -c "import main; import core; print('✓ Dependencies OK')"
 
 The wizard will guide you through:
 - **Database**: Host, port, SSL, auth
-- **LLM**: Provider (Ollama/OpenAI) and credentials
+- **LLM**: Ollama configuration
 - **Connection testing** for both services
 - **Configuration save** to `config.yaml` and `.env`
 
@@ -139,7 +139,7 @@ SecurityClaw/
 │   ├── scheduler.py           # APScheduler wrapper
 │   ├── skill_loader.py        # Dynamic skill discovery
 │   ├── db_connector.py        # OpenSearch/ES abstraction
-│   ├── llm_provider.py        # Ollama/OpenAI abstraction
+│   ├── llm_provider.py        # Ollama provider
 │   └── rag_engine.py          # Embedding store & retrieval
 │
 ├── skills/
@@ -288,13 +288,10 @@ db:
   vector_index: securityclaw-vectors     # RAG embedding store
 
 llm:
-  provider: ollama              # or: openai
+  provider: ollama
   ollama_base_url: http://localhost:11434
   ollama_model: qwen2.5:7b-instruct-q4_K_M
   ollama_embed_model: nomic-embed-text:latest
-  # or:
-  # openai_model: gpt-4o
-  # openai_api_key_env: OPENAI_API_KEY
 
 rag:
   embedding_model: all-MiniLM-L6-v2
@@ -339,7 +336,6 @@ During onboarding, you can use any index names/patterns your environment provide
 ```
 OPENSEARCH_USERNAME=<your-opensearch-username>
 OPENSEARCH_PASSWORD=<your-opensearch-password>
-OPENAI_API_KEY=<your-openai-api-key>
 OLLAMA_BASE_URL=http://localhost:11434
 ```
 
@@ -403,11 +399,11 @@ python main.py service
 ### Web Interface Features
 
 **Chat Interface** (http://localhost:3000)
-- 💬 **Real-time chat**: Send questions and receive answers from SecurityClaw skills
-- 🧠 **Reasoning steps**: View LLM reasoning and decision-making process
-- 📋 **Conversation history**: Browse and manage past conversations
-- 🎯 **Skill dispatch**: Manually trigger skills (anomaly_triage, threat_analyst, etc.)
-- 📊 **Memory view**: Monitor the agent's working memory and findings
+- **Real-time chat**: Send questions and receive answers from SecurityClaw skills
+- **Reasoning steps**: View LLM reasoning and decision-making process
+- **Conversation history**: Browse and manage past conversations
+- **Skill dispatch**: Manually trigger skills (anomaly_triage, threat_analyst, etc.)
+- **Memory view**: Monitor the agent's working memory and findings
 
 **API Endpoints** (http://localhost:5000/api)
 - `GET /api/status` — Agent status and memory summary
@@ -468,7 +464,7 @@ netstat -ano | findstr :3000       # Windows
 - Look for errors in the main terminal
 
 **"Chat not responding"**
-- Check LLM availability (Ollama running? OpenAI key valid?)
+- Check LLM availability (Ollama running?)
 - View logs: `python main.py --log-level DEBUG service`
 - Check config.yaml for correct provider settings
 
@@ -639,7 +635,7 @@ Respond in JSON format with:
 
 ## Performance Notes
 
-- **LLM Calls**: Each anomaly watcher and threat analyst cycle calls the LLM 1+ times (Ollama: ~1s per call, OpenAI: ~2s)
+- **LLM Calls**: Each anomaly watcher and threat analyst cycle calls the LLM 1+ times (Ollama: ~1s per call)
 - **RAG Retrieval**: kNN search is O(n) in mock; ~1ms per query on seeded DB
 - **Scheduler**: Background APScheduler has minimal overhead (~1% CPU idle)
 
@@ -654,12 +650,6 @@ Contributions welcome! Areas for enhancement:
 - [ ] Multi-tenant support
 - [ ] API endpoint for external integrations
 - [ ] Expanded web dashboard for structured memory visualization
-
----
-
-## License
-
-[Your License Here]
 
 ---
 
@@ -678,10 +668,4 @@ For issues, questions, or feature requests, open an issue or contact the Securit
   git grep -nEI '(password|api[_-]?key|BEGIN [A-Z ]*PRIVATE KEY|sk-)' -- .
   git log --all -G 'password|api[_-]?key|sk-' --oneline
 
-- Current audit result: no obvious real credentials were found in tracked files during this publication pass. Placeholder values and a private sample host were sanitized.
 
----
-
-**Last Updated**: March 6, 2026  
-**Version**: 1.0.0  
-**Status**: Active development / publication preparation

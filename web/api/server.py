@@ -188,7 +188,6 @@ def _env_payload() -> dict[str, Any]:
     for key in [
         "DB_USERNAME",
         "DB_PASSWORD",
-        "OPENAI_API_KEY",
         "OLLAMA_BASE_URL",
         "ABUSEIPDB_API_KEY",
         "ALIENVAULT_API_KEY",

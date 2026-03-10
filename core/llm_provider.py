@@ -1,9 +1,7 @@
-"""
-core/llm_provider.py — Provider-agnostic LLM abstraction.
+"""core/llm_provider.py — Ollama LLM provider.
 
 Supports:
-  - Ollama  (primary, via HTTP REST)
-  - OpenAI  (fallback, via openai SDK)
+  - Ollama (via HTTP REST)
 
 Architecture:
   - Chat / generation  → ollama_model   (e.g. qwen2.5:7b)
@@ -147,68 +145,7 @@ class OllamaProvider(BaseLLMProvider):
         return self._embedding_dim
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# OpenAI
-# ──────────────────────────────────────────────────────────────────────────────
 
-class OpenAIProvider(BaseLLMProvider):
-    """
-    Uses the official openai SDK.
-    Reads OPENAI_API_KEY from environment.
-    """
-
-    EMBED_MODEL = "text-embedding-3-small"
-
-    def __init__(self, model: Optional[str] = None) -> None:
-        import openai
-
-        cfg = Config()
-        api_key_env = cfg.get("llm", "openai_api_key_env", default="OPENAI_API_KEY")
-        openai.api_key = os.getenv(api_key_env, "")
-        self._client = openai.OpenAI()
-        self.model = model or cfg.get("llm", "openai_model", default="gpt-4o")
-        self.temperature = cfg.get("llm", "temperature", default=0.2)
-        self.max_tokens = cfg.get("llm", "max_tokens", default=2048)
-
-    def chat(
-        self,
-        messages: list[dict],
-        *,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-    ) -> str:
-        try:
-            resp = self._client.chat.completions.create(
-                model=self.model,
-                messages=messages,  # type: ignore[arg-type]
-                temperature=temperature or self.temperature,
-                max_tokens=max_tokens or self.max_tokens,
-            )
-            return resp.choices[0].message.content or ""
-        except Exception as exc:
-            logger.error("OpenAI chat failed: %s", exc)
-            raise
-
-    def embed(self, text: str) -> list[float]:
-        """Use local sentence-transformers — avoids API costs for embeddings."""
-        try:
-            resp = self._client.embeddings.create(
-                model=self.EMBED_MODEL,
-                input=text,
-            )
-            return resp.data[0].embedding
-        except Exception as exc:
-            logger.error("OpenAI embed failed: %s", exc)
-            raise
-
-    @property
-    def embedding_dimension(self) -> int:
-        """Return the dimension of embeddings produced by this provider.
-        
-        text-embedding-3-small produces 1536-dimensional embeddings.
-        """
-        # OpenAI's text-embedding-3-small always produces 1536 dimensions
-        return 1536
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -217,23 +154,8 @@ class OpenAIProvider(BaseLLMProvider):
 
 def build_llm_provider(provider: Optional[str] = None) -> BaseLLMProvider:
     """
-    Build the correct LLM provider from config (or explicit override).
-    Falls back to OpenAI if Ollama is unavailable.
+    Build the Ollama LLM provider from config (or explicit override).
     """
     cfg = Config()
-    chosen = provider or cfg.get("llm", "provider", default="ollama")
-
-    if chosen == "openai":
-        return OpenAIProvider()
-
-    # Ollama with automatic fallback
-    ollama = OllamaProvider()
-    try:
-        import requests
-        r = requests.get(f"{ollama.base_url}/api/tags", timeout=3)
-        r.raise_for_status()
-        logger.info("Ollama reachable — using Ollama provider.")
-        return ollama
-    except Exception:
-        logger.warning("Ollama unreachable — falling back to OpenAI provider.")
-        return OpenAIProvider()
+    provider or cfg.get("llm", "provider", default="ollama")
+    return OllamaProvider()

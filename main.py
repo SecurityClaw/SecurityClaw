@@ -116,42 +116,25 @@ def onboard():
     # ──────────────────────────────────────────────────────────────────────────
     # Phase 2: LLM Configuration
     # ──────────────────────────────────────────────────────────────────────────
-    console.print("[bold green]Step 2: LLM Provider Configuration[/]\n")
-    llm_provider = Prompt.ask(
-        "LLM provider",
-        choices=["ollama", "openai"],
-        default="ollama"
+    console.print("[bold green]Step 2: Ollama Configuration[/]\n")
+    ollama_url = Prompt.ask("Ollama base URL", default="http://localhost:11434")
+    ollama_model = Prompt.ask("Ollama chat model name", default="llama3")
+    console.print(
+        "[dim]The embed model is used exclusively for RAG vector embeddings (not for chat).\n"
+        "Use a small, fast model such as [italic]nomic-embed-text:latest[/italic].[/]"
     )
-
-    llm_config: dict = {}
-    if llm_provider == "ollama":
-        ollama_url = Prompt.ask("Ollama base URL", default="http://localhost:11434")
-        ollama_model = Prompt.ask("Ollama chat model name", default="llama3")
-        console.print(
-            "[dim]The embed model is used exclusively for RAG vector embeddings (not for chat).\n"
-            "Use a small, fast model such as [italic]nomic-embed-text:latest[/italic].[/]"
-        )
-        ollama_embed_model = Prompt.ask("Ollama embed model name", default="nomic-embed-text:latest")
-        llm_config = {
-            "ollama_base_url": ollama_url,
-            "ollama_model": ollama_model,
-            "ollama_embed_model": ollama_embed_model,
-        }
-        # Test Ollama
-        console.print("[cyan]Testing Ollama connection…[/]")
-        if _test_ollama_connection(ollama_url):
-            console.print("[green]✓ Ollama connection successful![/]\n")
-        else:
-            console.print("[yellow]⚠ Ollama connection test failed. Proceeding anyway…[/]\n")
+    ollama_embed_model = Prompt.ask("Ollama embed model name", default="nomic-embed-text:latest")
+    llm_config = {
+        "ollama_base_url": ollama_url,
+        "ollama_model": ollama_model,
+        "ollama_embed_model": ollama_embed_model,
+    }
+    # Test Ollama
+    console.print("[cyan]Testing Ollama connection…[/]")
+    if _test_ollama_connection(ollama_url):
+        console.print("[green]✓ Ollama connection successful![/]\n")
     else:
-        openai_key = Prompt.ask("OpenAI API Key", password=True)
-        openai_model = Prompt.ask("OpenAI model", default="gpt-4o")
-        llm_config = {
-            "openai_api_key_env": "OPENAI_API_KEY",
-            "openai_model": openai_model,
-        }
-        # Store API key in env var (we'll write to .env)
-        os.environ["OPENAI_API_KEY"] = openai_key
+        console.print("[yellow]⚠ Ollama connection test failed. Proceeding anyway…[/]\n")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Phase 3: External Reputation Intelligence (Optional)
@@ -611,10 +594,9 @@ def _write_config(
     config["db"]["vector_index"] = vector_index
 
     # Update LLM section
-    config["llm"]["provider"] = llm_provider
+    config["llm"]["provider"] = "ollama"
     for key, val in llm_config.items():
-        if key != "openai_api_key_env":  # Don't write the env var name to config
-            config["llm"][key] = val
+        config["llm"][key] = val
 
     # Write config.yaml
     with open(config_path, "w") as f:
@@ -627,8 +609,6 @@ def _write_config(
         env_lines.append(f"DB_USERNAME={db_user}")
     if db_pass:
         env_lines.append(f"DB_PASSWORD={db_pass}")
-    if llm_provider == "openai" and "OPENAI_API_KEY" in os.environ:
-        env_lines.append(f"OPENAI_API_KEY={os.environ['OPENAI_API_KEY']}")
     
     # Add external API keys
     for api_key_name, api_key_value in api_keys.items():

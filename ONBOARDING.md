@@ -56,9 +56,7 @@ This launches an interactive CLI that will ask you about:
 - Tests the connection
 
 **Phase 2: LLM Provider Configuration**
-- Which LLM? (Ollama or OpenAI)
-  - If **Ollama**: Base URL and model name
-  - If **OpenAI**: API key and model name
+- Ollama configuration: Base URL and model name
 - Tests the connection
 
 **Phase 3: Configuration Save**
@@ -87,7 +85,7 @@ cat .env            # Secrets (core and skill-specific variables)
 
 The `.env` file contains:
 - Database credentials (optional)
-- LLM credentials (OpenAI API key, Ollama base URL)
+- LLM credentials (Ollama base URL)
 - External threat intelligence API keys (AbuseIPDB, AlienVault, VirusTotal, Talos)
 - Skill-specific variables (MaxMind license, custom API tokens, etc.)
 
@@ -178,20 +176,16 @@ db:
   verify_certs: false
 
 llm:
-  provider: ollama                  # or: openai
+  provider: ollama
   ollama_base_url: http://localhost:11434
   ollama_model: qwen2.5:7b-instruct-q4_K_M
   ollama_embed_model: nomic-embed-text:latest
-  # or:
-  # openai_model: gpt-4o
-  # openai_api_key_env: OPENAI_API_KEY
 ```
 
 **`.env`** — Secret credentials (git-ignored)
 ```
 OPENSEARCH_USERNAME=<your-opensearch-username>
 OPENSEARCH_PASSWORD=<your-opensearch-password>
-OPENAI_API_KEY=<your-openai-api-key>
 ```
 
 ---

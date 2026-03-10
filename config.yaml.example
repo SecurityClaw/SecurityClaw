@@ -24,8 +24,6 @@ llm:
   ollama_model: qwen2.5:7b-instruct-q4_K_M
   # Lightweight local model used in the current example config for auxiliary tasks.
   ollama_embed_model: nomic-embed-text:latest
-  openai_model: gpt-4o
-  # API key loaded from .env: OPENAI_API_KEY
   temperature: 0.2
   max_tokens: 2048
 rag:

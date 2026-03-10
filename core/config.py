@@ -63,8 +63,6 @@ class Config:
             env_overrides.setdefault("db", {})["username"] = os.getenv("DB_USERNAME")
         if os.getenv("DB_PASSWORD"):
             env_overrides.setdefault("db", {})["password"] = os.getenv("DB_PASSWORD")
-        if os.getenv("OPENAI_API_KEY"):
-            env_overrides.setdefault("llm", {})["openai_api_key"] = os.getenv("OPENAI_API_KEY")
         if os.getenv("OLLAMA_BASE_URL"):
             env_overrides.setdefault("llm", {})["ollama_base_url"] = os.getenv("OLLAMA_BASE_URL")
         
