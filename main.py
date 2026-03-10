@@ -579,11 +579,25 @@ def _write_config(
         api_keys = {}
     
     config_path = Path(__file__).parent / "config.yaml"
+    example_path = Path(__file__).parent / "config.yaml.example"
     env_path = Path(__file__).parent / ".env"
 
-    # Read existing config
-    with open(config_path) as f:
-        config = yaml.safe_load(f)
+    # Read existing config, or use example as template if config doesn't exist
+    if config_path.exists():
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+    elif example_path.exists():
+        with open(example_path) as f:
+            config = yaml.safe_load(f)
+    else:
+        # Fallback: create minimal config structure
+        config = {
+            "agent": {"name": "SecurityClaw", "version": "1.0.0", "skills_dir": "skills", "log_level": "INFO"},
+            "scheduler": {"heartbeat_interval_seconds": 60, "memory_build_interval_hours": 6},
+            "db": {"provider": "opensearch", "index_prefix": "securityclaw"},
+            "llm": {"provider": "ollama"},
+            "rag": {"embedding_model": "all-MiniLM-L6-v2", "top_k": 5, "similarity_threshold": 0.65},
+        }
 
     # Update DB section (NO credentials in config — only in .env)
     config["db"]["provider"] = db_provider
