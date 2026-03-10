@@ -4,13 +4,13 @@ A modular, skill-based autonomous Security Operations Center (SOC) agent that mo
 
 ## Features
 
-✅ **Skill Modularity** — Capabilities as isolated folders with `logic.py` (Python) + `instruction.md` (LLM guidance)  
-✅ **Heartbeat Loop** — Cron-like scheduler: 1-minute anomaly watcher, 6-hour memory builder  
-✅ **Provider Agnostic** — Swap OpenSearch↔Elasticsearch and Ollama↔OpenAI via config  
-✅ **RAG-Based Memory** — Vector embeddings stored in OpenSearch; context-aware threat analysis  
-✅ **Working Memory** — Compact structured memory is stored locally in data/agent_memory.json with bounded sections for investigations, findings, and decisions  
-✅ **Local GeoIP Lookup** — Optional MaxMind GeoLite2 city/state/country enrichment with weekly refresh  
-✅ **Offline Test Suite** — ~300 collected tests with mocked DB/LLM and coverage reporting  
+* **Skill Modularity** — Capabilities as isolated folders with `logic.py` (Python) + `instruction.md` (LLM guidance)  
+* **Heartbeat Loop** — Cron-like scheduler: 1-minute anomaly watcher, 6-hour memory builder  
+* **Provider Agnostic** — Swap OpenSearch↔Elasticsearch and Ollama↔OpenAI via config  
+* **RAG-Based Memory** — Vector embeddings stored in OpenSearch; context-aware threat analysis  
+* **Working Memory** — Compact structured memory is stored locally in data/agent_memory.json with bounded sections for investigations, findings, and decisions  
+* **Conversation-based Investigations** — Allows you to investigate threats through an interactive chat interface, with LLM reasoning steps and RAG context retrieval  
+* **Web Interface** — Modern React-based UI for chat, memory visualization, and skill dispatch  
 
 ---
 
