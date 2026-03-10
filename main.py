@@ -261,7 +261,8 @@ def onboard():
 
     console.print("[green bold]✓ Configuration complete![/]")
     console.print("\n[cyan]You can now run:[/]")
-    console.print("  [yellow]python main.py run[/]              # Start the agent")
+    console.print("  [yellow]python main.py chat[/]              # Start in chat mode")
+    console.print("  [yellow]python main.py service[/]              # Start the agent")
     console.print("  [yellow]python main.py list-skills[/]      # See available skills")
     console.print("  [yellow]python main.py dispatch <skill>[/] # Fire a skill\n")
 

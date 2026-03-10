@@ -190,7 +190,6 @@ def ensure_skill_variables_onboarded() -> None:
 
         # Prompt for variables
         if prompt_requirements:
-            from click import Confirm as ClickConfirm
             from rich.prompt import Confirm
             
             setup_now = Confirm.ask("Configure these variables now?", default=True)
