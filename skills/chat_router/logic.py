@@ -9,6 +9,7 @@ This is not a periodic skill—it's invoked interactively via the chat command.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import re
@@ -18,7 +19,89 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 INSTRUCTION_PATH = Path(__file__).parent / "instruction.md"
+ROUTING_PROMPT_PATH = Path(__file__).parent / "ROUTING_PROMPT.md"
+SUPERVISOR_NEXT_ACTION_PROMPT_PATH = Path(__file__).parent / "SUPERVISOR_NEXT_ACTION_PROMPT.md"
+SUPERVISOR_EVALUATION_PROMPT_PATH = Path(__file__).parent / "SUPERVISOR_EVALUATION_PROMPT.md"
+RESPONSE_THINK_PROMPT_PATH = Path(__file__).parent / "RESPONSE_THINK_PROMPT.md"
+RESPONSE_REFLECTION_PROMPT_PATH = Path(__file__).parent / "RESPONSE_REFLECTION_PROMPT.md"
+RESPONSE_VERIFICATION_PROMPT_PATH = Path(__file__).parent / "RESPONSE_VERIFICATION_PROMPT.md"
+RESPONSE_FINAL_PROMPT_PATH = Path(__file__).parent / "RESPONSE_FINAL_PROMPT.md"
 SKILL_NAME = "chat_router"
+
+
+def _load_prompt_template(path: Path, fallback: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        logger.warning("[%s] Could not load prompt template %s: %s", SKILL_NAME, path.name, exc)
+        return fallback.strip()
+
+
+def _render_prompt(template: str, values: dict[str, Any]) -> str:
+    rendered = template
+    for key, value in values.items():
+        rendered = rendered.replace("{{" + key + "}}", str(value))
+    return rendered
+
+
+def _question_asks_for_reputation(user_question: str) -> bool:
+    question_lower = user_question.lower()
+    return any(
+        term in question_lower
+        for term in ["reputation", "threat intel", "threat intelligence", "risk", "malicious", "verdict", "score"]
+    )
+
+
+def _strip_unrequested_threat_intel(
+    user_question: str,
+    selected_skills: list[str],
+    available_skills: list[dict],
+) -> list[str]:
+    """Remove threat_analyst unless the user explicitly asked for threat or reputation analysis."""
+    available = {s.get("name") for s in available_skills}
+    if "threat_analyst" not in available or "threat_analyst" not in selected_skills:
+        return selected_skills
+    if _question_asks_for_reputation(user_question):
+        return selected_skills
+    filtered = [skill for skill in selected_skills if skill != "threat_analyst"]
+    if filtered != selected_skills:
+        logger.info(
+            "[%s] Removed threat_analyst because the question did not ask for reputation or threat analysis",
+            SKILL_NAME,
+        )
+    return filtered
+
+
+def _question_excludes_private_ips(user_question: str) -> bool:
+    question_lower = user_question.lower()
+    return any(
+        term in question_lower
+        for term in [
+            "aside from the private ip",
+            "aside from private ip",
+            "excluding private ip",
+            "exclude private ip",
+            "except private ip",
+            "other than private ip",
+            "non-private ip",
+            "public ip",
+            "private ips",
+            "internal ips",
+        ]
+    )
+
+
+def _question_has_explicit_entities(user_question: str) -> bool:
+    if re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", user_question):
+        return True
+    return bool(re.search(r"\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b", user_question.lower()))
+
+
+def _is_private_ip(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip).is_private
+    except ValueError:
+        return False
 
 
 def route_question(
@@ -60,60 +143,28 @@ def route_question(
         if history_lines:
             history_context = "\n\nRECENT CONVERSATION HISTORY (for context):\n" + "\n".join(history_lines)
 
-    prompt = f"""Analyze this security question and decide which available skills to use.
+    routing_template = _load_prompt_template(
+        ROUTING_PROMPT_PATH,
+        """
+Analyze this security question and decide which available skills to use.
 Consider the recent conversation history to maintain context.
 
-Current Question: "{user_question}"{history_context}
+Current Question: "{{USER_QUESTION}}"{{HISTORY_CONTEXT}}
 
 Available skills:
-{skills_description}
+{{SKILLS_DESCRIPTION}}
 
-ROUTING GUIDELINES:
-
-PRIMARY ROUTING RULES (Use These First):
-0. **DIRECT IP GEOLOCATION LOOKUP**: Questions asking where an IP is located, what country/city/state it belongs to,
-    or GeoIP enrichment for a specific IP → geoip_lookup.
-    Examples: "what country is 8.8.8.8 from?", "geolocate 1.1.1.1", "what city/state is this IP in?"
-
-1. **FIELD SCHEMA DISCOVERY FIRST**: Questions about "what fields exist", "which field holds X", 
-   "what is the field name for Y" → fields_querier FIRST
-   Examples: "what field holds country info?", "which field stores IP addresses?"
-   Then use opensearch_querier with discovered field names.
-
-2. **DIRECT LOG SEARCH (known fields)**: Questions about "traffic from X", "connections to Y", 
-    "flows from Z", "logs matching X criteria" WHERE explicit field names are already known → opensearch_querier
-    Examples: "show logs where source.ip=1.2.3.4", "filter destination.port=443", "search geoip.country_name for Iran"
-   
-3. **TEMPORAL / LOCATION / PROTOCOL FILTERING**: "when did X happen", "in February", "on port 1194", 
-    "from country X" in natural language → fields_querier FIRST, then opensearch_querier
-    Examples: "traffic from iran in the past 3 months", "connections on port 443 last week"
-
-4. **BASELINE ANALYSIS (follow-up research)**: After finding results, analyze normal/expected behavior → baseline_querier
-   Use ONLY for follow-up research, not for initial question answering.
-   Examples: "what's normal for this traffic?", "compare this to baseline", "analyze these patterns"
-
-5. **DEPRECATED**: rag_querier is legacy. Use opensearch_querier + fields_querier instead.
-
-SECONDARY ROUTING RULES:
-- If asking to INVESTIGATE AN INCIDENT or RECONSTRUCT A TIMELINE (what happened, sequence of events),
-  use forensic_examiner to build a ±5 min timeline.
-- If asking for THREAT INTELLIGENCE or REPUTATION DATA (is IP malicious, threat score, threat level),
-  use threat_analyst for external reputation checks.
-- If asking for threat intel PLUS concrete evidence from logs/alerts (which IPs, when it happened, which host, timestamps),
-  use opensearch_querier first to gather evidence, then threat_analyst.
-- If asking for DEEPER ANALYSIS of found anomalies, use anomaly_triage or threat_analyst.
-- Skills can be chained if needed (e.g., opensearch_querier then threat_analyst).
-
-KEY PRIORITY: Use fields_querier FIRST for natural-language log search questions unless the user explicitly names exact fields.
-Use opensearch_querier directly only when field names are already known.
-Use baseline_querier ONLY for follow-up research/analysis after you have results.
-
-ALWAYS ANSWER WITH A JSON OBJECT (strictly, no markdown):
-{{
-  "reasoning": "Why you chose these skills (mention which guidelines matched)",
-  "skills": ["skill_name_1", "skill_name_2"],
-  "parameters": {{"question": "{user_question}"}}
-}}"""
+Return a strict JSON object with reasoning, skills, and parameters.question.
+""",
+    )
+    prompt = _render_prompt(
+        routing_template,
+        {
+            "USER_QUESTION": user_question,
+            "HISTORY_CONTEXT": history_context,
+            "SKILLS_DESCRIPTION": skills_description,
+        },
+    )
 
     messages = [
         {"role": "system", "content": instruction},
@@ -129,6 +180,35 @@ ALWAYS ANSWER WITH A JSON OBJECT (strictly, no markdown):
             result["parameters"] = {}
         if "question" not in result["parameters"]:
             result["parameters"]["question"] = user_question
+
+        contextual_reputation_entities = _recover_threat_followup_entities(
+            user_question,
+            conversation_history,
+        )
+        if contextual_reputation_entities and any(
+            s.get("name") == "threat_analyst" for s in available_skills
+        ):
+            result["skills"] = ["threat_analyst"]
+            result["reasoning"] = "Follow-up reputation question anchored to entities from the previous answer"
+            result["parameters"]["question"] = _build_context_aware_threat_question(
+                user_question,
+                contextual_reputation_entities,
+            )
+            if conversation_history:
+                result["parameters"]["conversation_history"] = conversation_history
+            return result
+
+        # PREVENTION: Remove geoip_lookup if it's the first/only skill and no specific IPs are in the question
+        skills = result.get("skills", [])
+        if skills and skills[0] == "geoip_lookup" and not _contains_specific_ip(user_question):
+            logger.warning(
+                "[%s] Removing geoip_lookup as first skill because question doesn't mention specific IPs: %s",
+                SKILL_NAME,
+                user_question,
+            )
+            skills = [s for s in skills if s != "geoip_lookup"]
+            result["skills"] = skills
+        result["skills"] = skills
 
         # Enforce explicit forensic intent routing before generic filtering.
         result["skills"] = _apply_forensic_intent_override(
@@ -151,6 +231,11 @@ ALWAYS ANSWER WITH A JSON OBJECT (strictly, no markdown):
             current_results={},
         )
         result["skills"] = _enforce_evidence_then_threat_intel(
+            user_question=user_question,
+            selected_skills=result.get("skills", []),
+            available_skills=available_skills,
+        )
+        result["skills"] = _strip_unrequested_threat_intel(
             user_question=user_question,
             selected_skills=result.get("skills", []),
             available_skills=available_skills,
@@ -431,6 +516,42 @@ def _apply_forensic_intent_override(
     return ["forensic_examiner"]
 
 
+def _contains_specific_ip(user_question: str) -> bool:
+    """
+    Check if the question mentions a specific IP address or hostname.
+    
+    Returns True if the question contains:
+    - IPv4 addresses (e.g., 8.8.8.8, 192.168.1.1)
+    - IPv6 addresses
+    - Domain names/hostnames
+    
+    Returns False for general location queries like "traffic from Russia".
+    """
+    import re
+    question_lower = user_question.lower()
+    
+    # IP address patterns
+    ipv4_pattern = r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'
+    ipv6_pattern = r'(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}'
+    
+    # Check for IP addresses
+    if re.search(ipv4_pattern, question_lower):
+        return True
+    if re.search(ipv6_pattern, question_lower):
+        return True
+    
+    # Check for explicit hostname/domain mentions with context words
+    # (e.g., "hostname xxx.com" or "domain google.com")
+    if re.search(r'\b(?:hostname|domain|fqdn|host)\s+[\w\-\.]+', question_lower):
+        return True
+    
+    # Check for IP-related keywords suggesting specific IPs are being discussed
+    if re.search(r'\bgeolocate\s+\S+', question_lower) or re.search(r'\bwhere\s+is\s+\S+', question_lower):
+        return True
+    
+    return False
+
+
 def _filter_explicit_only_skills(skills: list[str], user_question: str) -> list[str]:
     """
     Filter out skills that are explicit-only or reserved for follow-up usage.
@@ -534,12 +655,26 @@ def execute_skill_workflow(
             
             # ── SPECIAL HANDLING: Enrich threat_analyst question with discovered entities ──
             if skill_name == "threat_analyst" and combined_previous_results:
-                entities = _extract_entities_from_previous_results(combined_previous_results)
                 original_q = skill_context["parameters"].get("question", "")
+                entities = _recover_threat_followup_entities(
+                    original_q,
+                    conversation_history,
+                    combined_previous_results,
+                )
                 if entities and (entities.get("ips") or entities.get("domains") or entities.get("countries")):
                     enriched_q = _build_context_aware_threat_question(original_q, entities)
                     skill_context["parameters"]["question"] = enriched_q
                     logger.info("[%s] Enriched threat_analyst question with discovered entities", SKILL_NAME)
+            elif skill_name == "threat_analyst" and conversation_history:
+                original_q = skill_context["parameters"].get("question", "")
+                entities = _recover_threat_followup_entities(
+                    original_q,
+                    conversation_history,
+                )
+                if entities:
+                    enriched_q = _build_context_aware_threat_question(original_q, entities)
+                    skill_context["parameters"]["question"] = enriched_q
+                    logger.info("[%s] Anchored threat_analyst to conversation-history entities", SKILL_NAME)
             
             # Dispatch skill with context
             result = runner.dispatch(skill_name, context=skill_context)
@@ -919,49 +1054,41 @@ def _supervisor_next_action(
         result_summary_lines.append(f"  {skill_name}: status={status}, records_found={count}")
     result_summary = "\n".join(result_summary_lines) or "  (no skills have run yet)"
 
-    prompt = f"""You are the SOC supervisor orchestrator. Your job is to route questions to skills and stop when the answer is found.
+    next_action_template = _load_prompt_template(
+        SUPERVISOR_NEXT_ACTION_PROMPT_PATH,
+        """
+You are the SOC supervisor orchestrator.
 
 QUESTION:
-{user_question}
-
-RECENT CONVERSATION:
-{history_text or '- none'}
+{{USER_QUESTION}}
 
 AVAILABLE SKILLS:
-{skills_description}{manifest_context}
+{{SKILLS_DESCRIPTION}}{{MANIFEST_CONTEXT}}
 
-PRIOR EXECUTION TRACE (latest first):
-{prior_steps}
+PRIOR EXECUTION TRACE:
+{{PRIOR_STEPS}}
 
 RESULTS ALREADY GATHERED:
-{result_summary}
+{{RESULT_SUMMARY}}
 
 PREVIOUS EVALUATION:
-{json.dumps(previous_eval, indent=2, default=str)}
+{{PREVIOUS_EVALUATION}}
 
-Return STRICT JSON:
-{{
-  "reasoning": "short rationale",
-  "skills": ["skill_name_1", "skill_name_2"],
-  "parameters": {{"question": "{user_question}"}}
-}}
-
-CRITICAL RULES:
-- Choose ONLY from the listed available skills.
-- If a skill already ran and returned records_found > 0, DO NOT run it again — the data is already gathered.
-- **ALERT / SIGNATURE / EVENT QUERIES (ANY TYPE)**: If question asks about alerts, signals, events, signatures, Suricata/Snort rules, ET rules, or any alert data (e.g., "any alerts that are ET EXPLOIT?", "show me Suricata signatures", "top 10 alerts") — use fields_querier FIRST to discover available alert/signature fields, THEN opensearch_querier to search them.
-- **LOG SEARCH AFTER FIELD DISCOVERY**: Once fields_querier has discovered field names, use opensearch_querier to search logs with specific field criteria.
-- If the question asks ONLY about REPUTATION, THREAT INTEL, RISK, VULNERABILITY, or MALICIOUS ACTIVITY — use threat_analyst FIRST.
-- **CRITICAL**: After opensearch_querier finds evidence, if the question ASK for reputation/threat intel, immediately queue threat_analyst next.
-- If the user also asks for concrete alert/log evidence (IPs, timestamps, when it happened, which host triggered it), use opensearch_querier FIRST to gather evidence, THEN threat_analyst for enrichment.
-- If the user asks for field details/values (bytes, packets, fields) that require schema knowledge — use fields_querier FIRST to discover field names, THEN use opensearch_querier if needed.
-- If the answer is about traffic/logs from a country/IP/port in natural language, use fields_querier FIRST to identify the right schema, THEN opensearch_querier. Use opensearch_querier FIRST only when exact field names are already explicit.
-- After log search finds records, optionally enrich with threat_analyst for IP/domain reputation.
-- If the question references a previously found alert/signature and asks for details about that alert, do NOT skip opensearch_querier.
-- baseline_querier is reserved for follow-up research/analysis only. Do NOT use it to answer initial user questions.
-- Return an empty skills list `[]` to finalize if results are already sufficient.
-- Avoid repeating the same skill with the same question more than once.
-"""
+Return strict JSON with reasoning, skills, and parameters.question.
+""",
+    )
+    prompt = _render_prompt(
+        next_action_template,
+        {
+            "USER_QUESTION": user_question,
+            "HISTORY_TEXT": history_text or "- none",
+            "SKILLS_DESCRIPTION": skills_description,
+            "MANIFEST_CONTEXT": manifest_context,
+            "PRIOR_STEPS": prior_steps,
+            "RESULT_SUMMARY": result_summary,
+            "PREVIOUS_EVALUATION": json.dumps(previous_eval, indent=2, default=str),
+        },
+    )
 
     try:
         response = llm.chat([
@@ -978,6 +1105,24 @@ CRITICAL RULES:
             parsed["skills"] = []
         if not isinstance(parsed.get("reasoning"), str):
             parsed["reasoning"] = "Supervisor selected next action"
+
+        contextual_reputation_entities = _recover_threat_followup_entities(
+            user_question,
+            conversation_history,
+            current_results,
+        )
+        if contextual_reputation_entities and any(
+            s.get("name") == "threat_analyst" for s in available_skills
+        ):
+            parsed["skills"] = ["threat_analyst"]
+            parsed["reasoning"] = "Follow-up reputation question anchored to entities from the previous answer"
+            parsed["parameters"]["question"] = _build_context_aware_threat_question(
+                user_question,
+                contextual_reputation_entities,
+            )
+            if conversation_history:
+                parsed["parameters"]["conversation_history"] = conversation_history
+            return parsed
         
         # Apply field discovery prepending for data type queries (same as route_question)
         parsed["skills"] = _prepend_field_discovery_for_data_types(
@@ -1003,6 +1148,11 @@ CRITICAL RULES:
             selected_skills=parsed.get("skills", []),
             available_skills=available_skills,
             current_results=current_results,
+        )
+        parsed["skills"] = _strip_unrequested_threat_intel(
+            user_question=user_question,
+            selected_skills=parsed.get("skills", []),
+            available_skills=available_skills,
         )
         
         # Additional rule: If opensearch_querier found results and question asks for reputation,
@@ -1030,6 +1180,34 @@ CRITICAL RULES:
                         SKILL_NAME
                     )
         
+        # ── AUTO-QUEUE opensearch_querier AFTER fields_querier ──────────────────────
+        # CRITICAL: If fields_querier just returned field_mappings and the supervisor
+        # tries to run fields_querier AGAIN (duplicate), automatically queue opensearch_querier
+        # to actually USE those discovered fields instead of re-discovering them.
+        fields_just_ran = "fields_querier" in parsed.get("skills", [])
+        fields_has_results = bool(
+            current_results.get("fields_querier") and (
+                current_results["fields_querier"].get("field_mappings") or
+                (current_results["fields_querier"].get("findings") or {}).get("field_mappings")
+            )
+        )
+        # Pattern: "about traffic from Russia" or "logs from Iran" or "show connections on port 443"
+        asks_for_log_search = bool(
+            re.search(
+                r"\b(traffic|flow|flows|connection|connections|log|logs|event|events|port|ports|protocol|country|countries).*(from|in|on|for|to|at|during|between)\b",
+                question_lower
+            )
+        )
+        
+        if fields_just_ran and fields_has_results and asks_for_log_search:
+            if "opensearch_querier" in {s.get("name") for s in available_skills}:
+                if "opensearch_querier" not in parsed.get("skills", []):
+                    parsed["skills"].append("opensearch_querier")
+                    logger.info(
+                        "[%s] Auto-queueing opensearch_querier: fields_querier discovered fields, now search logs with them",
+                        SKILL_NAME
+                    )
+        
         return parsed
     except Exception as exc:
         logger.warning("[%s] Supervisor next action failed: %s", SKILL_NAME, exc)
@@ -1054,6 +1232,8 @@ def _supervisor_evaluate_satisfaction(
     # Don't auto-satisfy if reputation/threat intel was asked but threat_analyst wasn't run
     total_records_found = 0
     for skill_name, result in skill_results.items():
+        if result.get("validation_failed"):
+            continue
         count = result.get("results_count") or result.get("log_records") or (
             len(result.get("results", [])) if isinstance(result.get("results"), list) else 0
         )
@@ -1069,6 +1249,24 @@ def _supervisor_evaluate_satisfaction(
         skill_results.get("threat_analyst") and 
         skill_results["threat_analyst"].get("status") == "ok"
     )
+    threat_verdicts = skill_results.get("threat_analyst", {}).get("verdicts") or []
+    asks_for_additional_evidence = any(
+        term in question_lower
+        for term in ["traffic", "country", "countries", "log", "logs", "when", "where", "port", "protocol", "connection", "connections", "flow", "flows"]
+    )
+
+    if asks_for_reputation and has_threat_intel and threat_verdicts and not asks_for_additional_evidence:
+        logger.info(
+            "[%s] Evaluation: threat_analyst returned %d verdict(s) for a reputation question — marking satisfied",
+            SKILL_NAME,
+            len(threat_verdicts),
+        )
+        return {
+            "satisfied": True,
+            "confidence": 0.9,
+            "reasoning": f"Threat intelligence verdicts were produced for {len(threat_verdicts)} entity(s).",
+            "missing": [],
+        }
     
     if total_records_found > 0:
         # If reputation was asked but we don't have threat intel yet, don't finalize
@@ -1096,42 +1294,59 @@ def _supervisor_evaluate_satisfaction(
             "missing": [],
         }
 
+    os_result = skill_results.get("opensearch_querier") or {}
+    directional_alternative = os_result.get("directional_alternative") or {}
+    if int(directional_alternative.get("results_count", 0) or 0) > 0:
+        alternative_direction = directional_alternative.get("direction", "opposite")
+        alternative_count = int(directional_alternative.get("results_count", 0) or 0)
+        logger.info(
+            "[%s] Evaluation: primary direction had zero results, but %d opposite-direction records were found — marking satisfied",
+            SKILL_NAME,
+            alternative_count,
+        )
+        return {
+            "satisfied": True,
+            "confidence": 0.85,
+            "reasoning": f"No records matched the requested direction, but {alternative_count} {alternative_direction}-direction records were found for the same IP.",
+            "missing": [],
+        }
+
     history_text = "\n".join(
         f"- {m.get('role', '?')}: {str(m.get('content', ''))[:220]}"
         for m in conversation_history[-6:]
     )
     result_summary = json.dumps(skill_results, indent=2, default=str)[:6000]
 
-    prompt = f"""Evaluate whether the current skill outputs are sufficient.
+    evaluation_template = _load_prompt_template(
+        SUPERVISOR_EVALUATION_PROMPT_PATH,
+        """
+Evaluate whether the current skill outputs are sufficient.
 
 QUESTION:
-{user_question}
+{{USER_QUESTION}}
 
-RECENT CONVERSATION:
-{history_text or '- none'}
+SKILL RESULTS:
+{{RESULT_SUMMARY}}
 
-SKILL RESULTS (aggregated):
-{result_summary}
-
-TOTAL RECORDS FOUND ACROSS ALL SKILLS: {total_records_found}
+TOTAL RECORDS FOUND ACROSS ALL SKILLS: {{TOTAL_RECORDS_FOUND}}
 
 STEP:
-{step}/{max_steps}
+{{STEP}}/{{MAX_STEPS}}
 
-Return STRICT JSON:
-{{
-  "satisfied": true/false,
-  "confidence": 0.0,
-  "reasoning": "short explanation",
-  "missing": ["what is still missing"]
-}}
-
-Rules:
-- If total_records_found > 0, the question about existence of traffic IS answered — set satisfied=true.
-- satisfied=true only if answers the question with relevant evidence.
-- If evidence is weak, set satisfied=false and list what's missing.
-- At final step ({max_steps}), set satisfied=true if any useful data was gathered.
-"""
+Return strict JSON with satisfied, confidence, reasoning, and missing.
+""",
+    )
+    prompt = _render_prompt(
+        evaluation_template,
+        {
+            "USER_QUESTION": user_question,
+            "HISTORY_TEXT": history_text or "- none",
+            "RESULT_SUMMARY": result_summary,
+            "TOTAL_RECORDS_FOUND": total_records_found,
+            "STEP": step,
+            "MAX_STEPS": max_steps,
+        },
+    )
 
     try:
         response = llm.chat([
@@ -1241,21 +1456,26 @@ def _extract_entities_from_previous_results(aggregated_results: dict) -> dict:
         if isinstance(results_list, list):
             for record in results_list:
                 if isinstance(record, dict):
+                    source_ips: set[str] = set()
+                    destination_ips: set[str] = set()
+                    record_countries: set[str] = set()
                     # Common IP field names
-                    for ip_field in [
-                        "src_ip", "source_ip", "srcip", "src", "ip", "_source.src_ip",
-                        "source.ip", "dest_ip", "destination_ip", "destination.ip",
-                    ]:
+                    for ip_field in ["src_ip", "source_ip", "srcip", "src", "ip", "_source.src_ip", "source.ip"]:
                         if ip_field in record and record[ip_field]:
                             val = record[ip_field]
                             if isinstance(val, str):
-                                entities["ips"].add(val)
-                    for nested_ip in (
-                        record.get("source", {}).get("ip") if isinstance(record.get("source"), dict) else None,
-                        record.get("destination", {}).get("ip") if isinstance(record.get("destination"), dict) else None,
-                    ):
-                        if isinstance(nested_ip, str):
-                            entities["ips"].add(nested_ip)
+                                source_ips.add(val)
+                    for ip_field in ["dst_ip", "dest_ip", "destination_ip", "destination.ip"]:
+                        if ip_field in record and record[ip_field]:
+                            val = record[ip_field]
+                            if isinstance(val, str):
+                                destination_ips.add(val)
+                    nested_source_ip = record.get("source", {}).get("ip") if isinstance(record.get("source"), dict) else None
+                    nested_destination_ip = record.get("destination", {}).get("ip") if isinstance(record.get("destination"), dict) else None
+                    if isinstance(nested_source_ip, str):
+                        source_ips.add(nested_source_ip)
+                    if isinstance(nested_destination_ip, str):
+                        destination_ips.add(nested_destination_ip)
                     
                     # Common domain field names
                     for domain_field in ["domain", "hostname", "fqdn", "src_domain"]:
@@ -1273,11 +1493,20 @@ def _extract_entities_from_previous_results(aggregated_results: dict) -> dict:
                             val = record[country_field]
                             if isinstance(val, str):
                                 entities["countries"].add(val)
+                                record_countries.add(val)
                     geo = record.get("geoip") or {}
                     if isinstance(geo, dict):
                         for nested_country in (geo.get("country_name"), geo.get("country")):
                             if isinstance(nested_country, str):
                                 entities["countries"].add(nested_country)
+                                record_countries.add(nested_country)
+                    has_country_info = bool(record_countries)
+
+                    if source_ips and has_country_info:
+                        entities["ips"].update(source_ips)
+                    else:
+                        entities["ips"].update(source_ips)
+                        entities["ips"].update(destination_ips)
                     
                     # Port extraction
                     for port_field in ["port", "dst_port", "dest_port", "dport", "destination.port", "destination_port"]:
@@ -1289,9 +1518,10 @@ def _extract_entities_from_previous_results(aggregated_results: dict) -> dict:
                     if isinstance(nested_dest_port, (int, str)):
                         entities["ports"].add(str(nested_dest_port))
         
-        # Also use extracted metadata
-        entities["countries"].update(result.get("countries", []))
-        entities["ports"].update(result.get("ports", []))
+        # Only trust summary metadata when the opensearch result passed validation.
+        if not result.get("validation_failed"):
+            entities["countries"].update(result.get("countries", []))
+            entities["ports"].update(result.get("ports", []))
     
     # Extract from baseline_querier / fields_querier results (legacy rag_querier support deprecated)
     for rag_skill in ("baseline_querier", "fields_querier"):
@@ -1313,6 +1543,152 @@ def _extract_entities_from_previous_results(aggregated_results: dict) -> dict:
     }
 
 
+def _extract_entities_from_conversation_history(conversation_history: list[dict] | None) -> dict:
+    """Extract the most recent concrete entities from recent conversation history."""
+    empty = {
+        "ips": [],
+        "domains": [],
+        "countries": [],
+        "ports": [],
+        "sources": [],
+    }
+    if not conversation_history:
+        return empty
+
+    ip_pattern = r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
+    domain_pattern = r"\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b"
+
+    for msg in reversed(conversation_history[-8:]):
+        text = str(msg.get("content", "") or "")
+        if not text:
+            continue
+
+        ips = list(dict.fromkeys(re.findall(ip_pattern, text)))
+        domains = list(dict.fromkeys(re.findall(domain_pattern, text.lower())))
+        countries: list[str] = []
+        for match in re.finditer(r"Countries seen:\s*([A-Za-z ,_-]+?)(?:\.|$)", text, re.IGNORECASE):
+            country_text = match.group(1).strip().rstrip(".")
+            countries.extend([part.strip() for part in country_text.split(",") if part.strip()])
+
+        ports: list[str] = []
+        for match in re.finditer(r"Ports:\s*([0-9, ]+?)(?:\.|$)", text, re.IGNORECASE):
+            port_text = match.group(1).strip().rstrip(".")
+            ports.extend([part.strip() for part in port_text.split(",") if part.strip()])
+
+        if ips or domains or countries or ports:
+            return {
+                "ips": ips,
+                "domains": domains,
+                "countries": countries,
+                "ports": ports,
+                "sources": [msg.get("role", "history")],
+            }
+
+    return empty
+
+
+def _filter_entities_for_question(entities: dict, user_question: str) -> dict:
+    if not entities:
+        return entities
+    filtered = {
+        "ips": list(entities.get("ips", [])),
+        "domains": list(entities.get("domains", [])),
+        "countries": list(entities.get("countries", [])),
+        "ports": list(entities.get("ports", [])),
+        "sources": list(entities.get("sources", [])),
+    }
+    if _question_excludes_private_ips(user_question):
+        filtered["ips"] = [ip for ip in filtered["ips"] if not _is_private_ip(ip)]
+    return filtered
+
+
+def _followup_reputation_entities(user_question: str, conversation_history: list[dict] | None) -> dict:
+    """Recover prior entities for follow-up reputation questions like 'what about the others?'"""
+    if not _question_asks_for_reputation(user_question):
+        return {}
+    if _question_has_explicit_entities(user_question):
+        return {}
+
+    question_lower = user_question.lower()
+    referential_cues = [
+        "those",
+        "them",
+        "above",
+        "above ip",
+        "above ips",
+        "the others",
+        "others",
+        "these",
+        "this ip",
+        "that ip",
+        "mentioned",
+        "just mentioned",
+        "you just mentioned",
+        "you've just mentioned",
+        "previously mentioned",
+        "prior ip",
+        "prior ips",
+        "previous ip",
+        "previous ips",
+        "aside from",
+        "excluding",
+        "exclude",
+        "except",
+        "other than",
+    ]
+    asks_for_new_evidence = any(
+        token in question_lower
+        for token in [
+            "traffic",
+            "country",
+            "countries",
+            "log",
+            "logs",
+            "port",
+            "protocol",
+            "connection",
+            "connections",
+            "flow",
+            "flows",
+            "when",
+            "where",
+            "search",
+            "show",
+            "find",
+            "list",
+        ]
+    )
+    if not any(cue in question_lower for cue in referential_cues):
+        return {}
+    if asks_for_new_evidence and not _question_excludes_private_ips(user_question):
+        return {}
+
+    history_entities = _extract_entities_from_conversation_history(conversation_history)
+    history_entities = _filter_entities_for_question(history_entities, user_question)
+    if history_entities.get("ips") or history_entities.get("domains"):
+        return history_entities
+    return {}
+
+
+def _recover_threat_followup_entities(
+    user_question: str,
+    conversation_history: list[dict] | None,
+    aggregated_results: dict | None = None,
+) -> dict:
+    """Recover concrete entities for threat follow-ups from current results or prior conversation."""
+    entities = _followup_reputation_entities(user_question, conversation_history)
+    if entities and (entities.get("ips") or entities.get("domains") or entities.get("countries")):
+        return entities
+
+    if aggregated_results:
+        entities = _extract_entities_from_previous_results(aggregated_results)
+        entities = _filter_entities_for_question(entities, user_question)
+        if entities and (entities.get("ips") or entities.get("domains") or entities.get("countries")):
+            return entities
+
+    return {}
+
+
 def _build_context_aware_threat_question(original_question: str, entities: dict) -> str:
     """
     Build a context-aware question for threat_analyst when prior results found entities.
@@ -1320,6 +1696,7 @@ def _build_context_aware_threat_question(original_question: str, entities: dict)
     This enriches the generic question with actual IPs/domains/countries discovered,
     so threat_analyst analyzes SPECIFIC entities rather than doing a generic lookup.
     """
+    entities = _filter_entities_for_question(entities, original_question)
     if not entities or not any([entities.get("ips"), entities.get("domains"), entities.get("countries")]):
         # If no entities extracted, use original question
         return original_question
@@ -1389,7 +1766,12 @@ def format_response(
     # ── PRIORITIZE OPENSEARCH/RAG BY DATA AVAILABILITY ──────────────────────
     # Check which has actual results (log records, not just findings)
     os_result = skill_results.get("opensearch_querier", {})
-    os_has_data = os_result and os_result.get("status") == "ok" and os_result.get("results_count", 0) > 0
+    os_has_data = (
+        os_result
+        and os_result.get("status") == "ok"
+        and os_result.get("results_count", 0) > 0
+        and not os_result.get("validation_failed")
+    )
     
     # Check baseline_querier / fields_querier results
     rag_result = skill_results.get("baseline_querier") or skill_results.get("fields_querier") or {}
@@ -1411,16 +1793,18 @@ def format_response(
         return _format_rag_response(user_question, rag_result)
 
     # ── PHASE 1: THINK ──────────────────────────────────────────────────────
-    think_prompt = f"""Analyze what the user is asking for.
+    think_template = _load_prompt_template(
+        RESPONSE_THINK_PROMPT_PATH,
+        """
+Analyze what the user is asking for.
 
-Question: "{user_question}"
+Question: "{{USER_QUESTION}}"
 
-Extract:
-1. Main intent (what are they trying to understand?)
-2. Key entities (IPs, domains, services, etc.)
-3. Success criteria (what would constitute a complete answer?)
-
-Be specific and concise."""
+Extract the main intent, key entities, and success criteria.
+Be specific and concise.
+""",
+    )
+    think_prompt = _render_prompt(think_template, {"USER_QUESTION": user_question})
     
     think_response = llm.chat([
         {"role": "system", "content": "You are a security analyst. Extract structured intent."},
@@ -1436,19 +1820,25 @@ Be specific and concise."""
         for skill_name, result in skill_results.items()
     ])
     
-    reflection_prompt = f"""You extracted the user's intent as:
-{think_response}
+    reflection_template = _load_prompt_template(
+        RESPONSE_REFLECTION_PROMPT_PATH,
+        """
+You extracted the user's intent as:
+{{THINK_RESPONSE}}
 
 Now you received these skill results:
-{results_text}
+{{RESULTS_TEXT}}
 
-REFLECTION QUESTIONS:
-1. Do the results address the main intent?
-2. Are all key entities covered?
-3. Do results meet the success criteria?
-4. Are there any inconsistencies or gaps?
-
-Briefly assess coverage (2-3 sentences)."""
+Briefly assess whether the results cover the intent, entities, success criteria, and any gaps.
+""",
+    )
+    reflection_prompt = _render_prompt(
+        reflection_template,
+        {
+            "THINK_RESPONSE": think_response,
+            "RESULTS_TEXT": results_text,
+        },
+    )
     
     reflection_response = llm.chat([
         {"role": "system", "content": "You are a critical analyst. Assess if results are sufficient."},
@@ -1463,21 +1853,25 @@ Briefly assess coverage (2-3 sentences)."""
     
     final_response = ""
     if anti_hallucination_enabled:
-        verification_prompt = f"""Internally verify your answer against these facts:
+        verification_template = _load_prompt_template(
+            RESPONSE_VERIFICATION_PROMPT_PATH,
+            """
+Internally verify your answer against these facts.
 
-User question: "{user_question}"
+User question: "{{USER_QUESTION}}"
 Skill results:
-{results_text}
+{{RESULTS_TEXT}}
 
-VERIFICATION (DO INTERNALLY, DO NOT SHOW IN ANSWER):
-- Are statements supported by the skill results?
-- Did you infer something NOT in the data?
-- Did you make up or assume any facts?
-- Is everything grounded in actual findings?
-
-NOW PROVIDE ONLY THE ANSWER to the user's question (2-4 sentences).
-Do NOT include verification text. Do NOT say "Based on the skill results..." or "Here is the answer:".
-Just provide the direct answer."""
+Provide only the direct answer in 2-4 sentences with no verification text or preamble.
+""",
+        )
+        verification_prompt = _render_prompt(
+            verification_template,
+            {
+                "USER_QUESTION": user_question,
+                "RESULTS_TEXT": results_text,
+            },
+        )
         
         final_response = llm.chat([
             {"role": "system", "content": "You are a rigorous security analyst. Verify internally but output only clean answers without preamble."},
@@ -1485,14 +1879,26 @@ Just provide the direct answer."""
         ])
     else:
         # Standard response without extra verification
-        final_prompt = f"""Based on these skill execution results, provide a concise response to the user.
+        final_template = _load_prompt_template(
+            RESPONSE_FINAL_PROMPT_PATH,
+            """
+Based on these skill execution results, provide a concise response to the user.
 
-User question: "{user_question}"
+User question: "{{USER_QUESTION}}"
 
 Skill results:
-{results_text}
+{{RESULTS_TEXT}}
 
-Provide a clear, actionable answer (2-4 sentences)."""
+Provide a clear, actionable answer in 2-4 sentences.
+""",
+        )
+        final_prompt = _render_prompt(
+            final_template,
+            {
+                "USER_QUESTION": user_question,
+                "RESULTS_TEXT": results_text,
+            },
+        )
         
         final_response = llm.chat([
             {"role": "system", "content": "You are a helpful SOC analyst. Provide clear, actionable insights."},
@@ -1646,10 +2052,30 @@ def _format_opensearch_response(user_question: str, os_result: dict) -> str:
     countries = os_result.get("countries", [])
     ports = os_result.get("ports", [])
     protocols = os_result.get("protocols", [])
-    time_range = os_result.get("time_range", "")
+    time_range = os_result.get("time_range_label") or os_result.get("time_range", "")
     search_terms = os_result.get("search_terms", [])
+    directional_alternative = os_result.get("directional_alternative") or {}
 
     if not results:
+        if directional_alternative:
+            requested_direction = os_result.get("ip_direction") or "requested"
+            alternative_direction = directional_alternative.get("direction") or "opposite"
+            alternative_count = int(directional_alternative.get("results_count", 0) or 0)
+            alt_time_range = directional_alternative.get("time_range_label") or time_range
+            queried_ip = "/".join(str(term) for term in search_terms[:3]) or "the requested IP"
+            detail_parts = [
+                f"No traffic {requested_direction} {queried_ip} was found in the {time_range} window.",
+                f"However, {alternative_count} record(s) were found in the {alternative_direction} direction for the same IP in the {alt_time_range} window.",
+            ]
+            sample_peers = directional_alternative.get("sample_peers") or []
+            if sample_peers:
+                detail_parts.append(f"Peers seen: {', '.join(sample_peers[:10])}.")
+            earliest = directional_alternative.get("earliest")
+            latest = directional_alternative.get("latest")
+            if earliest and latest:
+                detail_parts.append(f"Earliest: {earliest}. Latest: {latest}.")
+            return " ".join(detail_parts)
+
         filter_parts = []
         if countries:
             filter_parts.append(f"country={'/' .join(countries)}")

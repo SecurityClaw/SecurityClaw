@@ -14,9 +14,29 @@ import logging
 import time
 import re
 from typing import Optional, Tuple, Callable
-from core.query_repair_memory import get_memory, QueryRepairMemory
+from core.query_repair_memory import get_memory, QueryRepairMemory, _normalize_error
 
 logger = logging.getLogger(__name__)
+
+
+def _is_time_field(field_name: str) -> bool:
+    lowered = str(field_name or "").lower()
+    return lowered == "@timestamp" or any(token in lowered for token in ("timestamp", "date", "time"))
+
+
+def _is_date_like_string(value: str) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip().lower()
+    if not text:
+        return False
+    if text in {"now", "now/d", "now/w", "now/m"}:
+        return True
+    if re.fullmatch(r"now-\d+[hdwm]", text):
+        return True
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[t\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:?\d{2})?)?", text):
+        return True
+    return False
 
 
 def _short_json(payload: dict, limit: int = 1200) -> str:
@@ -37,6 +57,17 @@ class QueryRepairStrategy:
     def apply_python_fix(query: dict) -> dict:
         """Apply Python-level structural fixes."""
         try:
+            query = json.loads(json.dumps(query))
+
+            def _walk(node: object, visitor: Callable[[dict], None]) -> None:
+                if isinstance(node, dict):
+                    visitor(node)
+                    for value in list(node.values()):
+                        _walk(value, visitor)
+                elif isinstance(node, list):
+                    for item in node:
+                        _walk(item, visitor)
+
             if "query" not in query:
                 return query
             
@@ -62,8 +93,48 @@ class QueryRepairStrategy:
             bool_query = query.get("query", {}).get("bool", {})
             if not isinstance(bool_query, dict):
                 return query
+
+            # Fix 1: Move misplaced size out of bool clauses back to the top level.
+            if "size" in bool_query:
+                size_value = bool_query.pop("size")
+                if "size" not in query and isinstance(size_value, int):
+                    query["size"] = size_value
+                logger.debug("Python fix: moved bool.size to query root")
+
+            # Fix 2: Remove placeholder timestamp clauses like term(@timestamp=custom).
+            placeholder_timestamp_values = {"custom", "any", "none", "null", "timestamp", "date"}
             
-            # Fix 1: Range with string → match
+            def _strip_bad_timestamp_terms(container: dict) -> None:
+                for clause_name in ["must", "should", "filter", "must_not"]:
+                    clauses = container.get(clause_name)
+                    if not isinstance(clauses, list):
+                        continue
+                    filtered_clauses = []
+                    for clause in clauses:
+                        if not isinstance(clause, dict):
+                            continue
+                        timestamp_value = None
+                        if "term" in clause and isinstance(clause["term"], dict):
+                            timestamp_value = clause["term"].get("@timestamp")
+                        elif "match" in clause and isinstance(clause["match"], dict):
+                            timestamp_value = clause["match"].get("@timestamp")
+                        elif "range" in clause and isinstance(clause["range"], dict):
+                            timestamp_range = clause["range"].get("@timestamp")
+                            if isinstance(timestamp_range, dict):
+                                for candidate in timestamp_range.values():
+                                    if isinstance(candidate, str):
+                                        timestamp_value = candidate
+                                        break
+
+                        if isinstance(timestamp_value, str) and timestamp_value.strip().lower() in placeholder_timestamp_values:
+                            logger.debug("Python fix: removed placeholder @timestamp clause with value %s", timestamp_value)
+                            continue
+                        filtered_clauses.append(clause)
+                    container[clause_name] = filtered_clauses
+
+            _walk(query.get("query", {}), _strip_bad_timestamp_terms)
+            
+            # Fix 3: Range with string → match
             for clause_type in ["should", "must", "filter"]:
                 if clause_type not in bool_query:
                     continue
@@ -82,6 +153,8 @@ class QueryRepairStrategy:
                         for field, cond in clause["range"].items():
                             for op, val in (cond.items() if isinstance(cond, dict) else []):
                                 if isinstance(val, str):
+                                    if _is_time_field(field) and _is_date_like_string(val):
+                                        continue
                                     fixed.append({"match": {field: val}})
                                     logger.debug("Python fix: range(string) → match for %s", field)
                                     clause = None
@@ -95,7 +168,7 @@ class QueryRepairStrategy:
                 if fixed:
                     bool_query[clause_type] = fixed
             
-            # Fix 2: Ensure arrays for bool clause query lists
+            # Fix 4: Ensure arrays for bool clause query lists
             for clause_type in ["should", "must", "filter"]:
                 if clause_type in bool_query and not isinstance(bool_query[clause_type], list):
                     bool_query[clause_type] = [bool_query[clause_type]]
@@ -391,6 +464,8 @@ class IntelligentQueryRepair:
         last_error = None
         last_malformed_error = None
         used_repair = False
+        repeated_query_failures: dict[tuple[str, str], int] = {}
+        seen_llm_fixes: set[str] = set()
         
         for attempt in range(self.max_retries + 1):
             try:
@@ -415,8 +490,14 @@ class IntelligentQueryRepair:
                 last_error = str(exc)
                 error_msg = _extract_error_message(exc)
                 last_malformed_error = error_msg
+                failure_signature = (_normalize_error(error_msg), _short_json(current_query, limit=400))
+                repeated_query_failures[failure_signature] = repeated_query_failures.get(failure_signature, 0) + 1
                 logger.warning("[Repair] Query failed (attempt %d): %s", attempt + 1, error_msg[:100])
                 logger.warning("[Repair] Failed query payload (attempt %d): %s", attempt + 1, _short_json(current_query))
+
+                if repeated_query_failures[failure_signature] >= 3:
+                    logger.error("[Repair] Aborting repeated identical failure after %d occurrences", repeated_query_failures[failure_signature])
+                    return (False, None, f"Repeated identical malformed query failure: {error_msg[:100]}")
                 
                 if attempt >= self.max_retries:
                     logger.error("[Repair] Max retries reached (%d)", self.max_retries)
@@ -445,6 +526,14 @@ class IntelligentQueryRepair:
                         attempt=attempt
                     )
                     if fixed:
+                        fixed_signature = _short_json(fixed, limit=400)
+                        if fixed_signature == _short_json(current_query, limit=400):
+                            logger.warning("[Repair] LLM returned the same payload again; refusing duplicate retry")
+                            continue
+                        if fixed_signature in seen_llm_fixes:
+                            logger.warning("[Repair] LLM repeated a previously failed repaired payload; refusing duplicate retry")
+                            continue
+                        seen_llm_fixes.add(fixed_signature)
                         current_query = fixed
                         used_repair = True
                         logger.info("[Repair] Applied LLM fix, retrying...")

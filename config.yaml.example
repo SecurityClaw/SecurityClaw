@@ -25,7 +25,10 @@ llm:
   # Lightweight local model used in the current example config for auxiliary tasks.
   ollama_embed_model: nomic-embed-text:latest
   temperature: 0.2
-  max_tokens: 2048
+  max_tokens: 4096
+memory:
+  query_repair_max_repairs: 128
+  query_repair_max_field_types: 512
 rag:
   embedding_model: all-MiniLM-L6-v2
   top_k: 5

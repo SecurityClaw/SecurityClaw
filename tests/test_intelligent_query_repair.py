@@ -13,6 +13,7 @@ import json
 import pytest
 from unittest.mock import MagicMock, patch, call
 from core.query_repair_memory import QueryRepairMemory, get_memory
+import core.query_repair_memory as query_repair_memory_module
 from core.query_repair import IntelligentQueryRepair, QueryRepairStrategy
 
 
@@ -70,6 +71,36 @@ class TestQueryRepairMemory:
         assert memory.get_field_type("source.port") == "integer"
         assert memory.get_field_type("geoip.country_code2") == "keyword"
 
+    def test_memory_compacts_repairs_to_recent_limit(self, tmp_path):
+        memory_file = tmp_path / "query_repair_memory.json"
+
+        with patch.object(query_repair_memory_module, "MEMORY_FILE", memory_file):
+            with patch.object(query_repair_memory_module.Config, "get", side_effect=lambda section, key, default=None: 2 if key == "query_repair_max_repairs" else default):
+                memory = QueryRepairMemory()
+                memory.record_error_fix("error-one", {"query": 1}, {"fixed": 1})
+                memory.record_error_fix("error-two", {"query": 2}, {"fixed": 2})
+                memory.record_error_fix("error-three", {"query": 3}, {"fixed": 3})
+
+                reloaded = QueryRepairMemory()
+
+        assert len(reloaded.repairs) == 2
+        assert reloaded.get_known_fix("error-three") is not None
+        assert reloaded.get_known_fix("error-two") is not None
+
+    def test_memory_compacts_field_types_to_limit(self, tmp_path):
+        memory_file = tmp_path / "query_repair_memory.json"
+
+        with patch.object(query_repair_memory_module, "MEMORY_FILE", memory_file):
+            with patch.object(query_repair_memory_module.Config, "get", side_effect=lambda section, key, default=None: 2 if key == "query_repair_max_field_types" else default):
+                memory = QueryRepairMemory()
+                memory.record_field_type("field.one", "keyword")
+                memory.record_field_type("field.two", "ip")
+                memory.record_field_type("field.three", "date")
+
+        assert memory.get_field_type("field.one") is None
+        assert memory.get_field_type("field.two") == "ip"
+        assert memory.get_field_type("field.three") == "date"
+
 
 class TestQueryRepairStrategy:
     """Test individual repair strategies."""
@@ -105,6 +136,58 @@ class TestQueryRepairStrategy:
         
         assert isinstance(fixed["query"]["bool"]["must"], list)
         assert isinstance(fixed["query"]["bool"]["filter"], list)
+
+    def test_python_fix_moves_size_out_of_bool_clause(self):
+        """OpenSearch rejects size inside bool; it must be lifted to the query root."""
+        query = {
+            "query": {
+                "bool": {
+                    "must": [{"term": {"source.ip": "1.1.1.1"}}],
+                    "size": 200,
+                }
+            }
+        }
+
+        fixed = QueryRepairStrategy.apply_python_fix(query)
+
+        assert fixed["size"] == 200
+        assert "size" not in fixed["query"]["bool"]
+
+    def test_python_fix_removes_placeholder_timestamp_terms(self):
+        """Bogus placeholder timestamp clauses should be dropped deterministically."""
+        query = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"term": {"source.ip": "1.1.1.1"}},
+                        {"term": {"@timestamp": "custom"}},
+                    ]
+                }
+            }
+        }
+
+        fixed = QueryRepairStrategy.apply_python_fix(query)
+
+        must_clauses = fixed["query"]["bool"]["must"]
+        assert must_clauses == [{"term": {"source.ip": "1.1.1.1"}}]
+
+    def test_python_fix_preserves_valid_timestamp_range(self):
+        """Valid @timestamp range filters must not be rewritten into match queries."""
+        query = {
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"range": {"@timestamp": {"gte": "now-24h"}}}
+                    ]
+                }
+            }
+        }
+
+        fixed = QueryRepairStrategy.apply_python_fix(query)
+
+        assert fixed["query"]["bool"]["filter"] == [
+            {"range": {"@timestamp": {"gte": "now-24h"}}}
+        ]
     
     def test_llm_fix_with_known_pattern(self):
         """Should return known fix if pattern was seen before."""
@@ -204,8 +287,10 @@ class TestIntelligentQueryRepair:
         
         assert success is False
         assert results is None
-        # Should have tried multiple times (max_retries)
-        assert mock_db.search.call_count >= repair.max_retries
+        # The repair loop may stop early once it detects identical failures repeating.
+        assert mock_db.search.call_count > 1
+        assert mock_db.search.call_count <= repair.max_retries + 1
+        assert "Repeated identical malformed query failure" in message or "Failed after" in message
     
     def test_repair_with_progressively_detailed_prompts(self):
         """Each LLM attempt should have more detailed instructions."""
@@ -237,6 +322,42 @@ class TestIntelligentQueryRepair:
         
         # Prompts should get progressively more specific
         assert len(prompts[0]) < len(prompts[-1])  # Later prompts have more detail
+
+    def test_repair_stops_repeating_identical_llm_payloads(self):
+        """The loop should not burn all retries on the same repaired payload."""
+        from core.db_connector import QueryMalformedException
+
+        mock_db = MagicMock()
+        mock_llm = MagicMock()
+
+        malformed = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"term": {"source.ip": "1.1.1.1"}},
+                        {"term": {"@timestamp": "custom"}},
+                    ],
+                    "size": 200,
+                }
+            }
+        }
+
+        query_error = QueryMalformedException(
+            "logstash*",
+            malformed,
+            "RequestError(400, 'x_content_parse_exception', '[1:94] [bool] unknown field [size]')",
+        )
+        mock_db.search.side_effect = query_error
+        mock_llm.complete.return_value = json.dumps(malformed)
+
+        repair = IntelligentQueryRepair(mock_db, mock_llm)
+
+        success, results, message = repair.repair_and_retry("logstash*", malformed)
+
+        assert success is False
+        assert results is None
+        assert mock_llm.complete.call_count < repair.max_retries
+        assert "Repeated identical malformed query failure" in message or "Unable" in message
 
 
 class TestEndToEndRepair:

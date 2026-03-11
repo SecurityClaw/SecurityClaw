@@ -62,6 +62,30 @@ Q: "Which field stores bytes transferred?"
 → Use: fields_querier (reads local field catalog, answers schema questions)
 ```
 
+**CRITICAL: Geolocation Lookup vs. Log Search** (geoip_lookup):
+```
+⚠️ geoip_lookup is ONLY for questions about a SPECIFIC IP/HOSTNAME and its location.
+
+CORRECT usage (use geoip_lookup):
+  Q: "What country is 8.8.8.8 from?"
+  Q: "Where is IP 62.60.131.168 located?"
+  Q: "Geolocate 192.168.1.1"
+  Q: "What city/state is this hostname from?"
+  → Use: geoip_lookup (enriches a specific IP with geographic data)
+
+INCORRECT usage (DO NOT use geoip_lookup):
+  Q: "Any traffic from Russia in the past 24 hours?"
+  Q: "Show me connections from Iran"
+  Q: "Are there logs from Canada?"
+  → Use: fields_querier → opensearch_querier
+  → First discover field names (e.g., geoip.country_name, src_country)
+  → Then search logs for matching countries
+
+The difference:
+  - SPECIFIC IP to geolocation: geoip_lookup
+  - COUNTRY/LOCATION to log records: fields_querier → opensearch_querier
+```
+
 **Create Baselines** (network_baseliner) — EXPLICIT ONLY:
 ```
 Q: "Run the network_baseliner"
