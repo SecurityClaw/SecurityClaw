@@ -73,6 +73,7 @@ def _extract_field_mappings(docs: list[dict]) -> dict:
         ip_fields, source_ip_fields, destination_ip_fields,
         port_fields, source_port_fields, destination_port_fields,
         text_fields, timestamp_fields, domain_fields, geoip_fields,
+        country_fields,
         protocol_fields, bytes_fields, all_fields
     """
     mappings: dict[str, list] = {
@@ -86,6 +87,7 @@ def _extract_field_mappings(docs: list[dict]) -> dict:
         "timestamp_fields": [],
         "domain_fields": [],
         "geoip_fields": [],
+        "country_fields": [],
         "protocol_fields": [],
         "bytes_fields": [],
         "all_fields": [],
@@ -134,6 +136,8 @@ def _extract_field_mappings(docs: list[dict]) -> dict:
             if any(k in fl for k in ("geo", "country", "city", "region")):
                 if field not in mappings["geoip_fields"]:
                     mappings["geoip_fields"].append(field)
+            if "country" in fl and field not in mappings["country_fields"]:
+                mappings["country_fields"].append(field)
 
             # --- Protocol ---
             if any(k in fl for k in ("proto", "protocol", "transport")):

@@ -137,6 +137,26 @@ class TestEntityExtraction:
         assert "1.2.3.4" in entities["ips"]
         assert len(entities["ips"]) == 1
 
+    def test_extract_does_not_trust_requested_country_metadata_on_validation_failure(self):
+        """Validation-failed OpenSearch results should not inject requested countries as discovered facts."""
+        aggregated = {
+            "opensearch_querier": {
+                "status": "ok",
+                "validation_failed": True,
+                "results": [
+                    {"src_ip": "192.168.0.85", "dst_ip": "92.63.103.84"},
+                ],
+                "countries": ["Russia"],
+                "ports": ["443"],
+            }
+        }
+
+        entities = _extract_entities_from_previous_results(aggregated)
+
+        assert "192.168.0.85" in entities["ips"]
+        assert "92.63.103.84" in entities["ips"]
+        assert entities["countries"] == []
+
 
 class TestContextAwareQuestionEnrichment:
     """Test that threat_analyst questions are enriched with discovered entities."""

@@ -17,6 +17,21 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+def _classify_directional_ip_field(field_name: str, mappings: dict) -> None:
+    """Add an IP field to directional buckets using generic field-name hints."""
+    lower_name = field_name.lower()
+
+    if field_name not in mappings["ip_fields"]:
+        mappings["ip_fields"].append(field_name)
+
+    if any(token in lower_name for token in ("src", "source", "client", "orig", "remote", "local")):
+        if field_name not in mappings["source_ip_fields"]:
+            mappings["source_ip_fields"].append(field_name)
+    if any(token in lower_name for token in ("dst", "dest", "destination", "server", "resp", "peer")):
+        if field_name not in mappings["destination_ip_fields"]:
+            mappings["destination_ip_fields"].append(field_name)
+
+
 def discover_field_mappings(db: Any, llm: Any) -> dict:
     """Discover available fields from OpenSearch mappings and RAG documentation.
     
@@ -33,9 +48,13 @@ def discover_field_mappings(db: Any, llm: Any) -> dict:
     """
     mappings = {
         "ip_fields": [],
+        "source_ip_fields": [],
+        "destination_ip_fields": [],
+        "country_fields": [],
         "text_fields": [],
         "port_fields": [],
         "domain_fields": [],
+        "geo_fields": [],
         "timestamp_fields": [],
         "all_fields": [],  # Fallback for multi_match
     }
@@ -60,11 +79,18 @@ def discover_field_mappings(db: Any, llm: Any) -> dict:
                     mappings["all_fields"].append(field_name)
                     
                     # Classify by type
-                    if field_type in ("ip", "geo_point"):
-                        if field_name not in mappings["ip_fields"]:
-                            mappings["ip_fields"].append(field_name)
+                    if field_type == "ip":
+                        _classify_directional_ip_field(field_name, mappings)
+                    elif field_type == "geo_point":
+                        if field_name not in mappings["geo_fields"]:
+                            mappings["geo_fields"].append(field_name)
                     elif field_type == "keyword":
-                        if any(kw in field_name.lower() for kw in ["port", "destination.port"]):
+                        if "country" in field_name.lower():
+                            if field_name not in mappings["country_fields"]:
+                                mappings["country_fields"].append(field_name)
+                            if field_name not in mappings["text_fields"]:
+                                mappings["text_fields"].append(field_name)
+                        elif any(kw in field_name.lower() for kw in ["port", "destination.port"]):
                             if field_name not in mappings["port_fields"]:
                                 mappings["port_fields"].append(field_name)
                         elif any(kw in field_name.lower() for kw in ["domain", "hostname", "fqdn"]):
@@ -94,6 +120,8 @@ def discover_field_mappings(db: Any, llm: Any) -> dict:
                                 if nested_type == "keyword":
                                     if "country" in full_field_name.lower():
                                         # Country fields for geoIP filtering
+                                        if full_field_name not in mappings["country_fields"]:
+                                            mappings["country_fields"].append(full_field_name)
                                         if full_field_name not in mappings["text_fields"]:
                                             mappings["text_fields"].append(full_field_name)
                                         logger.debug("Found country field: %s", full_field_name)
@@ -106,9 +134,11 @@ def discover_field_mappings(db: Any, llm: Any) -> dict:
                                 elif nested_type in ("text", "wildcard"):
                                     if full_field_name not in mappings["text_fields"]:
                                         mappings["text_fields"].append(full_field_name)
-                                elif nested_type in ("ip", "geo_point"):
-                                    if full_field_name not in mappings["ip_fields"]:
-                                        mappings["ip_fields"].append(full_field_name)
+                                elif nested_type == "ip":
+                                    _classify_directional_ip_field(full_field_name, mappings)
+                                elif nested_type == "geo_point":
+                                    if full_field_name not in mappings["geo_fields"]:
+                                        mappings["geo_fields"].append(full_field_name)
             
             if mappings["all_fields"]:
                 logger.debug(
@@ -135,6 +165,8 @@ def discover_field_mappings(db: Any, llm: Any) -> dict:
                             _ftype = _finfo.get("inferred_type", "text")
                             if _fname not in mappings["all_fields"]:
                                 mappings["all_fields"].append(_fname)
+                            if "country" in _fname.lower() and _fname not in mappings["country_fields"]:
+                                mappings["country_fields"].append(_fname)
                             if _ftype == "ip" and _fname not in mappings["ip_fields"]:
                                 mappings["ip_fields"].append(_fname)
                             elif _ftype == "port" and _fname not in mappings["port_fields"]:
@@ -215,6 +247,8 @@ def _parse_field_documentation(field_doc: str, mappings: dict) -> None:
         if any(kw in lower for kw in ["ipv4", "ip address", "src_ip", "dest_ip", "source ip", "destination ip"]):
             if field not in mappings["ip_fields"]:
                 mappings["ip_fields"].append(field)
+        elif "country" in lower and field not in mappings["country_fields"]:
+            mappings["country_fields"].append(field)
         elif any(kw in lower for kw in ["port", "destination.port"]):
             if field not in mappings["port_fields"]:
                 mappings["port_fields"].append(field)

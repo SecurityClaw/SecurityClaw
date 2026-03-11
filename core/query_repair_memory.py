@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Optional
 from datetime import datetime
 
+from core.config import Config
+
 logger = logging.getLogger(__name__)
 
 MEMORY_FILE = Path(__file__).parent.parent / "data" / "query_repair_memory.json"
@@ -23,9 +25,12 @@ class QueryRepairMemory:
     
     def __init__(self):
         """Initialize the repair memory."""
+        cfg = Config()
         self.repairs = {}
         self.field_types = {}
         self.error_patterns = {}
+        self.max_repairs = int(cfg.get("memory", "query_repair_max_repairs", default=128) or 128)
+        self.max_field_types = int(cfg.get("memory", "query_repair_max_field_types", default=512) or 512)
         self.load()
     
     def load(self):
@@ -37,6 +42,7 @@ class QueryRepairMemory:
                     self.repairs = data.get("repairs", {})
                     self.field_types = data.get("field_types", {})
                     self.error_patterns = data.get("error_patterns", {})
+                self._compact()
                 logger.debug("[QueryRepairMemory] Loaded %d repairs, %d field types", 
                            len(self.repairs), len(self.field_types))
         except Exception as e:
@@ -45,6 +51,7 @@ class QueryRepairMemory:
     def save(self):
         """Save memory to disk."""
         try:
+            self._compact()
             MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(MEMORY_FILE, 'w') as f:
                 json.dump({
@@ -80,7 +87,13 @@ class QueryRepairMemory:
     
     def record_field_type(self, field_name: str, field_type: str):
         """Record the type of a field from index mapping."""
+        if field_name in self.field_types:
+            del self.field_types[field_name]
         self.field_types[field_name] = field_type
+        if len(self.field_types) > self.max_field_types:
+            overflow = len(self.field_types) - self.max_field_types
+            for stale_field in list(self.field_types.keys())[:overflow]:
+                del self.field_types[stale_field]
         if len(self.field_types) % 10 == 0:
             logger.debug("[QueryRepairMemory] Learned field: %s → %s", field_name, field_type)
         
@@ -107,6 +120,20 @@ class QueryRepairMemory:
         
         logger.info("[QueryRepairMemory] Learned %d fields from mapping", len(self.field_types))
         self.save()
+
+    def _compact(self):
+        """Keep on-disk repair memory bounded and recent."""
+        if len(self.repairs) > self.max_repairs:
+            def _repair_sort_key(item):
+                payload = item[1] if isinstance(item[1], dict) else {}
+                return payload.get("timestamp", "")
+
+            sorted_repairs = sorted(self.repairs.items(), key=_repair_sort_key, reverse=True)
+            self.repairs = dict(sorted_repairs[: self.max_repairs])
+
+        if len(self.field_types) > self.max_field_types:
+            kept_items = list(self.field_types.items())[-self.max_field_types :]
+            self.field_types = dict(kept_items)
 
 
 def _normalize_error(error_msg: str) -> str:

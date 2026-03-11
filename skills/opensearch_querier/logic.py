@@ -11,6 +11,7 @@ All query logic is in core.query_builder (DRY principle).
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import re
@@ -20,8 +21,171 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 INSTRUCTION_PATH = Path(__file__).parent / "instruction.md"
+PLANNING_PROMPT_PATH = Path(__file__).parent / "PLANNING_PROMPT.md"
 SKILL_NAME = "opensearch_querier"
 _IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_NON_IP_FIELD_TERMS = {
+    "latitude",
+    "longitude",
+    "country",
+    "city",
+    "geohash",
+    "timezone",
+    "region",
+    "postal",
+    "continent",
+    "location",
+    "asn",
+}
+
+
+def _parse_time_expression(value: str, *, now: datetime | None = None) -> datetime | None:
+    """Parse a limited subset of OpenSearch date math and ISO timestamps."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    current = now or datetime.now(timezone.utc)
+    text = value.strip()
+    normalized = text.lower()
+
+    if normalized == "now":
+        return current
+    if normalized == "now/d":
+        return current.replace(hour=0, minute=0, second=0, microsecond=0)
+    if normalized == "now/w":
+        start_of_day = current.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start_of_day - timedelta(days=start_of_day.weekday())
+    if normalized == "now/m":
+        return current.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    relative_match = re.fullmatch(r"now-(\d+)([hdwm])", normalized)
+    if relative_match:
+        amount = int(relative_match.group(1))
+        unit = relative_match.group(2)
+        if unit == "h":
+            return current - timedelta(hours=amount)
+        if unit == "d":
+            return current - timedelta(days=amount)
+        if unit == "w":
+            return current - timedelta(weeks=amount)
+        if unit == "m":
+            return current - timedelta(days=30 * amount)
+
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _format_time_range_label(raw_time_range: Any, resolved_time_range: Any) -> str:
+    """Return a human-friendly label when the resolved time window differs from the raw plan."""
+    if raw_time_range == "custom":
+        if resolved_time_range == "now/d":
+            return "today"
+        if resolved_time_range == "now-24h":
+            return "past 24 hours"
+        if resolved_time_range == "now/w":
+            return "this week"
+        if resolved_time_range == "now/M":
+            return "this month"
+    return str(raw_time_range) if raw_time_range is not None else "now-90d"
+
+
+def _resolve_time_range_for_question(question: str, raw_time_range: Any) -> tuple[str | dict[str, str], str]:
+    """Map vague/custom LLM time windows to concrete date math for common question forms."""
+    question_text = str(question or "")
+    q_lower = question_text.lower()
+
+    if re.search(r"\btoday\b|\bsince midnight\b", q_lower):
+        return "now/d", "today"
+    if re.search(r"\b(this\s+week)\b", q_lower):
+        return "now/w", "this week"
+    if re.search(r"\b(this\s+month)\b", q_lower):
+        return "now/M", "this month"
+
+    relative_match = re.search(r"\b(?:past|last)\s+(\d+)\s+(hour|hours|day|days|week|weeks|month|months)\b", q_lower)
+    if relative_match:
+        amount = int(relative_match.group(1))
+        unit = relative_match.group(2)
+        suffix = "d"
+        if "hour" in unit:
+            suffix = "h"
+        elif "week" in unit:
+            suffix = "w"
+        elif "month" in unit:
+            suffix = "M"
+        label = relative_match.group(0)
+        return f"now-{amount}{suffix}", label
+
+    if isinstance(raw_time_range, str) and raw_time_range.strip():
+        normalized = raw_time_range.strip()
+        if normalized.lower() == "custom":
+            logger.warning("[%s] Unresolved custom time range from planner for question: %s", SKILL_NAME, question_text[:200])
+            return "now-90d", "now-90d"
+        return normalized, _format_time_range_label(normalized, normalized)
+
+    return "now-90d", "now-90d"
+
+
+def _build_time_filter(time_range: str | dict[str, str]) -> dict:
+    """Build the @timestamp range filter from a normalized time range spec."""
+    if isinstance(time_range, dict):
+        bounds = {
+            key: value
+            for key, value in time_range.items()
+            if key in {"gte", "lte", "gt", "lt"} and isinstance(value, str) and value.strip()
+        }
+        if bounds:
+            return {"range": {"@timestamp": bounds}}
+    return {"range": {"@timestamp": {"gte": str(time_range)}}}
+
+
+def _filter_results_for_time_range(results: list[dict], time_range: str | dict[str, str]) -> list[dict]:
+    """Enforce supported relative time windows client-side so repaired queries cannot widen scope."""
+    if not results:
+        return results
+
+    now = datetime.now(timezone.utc)
+    lower_bound: datetime | None = None
+    upper_bound: datetime | None = now
+    lower_inclusive = True
+    upper_inclusive = True
+
+    if isinstance(time_range, dict):
+        if "gte" in time_range:
+            lower_bound = _parse_time_expression(time_range["gte"], now=now)
+        elif "gt" in time_range:
+            lower_bound = _parse_time_expression(time_range["gt"], now=now)
+            lower_inclusive = False
+        if "lte" in time_range:
+            upper_bound = _parse_time_expression(time_range["lte"], now=now)
+        elif "lt" in time_range:
+            upper_bound = _parse_time_expression(time_range["lt"], now=now)
+            upper_inclusive = False
+    else:
+        lower_bound = _parse_time_expression(str(time_range), now=now)
+
+    if lower_bound is None and upper_bound is None:
+        return results
+
+    filtered: list[dict] = []
+    for row in results:
+        timestamp_value = row.get("@timestamp") or row.get("timestamp")
+        parsed_timestamp = _parse_time_expression(str(timestamp_value), now=now) if timestamp_value else None
+        if parsed_timestamp is None:
+            continue
+        if lower_bound is not None:
+            if lower_inclusive and parsed_timestamp < lower_bound:
+                continue
+            if not lower_inclusive and parsed_timestamp <= lower_bound:
+                continue
+        if upper_bound is not None:
+            if upper_inclusive and parsed_timestamp > upper_bound:
+                continue
+            if not upper_inclusive and parsed_timestamp >= upper_bound:
+                continue
+        filtered.append(row)
+    return filtered
 
 
 def _extract_json_from_response(response: str) -> dict | None:
@@ -104,6 +268,31 @@ def _extract_ports_from_text(text: str) -> list[int]:
     return sorted(list(ports))
 
 
+def _load_planning_prompt() -> str:
+    """Load the static OpenSearch planning prompt from markdown."""
+    try:
+        return PLANNING_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        logger.warning("[%s] Could not load planning prompt markdown: %s", SKILL_NAME, exc)
+        return (
+            "Analyze the user's question and extract structured OpenSearch query parameters. "
+            "Return strict JSON with reasoning, search_type, search_terms, countries, ports, protocols, "
+            "time_range, matching_strategy, and field_analysis."
+        )
+
+
+def _log_excerpt(text: Any, limit: int = 600) -> str:
+    """Return a log-friendly preview with an explicit ellipsis instead of abrupt slicing."""
+    rendered = str(text or "")
+    if len(rendered) <= limit:
+        return rendered
+    trimmed = rendered[:limit].rstrip()
+    sentence_end = max(trimmed.rfind(". "), trimmed.rfind("\n"))
+    if sentence_end >= max(0, limit - 120):
+        trimmed = trimmed[:sentence_end + 1].rstrip()
+    return trimmed + " ..."
+
+
 def _extract_countries_from_text(text: str) -> list[str]:
     """Extract country names from text."""
     if not text:
@@ -136,6 +325,85 @@ def _extract_countries_from_text(text: str) -> list[str]:
             countries.add(country_name)
     
     return sorted(list(countries))
+
+
+def _score_ip_query_field(field_name: str) -> int:
+    """Score candidate fields for exact IP queries while excluding geo metadata."""
+    lower_name = str(field_name).lower()
+    leaf_name = lower_name.split(".")[-1]
+    tokens = {token for token in re.split(r"[^a-z0-9]+", lower_name) if token}
+
+    if not lower_name or any(term in lower_name for term in _NON_IP_FIELD_TERMS):
+        return -100
+    if lower_name in {"geoip", "source", "destination", "client", "server"}:
+        return -100
+
+    score = 0
+    if leaf_name in {"ip", "ip_address", "ipaddress", "ipv4", "ipv6"}:
+        score += 90
+    elif lower_name.endswith(("_ip", ".ip", ".ip_address", ".ipv4", ".ipv6")):
+        score += 80
+    elif tokens.intersection({"ip", "ipv4", "ipv6"}):
+        score += 70
+    elif leaf_name == "address" and tokens.intersection({
+        "src",
+        "source",
+        "dst",
+        "dest",
+        "destination",
+        "client",
+        "server",
+        "remote",
+        "local",
+        "orig",
+        "resp",
+    }):
+        score += 55
+
+    if tokens.intersection({"src", "source", "client", "orig", "remote", "local"}):
+        score += 10
+    if tokens.intersection({"dst", "dest", "destination", "server", "resp", "peer"}):
+        score += 10
+    if lower_name.startswith("geoip.") and leaf_name == "ip":
+        score -= 5
+
+    return score
+
+
+def _select_ip_query_fields(field_mappings: dict, ip_direction: str = "any") -> list[str]:
+    """Choose a small, high-confidence set of actual IP fields for IP searches."""
+    ranked_fields: dict[str, int] = {}
+    candidate_lists: list[list[str]] = []
+    preferred_fields = (
+        field_mappings.get("source_ip_fields") if ip_direction == "source" else
+        field_mappings.get("destination_ip_fields") if ip_direction == "destination" else
+        None
+    ) or []
+
+    if preferred_fields:
+        candidate_lists.append(preferred_fields)
+
+    if ip_direction == "any" or not preferred_fields:
+        candidate_lists.extend([
+            field_mappings.get("source_ip_fields") or [],
+            field_mappings.get("destination_ip_fields") or [],
+            field_mappings.get("ip_fields") or [],
+            field_mappings.get("all_fields") or [],
+        ])
+
+    for list_index, candidate_list in enumerate(candidate_lists):
+        priority_bonus = 20 if list_index == 0 and ip_direction in {"source", "destination"} else 0
+        for field_name in candidate_list:
+            score = _score_ip_query_field(field_name)
+            if score <= 0:
+                continue
+            ranked_fields[field_name] = max(score + priority_bonus, ranked_fields.get(field_name, -1000))
+
+    ordered_fields = sorted(
+        ranked_fields,
+        key=lambda field_name: (-ranked_fields[field_name], len(str(field_name)), str(field_name)),
+    )
+    return ordered_fields[:6]
 
 
 def _fallback_plan_from_question(
@@ -263,6 +531,186 @@ def _extract_ips_from_previous_results(previous_results: dict) -> list[str]:
     return ips
 
 
+def _infer_ip_direction(question: str, reasoning: str = "") -> str:
+    """Infer whether the user means source, destination, or any IP direction."""
+    combined = f"{question} {reasoning}".lower()
+
+    if any(re.search(pattern, combined) for pattern in (
+        r"\bfrom\s+",
+        r"\boriginating\s+from\b",
+        r"\bsource\s+ip\b",
+        r"\bclient\s+ip\b",
+        r"\bremote\s+ip\b",
+    )):
+        return "source"
+    if any(re.search(pattern, combined) for pattern in (
+        r"\bto\s+",
+        r"\bdestination\s+ip\b",
+        r"\bdest\s+ip\b",
+        r"\bserver\s+ip\b",
+        r"\btarget\s+ip\b",
+    )):
+        return "destination"
+    return "any"
+
+
+def _opposite_ip_direction(ip_direction: str) -> str:
+    if ip_direction == "source":
+        return "destination"
+    if ip_direction == "destination":
+        return "source"
+    return "any"
+
+
+def _get_nested_value(record: dict, field_name: str) -> Any:
+    """Return a dotted-path value from a record if present."""
+    if field_name in record:
+        return record.get(field_name)
+
+    current: Any = record
+    for part in field_name.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current.get(part)
+    return current
+
+
+def _first_present_value(record: dict, field_names: list[str]) -> Any:
+    """Return the first non-empty value for the provided candidate fields."""
+    for field_name in field_names:
+        value = _get_nested_value(record, field_name)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _candidate_country_fields(field_mappings: dict | None) -> list[str]:
+    """Return country-related fields discovered from RAG/schema metadata."""
+    if not isinstance(field_mappings, dict):
+        return []
+
+    preferred = list(field_mappings.get("country_fields") or [])
+    if preferred:
+        return preferred
+
+    all_fields = field_mappings.get("all_fields") or []
+    return [field for field in all_fields if "country" in str(field).lower()][:12]
+
+
+def _extract_validation_samples(results: list[dict], field_mappings: dict | None = None) -> list[dict]:
+    """Extract compact, schema-aware validation samples from search results."""
+    country_fields = _candidate_country_fields(field_mappings)
+    country_fallbacks = [
+        "geoip.country_name",
+        "country_name",
+        "country",
+        "geo.country_name",
+    ]
+    if country_fields:
+        country_candidates = country_fields + [field for field in country_fallbacks if field not in country_fields]
+    else:
+        country_candidates = country_fallbacks
+
+    samples: list[dict] = []
+    for result in results[:3]:
+        sample_record: dict[str, Any] = {}
+
+        if "alert" in result and isinstance(result["alert"], dict):
+            alert_obj = result["alert"]
+            sample_record["signature"] = alert_obj.get("signature")
+            sample_record["signature_id"] = alert_obj.get("signature_id")
+            sample_record["category"] = alert_obj.get("category")
+        else:
+            sample_record["signature"] = _first_present_value(result, ["alert.signature", "signature"])
+            sample_record["signature_id"] = _first_present_value(result, ["alert.signature_id", "signature_id"])
+            sample_record["category"] = _first_present_value(result, ["alert.category", "category"])
+
+        sample_record["timestamp"] = _first_present_value(result, ["@timestamp", "timestamp", "flow.start", "flow.end"])
+        sample_record["src_ip"] = _first_present_value(result, ["src_ip", "source.ip", "flow.src_ip", "alert.source.ip"])
+        sample_record["dest_ip"] = _first_present_value(result, ["dest_ip", "destination.ip", "flow.dest_ip", "alert.target.ip"])
+        sample_record["country"] = _first_present_value(result, country_candidates)
+        sample_record["country_field"] = next(
+            (field_name for field_name in country_candidates if _get_nested_value(result, field_name) not in (None, "", [], {})),
+            None,
+        )
+
+        samples.append(sample_record)
+
+    return samples
+
+
+def _filter_results_for_exact_ip_match(
+    results: list[dict],
+    search_terms: list,
+    field_mappings: dict,
+    ip_direction: str,
+) -> list[dict]:
+    """Keep only records that actually contain the requested IP in the intended fields."""
+    requested_ips = {str(term).strip().lower() for term in search_terms if _IP_PATTERN.fullmatch(str(term).strip())}
+    if not requested_ips or not results:
+        return results
+
+    candidate_fields = _select_ip_query_fields(field_mappings, ip_direction)
+    if not candidate_fields:
+        return results
+
+    filtered_results: list[dict] = []
+    for row in results:
+        for field_name in candidate_fields:
+            field_value = _get_nested_value(row, field_name)
+            if isinstance(field_value, str) and field_value.strip().lower() in requested_ips:
+                filtered_results.append(row)
+                break
+    return filtered_results
+
+
+def _build_directional_alternative_hint(
+    results: list[dict],
+    alternative_direction: str,
+    time_range_label: str,
+) -> dict | None:
+    """Summarize opposite-direction IP hits when the requested direction has no matches."""
+    if not results or alternative_direction not in {"source", "destination"}:
+        return None
+
+    timestamps: list[str] = []
+    peers: set[str] = set()
+    for row in results[:25]:
+        ts = row.get("@timestamp") or row.get("timestamp")
+        if ts:
+            timestamps.append(str(ts))
+
+        if alternative_direction == "destination":
+            peer_candidates = [
+                row.get("src_ip"),
+                row.get("source_ip"),
+                row.get("source.ip"),
+                row.get("source", {}).get("ip") if isinstance(row.get("source"), dict) else None,
+            ]
+        else:
+            peer_candidates = [
+                row.get("dest_ip"),
+                row.get("destination_ip"),
+                row.get("destination.ip"),
+                row.get("destination", {}).get("ip") if isinstance(row.get("destination"), dict) else None,
+            ]
+
+        for candidate in peer_candidates:
+            if candidate:
+                peers.add(str(candidate))
+
+    timestamps = sorted(timestamps)
+    return {
+        "direction": alternative_direction,
+        "results_count": len(results),
+        "time_range_label": time_range_label,
+        "sample_peers": sorted(peers)[:10],
+        "earliest": timestamps[0] if timestamps else None,
+        "latest": timestamps[-1] if timestamps else None,
+        "results": results[:10],
+    }
+
+
 def _question_asks_for_ip_geolocation(question: str) -> bool:
     """Return True for follow-ups asking where referenced IPs are from."""
     q = str(question or "").lower()
@@ -382,7 +830,6 @@ def _recover_followup_plan_from_context(
         plan["time_range"] = plan.get("time_range") or "now-90d"
         plan["field_analysis"] = f"Searching traffic details on recovered IPs: {', '.join(recovered_ips[:3])}"
         plan["reasoning"] = f"{reasoning_prefix} {recovery_reason}".strip()
-        return plan
 
     return plan
 
@@ -526,14 +973,23 @@ def run(context: dict) -> dict:
     logger.info("[%s] REASONING CHAIN - Step 1: Intent Analysis", SKILL_NAME)
     logger.info("[%s]   Search Type: %s", SKILL_NAME, query_plan.get("search_type"))
     logger.info("[%s]   Matching Strategy: %s", SKILL_NAME, query_plan.get("matching_strategy"))
-    logger.info("[%s]   Reasoning: %s", SKILL_NAME, query_plan.get("reasoning", "")[:350])
+    logger.info("[%s]   Reasoning: %s", SKILL_NAME, _log_excerpt(query_plan.get("reasoning", ""), limit=500))
     
     search_terms = query_plan.get("search_terms", [])
     countries = query_plan.get("countries", [])
     ports = query_plan.get("ports", [])
     protocols = query_plan.get("protocols", [])
-    time_range = query_plan.get("time_range", "now-90d")
+    raw_time_range = query_plan.get("time_range", "now-90d")
+    resolved_time_range, time_range_label = _resolve_time_range_for_question(question, raw_time_range)
     matching_strategy = query_plan.get("matching_strategy", "token")
+    ip_direction = _infer_ip_direction(question, query_plan.get("reasoning", ""))
+    requested_filters = {
+        "countries": countries,
+        "ports": ports,
+        "protocols": protocols,
+        "time_range": resolved_time_range,
+        "time_range_label": time_range_label,
+    }
 
     has_criteria = bool(search_terms or countries or ports or protocols)
     if not has_criteria:
@@ -547,22 +1003,25 @@ def run(context: dict) -> dict:
         countries=countries,
         ports=ports,
         protocols=protocols,
-        time_range=time_range,
+        time_range=resolved_time_range,
         field_mappings=field_mappings,
         matching_strategy=matching_strategy,
+        ip_direction=ip_direction,
     )
     query["size"] = parameters.get("size", 200)
 
-    logger.debug("[%s] Built query: %s", SKILL_NAME, str(query)[:500])
+    logger.debug("[%s] Built query: %s", SKILL_NAME, _log_excerpt(query, limit=700))
     logger.info(
-        "[%s] Querying '%s': %s | Strategy=%s | Time: %s | Countries: %s | Ports: %s | Terms: %s | Field_mappings_type=%s",
-        SKILL_NAME, index, query_plan.get("reasoning", ""), matching_strategy, time_range, countries, ports, search_terms,
+        "[%s] Querying '%s': %s | Strategy=%s | Time(raw=%s,resolved=%s) | Countries: %s | Ports: %s | Terms: %s | Field_mappings_type=%s",
+        SKILL_NAME, index, query_plan.get("reasoning", ""), matching_strategy, raw_time_range, resolved_time_range, countries, ports, search_terms,
         type(field_mappings).__name__
     )
 
     try:
         validation: dict[str, Any] = {"is_valid": True, "issue": "", "reflection": ""}
         results = _execute_search_with_llm_repair(db, llm, index, query)
+        results = _filter_results_for_exact_ip_match(results, search_terms, field_mappings, ip_direction)
+        results = _filter_results_for_time_range(results, resolved_time_range)
         logger.info("[%s] Raw results from opensearch: %d items", SKILL_NAME, len(results) if results else 0)
         
         # ── LOG REASONING STEP 2: Query Execution ──────────────────────────
@@ -593,7 +1052,9 @@ def run(context: dict) -> dict:
             validation = _llm_validate_results_reflective(
                 question=question,
                 search_terms=search_terms,
+                requested_filters=requested_filters,
                 results=results,
+                field_mappings=field_mappings,
                 previous_validation_failed=False,
                 llm=llm,
             )
@@ -604,12 +1065,12 @@ def run(context: dict) -> dict:
                        validation.get("is_valid"), validation.get("confidence", 0))
             if not validation.get("is_valid"):
                 logger.warning("[%s]   Issue: %s", SKILL_NAME, validation.get("issue"))
-                logger.info("[%s]   LLM Reflection: %s", SKILL_NAME, validation.get("reflection", "none")[:500])
+                logger.info("[%s]   LLM Reflection: %s", SKILL_NAME, _log_excerpt(validation.get("reflection", "none"), limit=700))
             
             if not validation.get("is_valid"):
                 logger.warning(
                     "[%s] LLM validation failed: %s | Reflection: %s",
-                    SKILL_NAME, validation.get("issue"), validation.get("reflection", "none")[:1000]
+                    SKILL_NAME, validation.get("issue"), _log_excerpt(validation.get("reflection", "none"), limit=1200)
                 )
                 # Try recovery: switch matching strategy
                 recovery_strategy = "token" if matching_strategy == "phrase" else "phrase"
@@ -620,19 +1081,24 @@ def run(context: dict) -> dict:
                     countries=countries,
                     ports=ports,
                     protocols=protocols,
-                    time_range=time_range,
+                    time_range=resolved_time_range,
                     field_mappings=field_mappings,
                     matching_strategy=recovery_strategy,
+                    ip_direction=ip_direction,
                 )
                 recovery_query["size"] = parameters.get("size", 200)
                 
                 recovery_results = _execute_search_with_llm_repair(db, llm, index, recovery_query)
+                recovery_results = _filter_results_for_exact_ip_match(recovery_results, search_terms, field_mappings, ip_direction)
+                recovery_results = _filter_results_for_time_range(recovery_results, resolved_time_range)
                 
                 if recovery_results:
                     recovery_validation = _llm_validate_results_reflective(
                         question=question,
                         search_terms=search_terms,
+                        requested_filters=requested_filters,
                         results=recovery_results,
+                        field_mappings=field_mappings,
                         previous_validation_failed=True,
                         llm=llm,
                     )
@@ -642,6 +1108,49 @@ def run(context: dict) -> dict:
                         validation = recovery_validation
                     else:
                         logger.warning("[%s] Recovery failed, keeping original results", SKILL_NAME)
+
+        directional_alternative = None
+
+        if not results and search_terms and ip_direction in {"source", "destination"}:
+            alternative_direction = _opposite_ip_direction(ip_direction)
+            logger.info(
+                "[%s] No %s-direction IP matches found; probing %s direction before LLM diagnosis",
+                SKILL_NAME,
+                ip_direction,
+                alternative_direction,
+            )
+            alternative_query = _build_opensearch_query(
+                search_terms=search_terms,
+                countries=countries,
+                ports=ports,
+                protocols=protocols,
+                time_range=resolved_time_range,
+                field_mappings=field_mappings,
+                matching_strategy=matching_strategy,
+                ip_direction=alternative_direction,
+            )
+            alternative_query["size"] = parameters.get("size", 200)
+            alternative_results = _execute_search_with_llm_repair(db, llm, index, alternative_query)
+            alternative_results = _filter_results_for_exact_ip_match(
+                alternative_results,
+                search_terms,
+                field_mappings,
+                alternative_direction,
+            )
+            alternative_results = _filter_results_for_time_range(alternative_results, resolved_time_range)
+            if alternative_results:
+                directional_alternative = _build_directional_alternative_hint(
+                    alternative_results,
+                    alternative_direction,
+                    time_range_label,
+                )
+                logger.info(
+                    "[%s] Found %d opposite-direction IP matches (%s) in %s window",
+                    SKILL_NAME,
+                    len(alternative_results),
+                    alternative_direction,
+                    time_range_label,
+                )
 
         # Recovery: if primary query returns 0 results, diagnose why and suggest recovery
         if not results:
@@ -659,7 +1168,7 @@ def run(context: dict) -> dict:
                 llm=llm,
             )
             
-            logger.info("[%s]   Suggested Recovery: %s", SKILL_NAME, diagnosis.get("suggested_recovery", "none")[:500])
+            logger.info("[%s]   Suggested Recovery: %s", SKILL_NAME, _log_excerpt(diagnosis.get("suggested_recovery", "none"), limit=700))
             
             # Try LLM-suggested recovery if it looks promising
             if diagnosis.get("should_try_recovery"):
@@ -673,13 +1182,15 @@ def run(context: dict) -> dict:
                     countries=countries,
                     ports=ports,
                     protocols=protocols,
-                    time_range=time_range,
+                    time_range=resolved_time_range,
                     field_mappings=field_mappings,
                     matching_strategy=recovery_strategy,
+                    ip_direction=ip_direction,
                 )
                 if recovery_query:
                     recovery_query["size"] = parameters.get("size", 200)
                     results = _execute_search_with_llm_repair(db, llm, index, recovery_query)
+                    results = _filter_results_for_exact_ip_match(results, search_terms, field_mappings, ip_direction)
                     if results:
                         logger.info("[%s] Recovery successful: got %d results after strategy switch", 
                                    SKILL_NAME, len(results))
@@ -692,13 +1203,16 @@ def run(context: dict) -> dict:
                     countries=countries,
                     ports=ports,
                     protocols=protocols,
-                    time_range=time_range,
+                    time_range=resolved_time_range,
                     field_mappings=field_mappings,
+                    ip_direction=ip_direction,
                     relaxed=True,
                 )
                 if recovery:
                     recovery["size"] = parameters.get("size", 200)
                     results = _execute_search_with_llm_repair(db, llm, index, recovery)
+                    results = _filter_results_for_exact_ip_match(results, search_terms, field_mappings, ip_direction)
+                    results = _filter_results_for_time_range(results, resolved_time_range)
                     if results:
                         logger.info("[%s] Relaxed recovery succeeded: got %d results", SKILL_NAME, len(results))
 
@@ -710,8 +1224,12 @@ def run(context: dict) -> dict:
             "countries": countries,
             "ports": ports,
             "protocols": protocols,
-            "time_range": time_range,
+            "time_range": raw_time_range,
+            "time_range_label": time_range_label,
+            "time_range_resolved": resolved_time_range,
             "reasoning": query_plan.get("reasoning", ""),
+            "ip_direction": ip_direction,
+            "directional_alternative": directional_alternative,
             "validation_failed": bool(results and not validation.get("is_valid", True)),
             "validation_issue": str(validation.get("issue", "")),
             "validation_reflection": str(validation.get("reflection", "")),
@@ -742,9 +1260,10 @@ def _build_opensearch_query(
     countries: list,
     ports: list,
     protocols: list,
-    time_range: str,
+    time_range: str | dict[str, str],
     field_mappings: dict,
     matching_strategy: str = "token",
+    ip_direction: str = "any",
     relaxed: bool = False,
 ) -> dict:
     """
@@ -765,7 +1284,7 @@ def _build_opensearch_query(
     
     must_clauses = []
     all_fields = field_mappings.get("all_fields") or []
-    country_fields = [f for f in all_fields if "country" in str(f).lower()][:10]
+    country_fields = _candidate_country_fields(field_mappings)[:10]
     port_fields = (field_mappings.get("port_fields") or [])[:6]
     
     # ── PRIORITIZE SPECIFIC FIELD TYPES ──────────────────────────────────
@@ -882,9 +1401,8 @@ def _build_opensearch_query(
         is_ip_search = any(re.match(ip_pattern, str(t)) for t in search_terms)
         
         if is_ip_search:
-            # Use IP-specific fields for IP searches
-            ip_fields = [f for f in all_fields if any(k in str(f).lower() for k in ("src_ip", "dest_ip", "ip"))][:10]
-            fields = ip_fields if ip_fields else [f for f in all_fields if "ip" in str(f).lower()][:10]
+            # Use only high-confidence IP fields to avoid malformed geo/metadata queries.
+            fields = _select_ip_query_fields(field_mappings, ip_direction)
             logger.info("[%s] _build_opensearch_query: Detected IP search - using IP fields: %s", SKILL_NAME, fields[:5] if len(fields) > 5 else fields)
         else:
             # Select text fields for keyword search
@@ -941,7 +1459,7 @@ def _build_opensearch_query(
     if not must_clauses:
         return {"query": {"match_none": {}}}
 
-    time_filter = {"range": {"@timestamp": {"gte": time_range}}}
+    time_filter = _build_time_filter(time_range)
     return {
         "query": {
             "bool": {
@@ -984,7 +1502,7 @@ Diagnose the most likely root cause."""
 
     try:
         diagnosis = llm.complete(diagnosis_prompt)
-        logger.info("[%s] _diagnose_query_failure DIAGNOSIS:\n%s", SKILL_NAME, diagnosis[:300])
+        logger.info("[%s] _diagnose_query_failure DIAGNOSIS:\n%s", SKILL_NAME, _log_excerpt(diagnosis, limit=1200))
         
         # Second pass: suggest recovery
         recovery_prompt = f"""Based on this diagnosis: {diagnosis}
@@ -999,7 +1517,7 @@ What is ONE specific thing we should try next?
 Return actionable next step with explanation."""
         
         recovery = llm.complete(recovery_prompt)
-        logger.info("[%s] _diagnose_query_failure RECOVERY SUGGESTION:\n%s", SKILL_NAME, recovery[:300])
+        logger.info("[%s] _diagnose_query_failure RECOVERY SUGGESTION:\n%s", SKILL_NAME, _log_excerpt(recovery, limit=1200))
         
         return {
             "diagnosis": diagnosis,
@@ -1018,7 +1536,9 @@ Return actionable next step with explanation."""
 def _llm_validate_results_reflective(
     question: str,
     search_terms: list,
+    requested_filters: dict,
     results: list,
+    field_mappings: dict | None,
     previous_validation_failed: bool,
     llm: Any,
 ) -> dict:
@@ -1026,7 +1546,7 @@ def _llm_validate_results_reflective(
     Validate results with reflection. If validation fails, reason about why before giving up.
     """
     # First pass: quick validation
-    validation = _llm_validate_results(question, search_terms, results, llm)
+    validation = _llm_validate_results(question, search_terms, requested_filters, results, field_mappings, llm)
     
     if validation.get("is_valid"):
         logger.info("[%s] Results validated on first pass", SKILL_NAME)
@@ -1049,7 +1569,7 @@ Why did validation fail?"""
     
     try:
         reflection = llm.complete(reflection_prompt)
-        logger.info("[%s] REFLECTION ON VALIDATION FAILURE:\n%s", SKILL_NAME, reflection[:1000])
+        logger.info("[%s] REFLECTION ON VALIDATION FAILURE:\n%s", SKILL_NAME, _log_excerpt(reflection, limit=1200))
         
         return {
             **validation,
@@ -1065,7 +1585,9 @@ Why did validation fail?"""
 def _llm_validate_results(
     question: str,
     search_terms: list,
+    requested_filters: dict,
     results: list,
+    field_mappings: dict | None,
     llm: Any,
 ) -> dict:
     """
@@ -1083,28 +1605,8 @@ def _llm_validate_results(
     if not results:
         return {"is_valid": False, "issue": "No results returned", "suggestion": "Try relaxed search or different terms"}
     
-    # Sample first few results and extract relevant fields
-    samples = []
-    for result in results[:3]:
-        sample_record = {}
-        
-        # Try to extract signature fields (handle nested alert object)
-        if "alert" in result and isinstance(result["alert"], dict):
-            alert_obj = result["alert"]
-            sample_record["signature"] = alert_obj.get("signature")
-            sample_record["signature_id"] = alert_obj.get("signature_id")
-            sample_record["category"] = alert_obj.get("category")
-        else:
-            sample_record["signature"] = result.get("alert.signature") or result.get("signature")
-            sample_record["signature_id"] = result.get("alert.signature_id")
-            sample_record["category"] = result.get("alert.category")
-        
-        # Extract IPs/countries for traffic queries
-        sample_record["src_ip"] = result.get("src_ip")
-        sample_record["dest_ip"] = result.get("dest_ip")
-        sample_record["country"] = result.get("geoip.country_name") or result.get("country_name")
-        
-        samples.append(sample_record)
+    structured_filters = requested_filters if isinstance(requested_filters, dict) else {}
+    samples = _extract_validation_samples(results, field_mappings)
     
     sample_text = json.dumps(samples, indent=2, default=str)
     
@@ -1123,6 +1625,7 @@ def _llm_validate_results(
 USER QUESTION: "{question}"
 
 SEARCH TERMS: {', '.join(search_terms)}
+REQUESTED FILTERS: {json.dumps(structured_filters, default=str)}
 
 SAMPLED RESULTS (extracted key fields):
 {sample_text}
@@ -1130,7 +1633,7 @@ SAMPLED RESULTS (extracted key fields):
 VALIDATION TASK:
 1. Do the results contain fields/values matching the search terms?
 2. For signature/alert searches: Do results contain EXACT signatures? (e.g., if searching "ET POLICY", are there records with signature containing "ET POLICY"?)
-3. For traffic searches: Do results contain the countries/IPs/ports requested?
+3. For traffic searches: Do results contain the countries/IPs/ports/protocols/time window requested?
 4. Are results relevant to the user's intent?
 
 RETURN STRICT JSON:
@@ -1145,6 +1648,8 @@ CRITICAL CHECKS:
 - If searching for "ET POLICY", results must have signatures containing "ET POLICY"
 - If searching for "ET EXPLOIT", results must have "ET EXPLOIT", NOT "ET POLICY" or others
 - If searching for a country, results must have that country in geoip data
+- If a sample includes `country_field`, trust that as evidence that the record carries country metadata
+- If a sample includes timestamps inside the requested time range, do not fail validation only because the prompt did not restate the time window verbatim
 - Partial matches ARE acceptable for alert signatures (e.g., "ET POLICY Dropbox" contains "ET POLICY")
 """
 
@@ -1367,53 +1872,24 @@ def _plan_opensearch_query_with_llm(
         if field_info_parts:
             field_context = "\n\nAVAILABLE FIELDS:\n" + "\n".join(field_info_parts)
 
-    prompt = f"""You are planning an OpenSearch query. Analyze the user's question and recommend a query strategy.
+        planning_prompt = _load_planning_prompt()
+        prompt = f"""{planning_prompt}
 
 CONVERSATION CONTEXT:
 {conversation_summary if conversation_summary else "(No prior context)"}{field_context}
 
 USER QUESTION: "{question}"
 
-TASK:
-1. Extract search_terms, countries, ports, protocols from the question
-2. Identify what type of data the user wants (alerts, traffic, IPs, domains, etc.)
-3. For ALERT/SIGNATURE searches: Recommend PHRASE MATCHING (exact signature names - no tokenization)
-4. For TRAFFIC/LOG searches: Recommend TOKEN MATCHING (standard text search)
-5. Validate: if searching for "ET EXPLOIT", should match ONLY "ET EXPLOIT", not "ET INFO" or "ET POLICY"
-
-RETURN STRICT JSON:
-{{
-  "reasoning": "why you chose this strategy",
-  "search_type": "alert|traffic|domain|ip|general",
-  "search_terms": ["term1", "term2"],
-  "countries": ["country1"],
-  "ports": [443, 80],
-  "protocols": ["TCP"],
-  "time_range": "now-90d|now-30d|now-7d|custom",
-  "matching_strategy": "phrase|token|term|match",
-  "field_analysis": "explanation of field choice and matching logic"
-}}
-
-CRITICAL MATCHING RULES:
-- "phrase": Use match_phrase for exact phrase matching (no tokenization). Best for structured fields like rule names.
-  Example: searching "ET EXPLOIT" matches ONLY "ET EXPLOIT", NOT "ET INFORMATION" or "ET POLICY"
-- "token": Use standard multi_match (tokenized). For free-text fields like descriptions.
-  Example: searching "malware" matches "malware", "Malware C2", "banking malware", etc.
-- "term": Use term filter (exact value match, case-insensitive). For keyword fields.
-  Example: country codes, exact IPs, port numbers
-
-STRATEGY SELECTION:
-- If question asks about IPs, ALWAYS recommend "term" (never "phrase" for IPs)
-- If question mentions alerts/signatures/rules → use "phrase" strategy
-- If question mentions traffic/flows/connections → use "token" strategy
-- If question mentions owner/reputation WITH an IP → still use "term" for that IP
-If question mentions IPs, ALWAYS use "term" strategy (even if asking "who is the owner of IP")
-If question mentions ports, ALWAYS use "term" strategy
+Additional runtime requirements:
+- Include search_type as one of: alert|traffic|domain|ip|general
+- Include matching_strategy as one of: phrase|token|term|match
+- Include field_analysis explaining which discovered field categories matter most
+- Return STRICT JSON only
 """
 
     try:
         response = llm.complete(prompt)
-        logger.debug("[%s] LLM Plan raw: %s", SKILL_NAME, response[:300])
+        logger.debug("[%s] LLM Plan raw: %s", SKILL_NAME, _log_excerpt(response, limit=700))
 
         import json
         # Try direct parse; fallback to regex JSON extraction.

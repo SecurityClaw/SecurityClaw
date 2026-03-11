@@ -192,6 +192,33 @@ class TestThreatAnalystHistoryExtraction:
             assert isinstance(result_string, str)
             assert isinstance(queried_apis, list)
 
+    def test_enrich_excludes_private_ips_when_question_requests_public_only(self):
+        """Private/internal IPs should be dropped for follow-up reputation questions that exclude them."""
+        from skills.threat_analyst.logic import _enrich_with_reputation
+
+        history = [
+            {
+                "role": "assistant",
+                "content": "Source/destination IPs: 192.168.0.156, 37.230.117.113, 82.146.61.17.",
+            }
+        ]
+
+        with patch("skills.threat_analyst.reputation_intel.get_ip_reputation") as mock_intel:
+            mock_intel.side_effect = [
+                {"ip": "37.230.117.113", "combined_risk": "HIGH", "queries": ["abuseipdb"]},
+                {"ip": "82.146.61.17", "combined_risk": "MEDIUM", "queries": ["abuseipdb"]},
+            ]
+
+            result_string, queried_apis = _enrich_with_reputation(
+                "Aside from the private IPs, what is the reputation of the others?",
+                history,
+            )
+
+            looked_up = [call.args[0] for call in mock_intel.call_args_list]
+            assert looked_up == ["37.230.117.113", "82.146.61.17"]
+            assert "192.168.0.156" not in result_string
+            assert "abuseipdb" in queried_apis
+
     def test_threat_analyst_passes_history_to_enrich(self):
         """threat_analyst.run() should pass conversation_history to _enrich_with_reputation."""
         from skills.threat_analyst.logic import _analyze_finding

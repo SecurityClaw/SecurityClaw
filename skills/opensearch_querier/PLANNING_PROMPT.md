@@ -15,12 +15,15 @@ Respond in STRICT JSON:
 ```json
 {
   "reasoning": "What the user is looking for",
+  "search_type": "alert|traffic|domain|ip|general",
   "detected_time_range": "Time period description (or 'none')",
   "time_range": "Elasticsearch range code (now-3M, now-1w, now-7d, now-1d, now-90d, etc.)",
   "countries": ["CountryName1", "CountryName2"],
   "ports": [1194, 443],
   "protocols": ["TCP", "UDP"],
   "search_terms": ["keyword1", "keyword2"],
+  "matching_strategy": "phrase|token|term|match",
+  "field_analysis": "Which field categories are most relevant and why",
   "skip_search": false
 }
 ```
@@ -66,18 +69,46 @@ Extract keywords that don't fit structured fields:
 - Event types: "DNS query", "connection failure"
 - **Do NOT extract** country names, ports, or protocols here (they have their own fields)
 
+### Search Type
+Pick the dominant category of the user's intent:
+- `ip`: direct IP lookup, IP reputation, or questions centered on specific IP addresses
+- `traffic`: traffic/flow/connection/log existence questions
+- `alert`: signatures, alert names, Suricata/Snort/ET rule searches
+- `domain`: domain/DNS/FQDN-focused searches
+- `general`: fallback when none of the above cleanly fit
+
+### Matching Strategy
+- `term`: exact values like IPs, ports, keyword fields, protocol literals
+- `phrase`: exact signature or rule names where tokenization would broaden matches too much
+- `token`: standard free-text matching across text fields
+- `match`: fallback if none of the above fit cleanly
+
+For IPs and ports, prefer `term`.
+For alerts/signatures/rules, prefer `phrase`.
+For general traffic/log searches, prefer `token`.
+
+### Field Analysis
+Briefly explain which discovered field categories matter most, for example:
+- source vs destination IP fields
+- alert/signature fields
+- country/geo fields
+- timestamp fields
+
 ## Examples
 
 Example 1: "Show me traffic from Iran in the past 3 months"
 ```json
 {
   "reasoning": "User wants to see network traffic originating from Iran",
+  "search_type": "traffic",
   "detected_time_range": "past 3 months",
   "time_range": "now-3M",
   "countries": ["Iran"],
   "ports": [],
   "protocols": [],
   "search_terms": [],
+  "matching_strategy": "token",
+  "field_analysis": "Use country/geo fields plus timestamp fields for a traffic search.",
   "skip_search": false
 }
 ```
@@ -86,12 +117,15 @@ Example 2: "Port 1194 activity in Russia last week"
 ```json
 {
   "reasoning": "User asking for activity on port 1194 from Russia",
+  "search_type": "traffic",
   "detected_time_range": "last week",
   "time_range": "now-7d",
   "countries": ["Russia"],
   "ports": [1194],
   "protocols": [],
   "search_terms": [],
+  "matching_strategy": "term",
+  "field_analysis": "Use port fields, country fields, and timestamp fields.",
   "skip_search": false
 }
 ```
@@ -100,12 +134,15 @@ Example 3: "Find TCP connections to example.com"
 ```json
 {
   "reasoning": "User wants TCP flows to example.com domain",
+  "search_type": "domain",
   "detected_time_range": "not specified",
   "time_range": "now-90d",
   "countries": [],
   "ports": [],
   "protocols": ["TCP"],
   "search_terms": ["example.com"],
+  "matching_strategy": "term",
+  "field_analysis": "Use domain fields plus protocol and timestamp fields.",
   "skip_search": false
 }
 ```
@@ -114,12 +151,15 @@ Example 4: "What fields are available for byte transfers?"
 ```json
 {
   "reasoning": "User asking about field schema, not executing a search",
+  "search_type": "general",
   "detected_time_range": "N/A",
   "time_range": "now-90d",
   "countries": [],
   "ports": [],
   "protocols": [],
   "search_terms": [],
+  "matching_strategy": "token",
+  "field_analysis": "Schema question only; no OpenSearch execution needed.",
   "skip_search": true
 }
 ```
@@ -128,12 +168,15 @@ Example 5: "China TCP connections on port 443 or 22 past 90 days"
 ```json
 {
   "reasoning": "User wants TCP connections from China on SSH or HTTPS ports",
+  "search_type": "traffic",
   "detected_time_range": "past 90 days",
   "time_range": "now-90d",
   "countries": ["China"],
   "ports": [443, 22],
   "protocols": ["TCP"],
   "search_terms": [],
+  "matching_strategy": "term",
+  "field_analysis": "Use country, port, protocol, and timestamp fields.",
   "skip_search": false
 }
 ```
@@ -142,12 +185,15 @@ Example 6: "Traffic from Iran in the past 3 years"
 ```json
 {
   "reasoning": "User wants to see network traffic from Iran going back 3 years",
+  "search_type": "traffic",
   "detected_time_range": "past 3 years",
   "time_range": "now-3y",
   "countries": ["Iran"],
   "ports": [],
   "protocols": [],
   "search_terms": [],
+  "matching_strategy": "token",
+  "field_analysis": "Use country/geo fields and timestamp fields for a long-range traffic search.",
   "skip_search": false
 }
 ```

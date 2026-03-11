@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import MagicMock
 
-from skills.chat_router.logic import orchestrate_with_supervisor, route_question
+from skills.chat_router.logic import execute_skill_workflow, orchestrate_with_supervisor, route_question
 
 
 class _Cfg:
@@ -222,6 +223,223 @@ def test_route_question_keeps_direct_opensearch_for_explicit_field_query():
     )
 
     assert result["skills"] == ["opensearch_querier"]
+
+
+def test_route_question_anchors_followup_reputation_to_previous_public_ips_only():
+    class _RouteLLM:
+        def chat(self, messages: list[dict]):
+            return json.dumps(
+                {
+                    "reasoning": "Need more data first.",
+                    "skills": ["fields_querier", "opensearch_querier", "threat_analyst"],
+                    "parameters": {},
+                }
+            )
+
+    available_skills = [
+        {"name": "fields_querier", "description": "Field schema discovery"},
+        {"name": "opensearch_querier", "description": "Direct log search"},
+        {"name": "threat_analyst", "description": "Reputation analysis"},
+    ]
+    history = [
+        {
+            "role": "assistant",
+            "content": "Found 200 record(s) matching Russia. Countries seen: Russia. Source/destination IPs: 192.168.0.156, 37.230.117.113, 82.146.61.17.",
+        }
+    ]
+
+    result = route_question(
+        user_question="Aside from the private IPs, what is the reputation of the others?",
+        available_skills=available_skills,
+        llm=_RouteLLM(),
+        instruction="test",
+        conversation_history=history,
+    )
+
+    assert result["skills"] == ["threat_analyst"]
+    enriched_question = result["parameters"]["question"]
+    assert "37.230.117.113" in enriched_question
+    assert "82.146.61.17" in enriched_question
+    assert "192.168.0.156" not in enriched_question
+
+
+def test_route_question_anchors_just_mentioned_non_private_ip_followup():
+    class _RouteLLM:
+        def chat(self, messages: list[dict]):
+            return json.dumps(
+                {
+                    "reasoning": "Need more data first.",
+                    "skills": ["opensearch_querier", "threat_analyst"],
+                    "parameters": {},
+                }
+            )
+
+    available_skills = [
+        {"name": "opensearch_querier", "description": "Direct log search"},
+        {"name": "threat_analyst", "description": "Reputation analysis"},
+    ]
+    history = [
+        {
+            "role": "assistant",
+            "content": "Found 14 record(s) matching Russia in the past 7 days window. Countries seen: Russia. Source/destination IPs: 192.168.0.85, 37.230.117.113, 92.63.103.84. Earliest: 2026-03-09T21:04:10.437Z. Latest: 2026-03-09T21:08:07.670Z.",
+        }
+    ]
+
+    result = route_question(
+        user_question="Run threat intelligence to the non private IPs you've just mentioned",
+        available_skills=available_skills,
+        llm=_RouteLLM(),
+        instruction="test",
+        conversation_history=history,
+    )
+
+    assert result["skills"] == ["threat_analyst"]
+    enriched_question = result["parameters"]["question"]
+    assert "37.230.117.113" in enriched_question
+    assert "92.63.103.84" in enriched_question
+    assert "192.168.0.85" not in enriched_question
+
+
+def test_route_question_anchors_above_ips_reputation_followup():
+    class _RouteLLM:
+        def chat(self, messages: list[dict]):
+            return json.dumps(
+                {
+                    "reasoning": "Need more data first.",
+                    "skills": ["fields_querier", "opensearch_querier", "threat_analyst"],
+                    "parameters": {},
+                }
+            )
+
+    available_skills = [
+        {"name": "fields_querier", "description": "Field schema discovery"},
+        {"name": "opensearch_querier", "description": "Direct log search"},
+        {"name": "threat_analyst", "description": "Reputation analysis"},
+    ]
+    history = [
+        {
+            "role": "assistant",
+            "content": "Found 14 record(s) matching Russia in the past 7 days window. Countries seen: Russia. Source/destination IPs: 192.168.0.85, 37.230.117.113, 92.63.103.84. Earliest: 2026-03-09T21:04:10.437Z. Latest: 2026-03-09T21:08:07.670Z.",
+        }
+    ]
+
+    result = route_question(
+        user_question="What is the reputation of the above IPs?",
+        available_skills=available_skills,
+        llm=_RouteLLM(),
+        instruction="test",
+        conversation_history=history,
+    )
+
+    assert result["skills"] == ["threat_analyst"]
+    enriched_question = result["parameters"]["question"]
+    assert "37.230.117.113" in enriched_question
+    assert "92.63.103.84" in enriched_question
+    assert "192.168.0.85" in enriched_question
+
+
+def test_execute_skill_workflow_threat_analyst_falls_back_to_history_when_same_turn_has_no_action():
+    class _Runner:
+        def _build_context(self):
+            return {}
+
+        def dispatch(self, skill_name: str, context: dict):
+            if skill_name == "opensearch_querier":
+                return {"status": "no_action"}
+            if skill_name == "threat_analyst":
+                return {
+                    "status": "ok",
+                    "verdicts": [
+                        {
+                            "verdict": "FALSE_POSITIVE",
+                            "confidence": 90,
+                            "reasoning": context["parameters"]["question"],
+                        }
+                    ],
+                }
+            return {"status": "ok"}
+
+    history = [
+        {
+            "role": "assistant",
+            "content": "Found 14 record(s) matching Russia in the past 7 days window. Countries seen: Russia. Source/destination IPs: 192.168.0.85, 37.230.117.113, 92.63.103.84. Earliest: 2026-03-09T21:04:10.437Z. Latest: 2026-03-09T21:08:07.670Z.",
+        }
+    ]
+
+    results = execute_skill_workflow(
+        skills=["opensearch_querier", "threat_analyst"],
+        runner=_Runner(),
+        context={},
+        routing_decision={
+            "parameters": {
+                "question": "Run threat intelligence to the non private IPs you've just mentioned",
+            }
+        },
+        conversation_history=history,
+        aggregated_results={},
+    )
+
+    threat_reasoning = results["threat_analyst"]["verdicts"][0]["reasoning"]
+    assert "37.230.117.113" in threat_reasoning
+    assert "92.63.103.84" in threat_reasoning
+    assert "192.168.0.85" not in threat_reasoning
+
+
+def test_format_response_ignores_validation_failed_opensearch_hits():
+    from skills.chat_router.logic import format_response
+
+    mock_llm = MagicMock()
+    mock_llm.chat.return_value = "Threat intel points to the public IPs from the prior results, not the invalid fallback search."
+
+    response = format_response(
+        "Aside from the private IPs, what is the reputation of the others?",
+        {"skills": ["opensearch_querier", "threat_analyst"], "parameters": {}},
+        {
+            "opensearch_querier": {
+                "status": "ok",
+                "results_count": 5,
+                "validation_failed": True,
+                "results": [{"src_ip": "75.75.75.75"}],
+            },
+            "threat_analyst": {
+                "status": "ok",
+                "verdicts": [{"verdict": "FALSE_POSITIVE", "confidence": 85, "reasoning": "Low risk."}],
+            },
+        },
+        mock_llm,
+        cfg=_Cfg(),
+    )
+
+    assert "75.75.75.75" not in response
+    assert mock_llm.chat.called
+
+
+def test_route_question_strips_threat_analyst_for_plain_country_traffic_question():
+    class _RouteLLM:
+        def chat(self, messages: list[dict]):
+            return json.dumps(
+                {
+                    "reasoning": "Need country search plus intel.",
+                    "skills": ["fields_querier", "opensearch_querier", "threat_analyst"],
+                    "parameters": {},
+                }
+            )
+
+    available_skills = [
+        {"name": "fields_querier", "description": "Field schema discovery"},
+        {"name": "opensearch_querier", "description": "Direct log search"},
+        {"name": "threat_analyst", "description": "Reputation analysis"},
+    ]
+
+    result = route_question(
+        user_question="Any traffic from Russia this past week?",
+        available_skills=available_skills,
+        llm=_RouteLLM(),
+        instruction="test",
+        conversation_history=[],
+    )
+
+    assert result["skills"] == ["fields_querier", "opensearch_querier"]
 
 
 def test_supervisor_upgrades_repeated_field_discovery_to_opensearch_after_schema_results():

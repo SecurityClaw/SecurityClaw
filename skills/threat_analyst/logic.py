@@ -14,6 +14,7 @@ Context keys consumed:
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import re
@@ -24,6 +25,32 @@ logger = logging.getLogger(__name__)
 
 INSTRUCTION_PATH = Path(__file__).parent / "instruction.md"
 SKILL_NAME = "threat_analyst"
+
+
+def _is_private_ip(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip).is_private
+    except ValueError:
+        return False
+
+
+def _question_excludes_private_ips(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        token in lowered
+        for token in [
+            "aside from the private ip",
+            "aside from private ip",
+            "excluding private ip",
+            "exclude private ip",
+            "except private ip",
+            "other than private ip",
+            "non-private ip",
+            "public ip",
+            "private ips",
+            "internal ips",
+        ]
+    )
 
 
 def run(context: dict) -> dict:
@@ -237,7 +264,12 @@ def _enrich_with_reputation(finding_desc: str, conversation_history: list[dict] 
                 logger.debug("[%s] Found in history: IPs=%s, domains=%s", SKILL_NAME, ips, domains)
                 break
 
+    if _question_excludes_private_ips(finding_desc):
+        ips = {ip for ip in ips if not _is_private_ip(ip)}
+
     if not ips and not domains:
+        if _question_excludes_private_ips(finding_desc):
+            return "No external reputation data needed after excluding private/internal IPs.", []
         return "No external reputation data needed (no IPs or domains in question or history).", []
 
     reputation_lines = []
