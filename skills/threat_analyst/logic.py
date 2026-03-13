@@ -9,7 +9,7 @@ and issues a verdict (FALSE_POSITIVE | TRUE_THREAT).
 Context keys consumed:
     context["db"]     -> BaseDBConnector
     context["llm"]    -> BaseLLMProvider
-    context["memory"] -> AgentMemory
+    context["memory"] -> Memory instance (StateBackedMemory or CheckpointBackedMemory)
     context["config"] -> Config
 """
 from __future__ import annotations
@@ -53,6 +53,66 @@ def _question_excludes_private_ips(text: str) -> bool:
     )
 
 
+def _extract_public_ipv4s(text: str) -> list[str]:
+    ip_pattern = r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
+    return list(dict.fromkeys(ip for ip in re.findall(ip_pattern, text or "") if not _is_private_ip(ip)))
+
+
+def _finding_requires_rag_context(finding_desc: str) -> bool:
+    """Return True only for findings that need behavioral baseline context."""
+    lowered = finding_desc.lower()
+    is_reputation_question = any(
+        term in lowered
+        for term in ["reputation", "threat intel", "threat intelligence", "malicious", "risk", "verdict", "score"]
+    )
+    return not is_reputation_question
+
+
+def _build_grounded_reputation_reasoning(
+    requested_ips: list[str],
+    verdict_label: str,
+    reputation_context: str,
+) -> str:
+    """Build a grounded explanation that only references the requested IPs."""
+    subject = ", ".join(requested_ips) if requested_ips else "the requested entities"
+    detail_lines = []
+    for line in (reputation_context or "").splitlines():
+        normalized = line.strip().lstrip("•").strip()
+        if not normalized:
+            continue
+        if requested_ips and not any(ip in normalized for ip in requested_ips):
+            continue
+        detail_lines.append(normalized)
+        if len(detail_lines) >= 3:
+            break
+
+    if detail_lines:
+        return f"Reputation analysis for {subject}: {verdict_label}. " + " ".join(detail_lines)
+    return f"Reputation analysis for {subject}: {verdict_label}. No additional IPs were considered."
+
+
+def _sanitize_verdict_entities(parsed: dict, finding_desc: str, reputation_context: str) -> dict:
+    """Ensure threat verdict reasoning does not introduce IPs outside the requested set."""
+    requested_ips = _extract_public_ipv4s(finding_desc)
+    reasoning_ips = set(_extract_public_ipv4s(str(parsed.get("reasoning", "") or "")))
+
+    if requested_ips and reasoning_ips and not reasoning_ips.issubset(set(requested_ips)):
+        logger.warning(
+            "[%s] Threat verdict mentioned unexpected IPs %s; constraining reasoning to %s",
+            SKILL_NAME,
+            sorted(reasoning_ips),
+            requested_ips,
+        )
+        parsed["reasoning"] = _build_grounded_reputation_reasoning(
+            requested_ips,
+            str(parsed.get("verdict", "UNKNOWN") or "UNKNOWN"),
+            reputation_context,
+        )
+
+    parsed["_requested_ips"] = requested_ips
+    return parsed
+
+
 def run(context: dict) -> dict:
     """Entry point called by the Runner."""
     db = context.get("db")
@@ -62,9 +122,9 @@ def run(context: dict) -> dict:
     parameters = context.get("parameters", {})
     conversation_history = context.get("conversation_history", [])
 
-    if db is None or llm is None:
-        logger.warning("[%s] db or llm not available — skipping.", SKILL_NAME)
-        return {"status": "skipped", "reason": "no db/llm"}
+    if llm is None:
+        logger.warning("[%s] llm not available — skipping.", SKILL_NAME)
+        return {"status": "skipped", "reason": "no llm"}
 
     instruction = INSTRUCTION_PATH.read_text(encoding="utf-8")
 
@@ -86,9 +146,15 @@ def run(context: dict) -> dict:
     elif escalations:
         logger.info("[%s] Analyzing %d escalation(s)…", SKILL_NAME, len(escalations))
 
-    from core.rag_engine import RAGEngine
+    rag = None
+    needs_rag_context = any(_finding_requires_rag_context(item) for item in escalations)
+    if needs_rag_context:
+        if db is None:
+            logger.warning("[%s] db not available for baseline-backed threat analysis — skipping.", SKILL_NAME)
+            return {"status": "skipped", "reason": "no db"}
+        from core.rag_engine import RAGEngine
+        rag = RAGEngine(db=db, llm=llm)
 
-    rag = RAGEngine(db=db, llm=llm)
     verdicts = []
 
     for item in escalations:
@@ -129,24 +195,43 @@ def _analyze_finding(finding_desc: str, instruction: str, rag, llm,
     
     Returns dict with analysis verdict and API query information.
     """
-    # Retrieve relevant baseline context
-    rag_context = rag.build_context_string(
-        query=finding_desc,
-        category="network_baseline",
-    )
+    # Extract IPs/domains from the finding first to determine question type
+    ip_pattern = r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
+    ips_in_finding = set(re.findall(ip_pattern, finding_desc))
+    domain_pattern = r"\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b"
+    domains_in_finding = set(re.findall(domain_pattern, finding_desc.lower()))
+    
+    # For reputation/threat analysis, skip RAG baseline context.
+    # Reputation checks should analyze ONLY the explicitly-queried entities, not browse
+    # baseline behavior which introduces noise and causes the LLM to analyze wrong IPs.
+    # Baseline context is for behavioral anomaly analysis, not threat reputation.
+    is_reputation_question = not _finding_requires_rag_context(finding_desc)
+    
+    if is_reputation_question or rag is None:
+        # Reputation questions don't need baseline context
+        baseline_section = ""
+    else:
+        # For other finding types, use RAG context
+        rag_context = rag.build_context_string(
+            query=finding_desc,
+            category="network_baseline",
+        )
+        has_relevant_baseline = "_No relevant context found._" not in rag_context
+        baseline_section = f"**Baseline Context:**\n{rag_context}\n\n" if has_relevant_baseline else ""
 
     # Extract and enrich with external reputation intelligence
     # Pass conversation history to help extract IPs/domains from context
     reputation_context, queried_apis = _enrich_with_reputation(finding_desc, conversation_history)
 
-    # Only include baseline context if relevant information was actually found
-    # Avoid including "No relevant context found" which misleads the LLM
-    has_relevant_baseline = "_No relevant context found._" not in rag_context
-    
-    if has_relevant_baseline:
-        baseline_section = f"**Baseline Context:**\n{rag_context}\n\n"
-    else:
-        baseline_section = ""
+    # Extract the specific IPs from the finding so the LLM stays anchored to them.
+    _ip_pattern_str = r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
+    _finding_ips = re.findall(_ip_pattern_str, finding_desc)
+    _public_finding_ips = [ip for ip in _finding_ips if not _is_private_ip(ip)]
+    _anchor_note = (
+        f"\nIMPORTANT: Only reference these specific IPs in your verdict: {', '.join(_public_finding_ips)}. "
+        "Do not introduce IPs or domains from the baseline context that are not part of this finding."
+        if _public_finding_ips else ""
+    )
 
     messages = [
         {"role": "system", "content": instruction},
@@ -156,7 +241,7 @@ def _analyze_finding(finding_desc: str, instruction: str, rag, llm,
                 f"**Anomaly Finding:**\n{finding_desc}\n\n"
                 f"{baseline_section}"
                 f"**Reputation Intelligence:**\n{reputation_context}\n\n"
-                "Based on the above context and reputation data, provide your verdict."
+                f"Based on the above context and reputation data, provide your verdict.{_anchor_note}"
             ),
         },
     ]
@@ -165,6 +250,7 @@ def _analyze_finding(finding_desc: str, instruction: str, rag, llm,
         response = llm.chat(messages)
         parsed = _parse_json(response)
         if parsed:
+            parsed = _sanitize_verdict_entities(parsed, finding_desc, reputation_context)
             parsed["_finding"] = finding_desc[:200]
             parsed["_queried_apis"] = queried_apis  # Include which APIs were queried
             return parsed
@@ -264,8 +350,9 @@ def _enrich_with_reputation(finding_desc: str, conversation_history: list[dict] 
                 logger.debug("[%s] Found in history: IPs=%s, domains=%s", SKILL_NAME, ips, domains)
                 break
 
-    if _question_excludes_private_ips(finding_desc):
-        ips = {ip for ip in ips if not _is_private_ip(ip)}
+    # Always exclude private/RFC-1918 IPs: they have no external threat reputation
+    # and including them confuses the LLM (they may match baseline entries for other reasons).
+    ips = {ip for ip in ips if not _is_private_ip(ip)}
 
     if not ips and not domains:
         if _question_excludes_private_ips(finding_desc):

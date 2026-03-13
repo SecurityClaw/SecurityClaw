@@ -16,7 +16,7 @@ Features:
 Context keys consumed:
     context["db"]         -> BaseDBConnector
     context["llm"]        -> BaseLLMProvider
-    context["memory"]     -> AgentMemory
+    context["memory"]     -> Memory instance (StateBackedMemory or CheckpointBackedMemory)
     context["config"]     -> Config
     context["parameters"] -> {"force_refresh": bool}  # optional
 """
@@ -114,12 +114,28 @@ def run(context: dict) -> dict:
     force_refresh = parameters.get("force_refresh", False)
 
     if db is None or llm is None:
-        logger.warning("[%s] db or llm not available — skipping.", SKILL_NAME)
-        return {"status": "skipped", "reason": "no db/llm"}
+        msg = "[%s] db or llm not available — cannot proceed."
+        if force_refresh:
+            # Startup requires database and LLM
+            logger.error(msg, SKILL_NAME)
+            return {"status": "error", "reason": "database or LLM unavailable on startup"}
+        else:
+            logger.warning(msg, SKILL_NAME)
+            return {"status": "skipped", "reason": "no db/llm"}
 
     instruction = INSTRUCTION_PATH.read_text(encoding="utf-8")
     logs_index   = cfg.get("db", "logs_index",   default="securityclaw-logs")
     vector_index = cfg.get("db", "vector_index",  default="securityclaw-vectors")
+
+    # ── Test database connection on startup ────────────────────────────────────
+    if force_refresh:
+        try:
+            # Simple test to verify database is reachable
+            if hasattr(db, "_client"):
+                db._client.info()
+        except Exception as exc:
+            logger.error("[%s] Database connection failed on startup: %s", SKILL_NAME, exc)
+            return {"status": "error", "reason": f"database connection failed: {str(exc)[:100]}"}
 
     # ── 0a. Force-refresh: wipe all existing behavioural baseline docs ────────
     if force_refresh:

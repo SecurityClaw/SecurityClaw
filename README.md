@@ -8,8 +8,9 @@ A modular, skill-based autonomous Security Operations Center (SOC) agent that mo
 * **Heartbeat Loop** — Cron-like scheduler: 1-minute anomaly watcher, 6-hour memory builder  
 * **Provider Agnostic** — Swap OpenSearch↔Elasticsearch via config  
 * **RAG-Based Memory** — Vector embeddings stored in OpenSearch; context-aware threat analysis  
-* **Working Memory** — Compact structured memory is stored locally in data/agent_memory.json with bounded sections for investigations, findings, and decisions  
-* **Conversation-based Investigations** — Allows you to investigate threats through an interactive chat interface, with LLM reasoning steps and RAG context retrieval  
+* **LangGraph Orchestration** — Multi-step DECIDE→EXECUTE→EVALUATE supervisor loop implemented as a `StateGraph`; conversation and chat working memory checkpointed to SQLite via `SqliteSaver`  
+* **Working Memory** — Interactive chat working memory stays inside LangGraph state and is checkpointed in `data/conversations.db`; the scheduler/CLI runtime now uses the same checkpoint-backed model via `data/runtime_memory.db`  
+* **Conversation-based Investigations** — Investigate threats through an interactive chat interface with real-time LLM reasoning steps, routing guards, and RAG context retrieval  
 * **Web Interface** — Modern React-based UI for chat, memory visualization, and skill dispatch  
 
 ---
@@ -134,16 +135,16 @@ SecurityClaw/
 │
 ├── core/
 │   ├── config.py              # YAML + env loader
-│   ├── memory.py              # Compact structured memory store
+│   ├── memory.py              # Structured memory helpers for file/state/checkpoint-backed runtimes
 │   ├── runner.py              # Conductor (skill discovery, scheduling)
 │   ├── scheduler.py           # APScheduler wrapper
 │   ├── skill_loader.py        # Dynamic skill discovery
 │   ├── db_connector.py        # OpenSearch/ES abstraction
 │   ├── llm_provider.py        # Ollama provider
-│   └── rag_engine.py          # Embedding store & retrieval
+│   ├── rag_engine.py          # Embedding store & retrieval
+│   └── chat_router/           # API-only: LangGraph StateGraph orchestrator
 │
 ├── skills/
-│   ├── chat_router/            # API-only: Routes user questions to skills
 │   ├── network_baseliner/     # 6h: Aggregate logs → RAG vectors
 │   ├── fields_baseliner/      # 1h: Catalog OpenSearch field schemas
 │   ├── anomaly_triage/        # Manual: Poll AD findings → enrich → escalate
@@ -152,8 +153,12 @@ SecurityClaw/
 │   ├── forensic_examiner/     # Manual: Build incident timelines
 │   ├── baseline_querier/      # Manual: Search behavioral baselines
 │   ├── fields_querier/        # Manual: Query field schema catalog
-│   ├── geoip_lookup/          # Cron (Tue/Fri 2 AM UTC): Maintain MaxMind DB
-│   └── rag_querier/           # Manual: RAG context retrieval
+│   └── geoip_lookup/          # Cron (Tue/Fri 2 AM UTC): Maintain MaxMind DB
+│
+├── data/
+│   ├── conversations.db       # SQLite — LangGraph checkpoint store (conversation + chat memory)
+│   ├── runtime_memory.db      # SQLite — LangGraph checkpoint store (scheduler + CLI runtime memory)
+│   └── geoip/                 # MaxMind GeoLite2 database files
 │
 ├── tests/
 │   ├── conftest.py            # Shared fixtures
@@ -172,7 +177,8 @@ SecurityClaw/
 |-----------|---|
 | **Skill Modularity** | Each skill is a folder with `logic.py` (entrypoint) and `instruction.md` (LLM system prompt) |
 | **Auto-Discovery** | Runner scans `/skills` and dynamically loads all valid skills |
-| **Stateful Memory** | A bounded JSON memory store in data/agent_memory.json tracks focus, findings, decisions, and escalation without uncontrolled growth |
+| **LangGraph Orchestration** | `chat_router` runs a `StateGraph` (DECIDE→EXECUTE→EVALUATE loop) compiled with `SqliteSaver`; state includes chat memory, skill results, and conversation history |
+| **Stateful Memory** | Chat orchestration uses LangGraph state checkpointed at `data/conversations.db`; the scheduler and CLI runtime use the same bounded structured memory model checkpointed at `data/runtime_memory.db` |
 | **Scheduled Execution** | APScheduler fires skills at intervals; intervals defined in skill `instruction.md` front-matter |
 | **Provider Agnostic** | Abstract `BaseDBConnector` and `BaseLLMProvider` allow swapping vendors via config |
 | **RAG Context** | Embeddings stored in vector index; retrieved during LLM analysis for behavioral context |
@@ -250,7 +256,6 @@ SecurityClaw/
 | **baseline_querier** | In-Progress | Search behavioral baselines; not publication-hardened |
 | **fields_querier** | Stable | Search field schema catalog |
 | **geoip_lookup** | Stable | MaxMind GeoLite2 maintenance and lookups |
-| **rag_querier** | Stable | RAG context retrieval |
 
 **Legend**:
 - **Stable**: Publication-ready; tested in production patterns
@@ -525,7 +530,7 @@ skills/my_skill/logic.py
 Context dict keys:
   - db        → BaseDBConnector
   - llm       → BaseLLMProvider
-  - memory    → AgentMemory
+  - memory    → StateBackedMemory (in-memory) or CheckpointBackedMemory (SQLite-backed)
   - config    → Config
   - skills    → dict of loaded Skill objects
 """
@@ -661,7 +666,7 @@ For issues, questions, or feature requests, open an issue or contact the Securit
 
 ## Security / Publication Checklist
 
-- `config.yaml`, `.env`, and `data/agent_memory.json` are intended to stay local.
+- `config.yaml`, `.env`, `data/conversations.db`, and `data/runtime_memory.db` are intended to stay local.
 - Use [config.yaml.example](config.yaml.example) as the public template.
 - Run a quick scan before publishing:
 

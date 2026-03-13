@@ -8,7 +8,7 @@ for ThreatAnalyst via agent memory.
 Context keys consumed:
     context["db"]     -> BaseDBConnector
     context["llm"]    -> BaseLLMProvider
-    context["memory"] -> AgentMemory
+    context["memory"] -> Memory instance (StateBackedMemory or CheckpointBackedMemory)
     context["config"] -> Config
 """
 from __future__ import annotations

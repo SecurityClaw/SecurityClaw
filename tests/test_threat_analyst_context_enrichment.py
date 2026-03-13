@@ -11,7 +11,7 @@ This fixes the bug where:
 """
 
 import pytest
-from skills.chat_router.logic import (
+from core.chat_router.logic import (
     _extract_entities_from_previous_results,
     _build_context_aware_threat_question,
 )

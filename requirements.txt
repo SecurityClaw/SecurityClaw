@@ -12,3 +12,5 @@ rich>=13.7.0
 click>=8.1.7
 fastapi>=0.115.0
 uvicorn>=0.32.0
+langgraph>=0.2.0
+langgraph-checkpoint-sqlite>=1.0.0

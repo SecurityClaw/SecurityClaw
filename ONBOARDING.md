@@ -119,6 +119,8 @@ Each skill declares:
 .venv/bin/python main.py chat
 ```
 
+**Conversation persistence**: Conversations and agent memory are stored in `data/conversations.db` (SQLite, created automatically on first run). Each chat session writes to this file via the LangGraph `SqliteSaver` checkpointer — no manual maintenance is needed.
+
 **First chat startup**: SecurityClaw will check for any missing skill-specific variables and prompt you to configure them. This includes:
 - MaxMind license key (for `geoip_lookup`)
 - Threat intelligence API keys (for `threat_analyst`)
@@ -270,6 +272,10 @@ On next `python main.py onboard` or `python main.py chat`, SecurityClaw will det
 .venv/bin/python main.py onboard
 ```
 Simply repeat the wizard to update any settings (existing values are shown as defaults).
+
+**Conversation history not appearing**
+- Conversation state is stored in `data/conversations.db`. If the file is missing or corrupted, delete it and restart; a fresh database will be created automatically.
+- Use `/history` inside chat to browse past conversations.
 
 ---
 

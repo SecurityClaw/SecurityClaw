@@ -3,12 +3,62 @@ tests/test_integration_threat_intel_workflow.py — End-to-end threat intel work
 """
 from __future__ import annotations
 
+import json
 import pytest
 from unittest.mock import Mock, patch
 
 
 class TestThreatIntelWorkflow:
     """Integration tests for complete threat intelligence workflow."""
+
+    def test_reputation_only_run_skips_rag_engine_initialization(self):
+        """Reputation-only threat analysis must not initialize RAGEngine or use the DB."""
+        from skills.threat_analyst.logic import run
+
+        mock_llm = Mock()
+        mock_llm.chat.return_value = (
+            '{"verdict": "TRUE_THREAT", "confidence": 85, '
+            '"reasoning": "37.230.117.113 and 82.146.61.17 have elevated abuse history."}'
+        )
+        context = {
+            "db": None,
+            "llm": mock_llm,
+            "memory": None,
+            "config": Mock(),
+            "parameters": {
+                "question": (
+                    "What is the reputation of these IPs? Previously discovered entities from log search: "
+                    "IPs: 37.230.117.113, 82.146.61.17"
+                )
+            },
+            "conversation_history": [],
+        }
+
+        with patch(
+            "core.rag_engine.RAGEngine",
+            side_effect=AssertionError("RAGEngine must not be initialized for reputation-only analysis"),
+        ):
+            with patch("skills.threat_analyst.reputation_intel.get_ip_reputation") as mock_get_ip:
+                mock_get_ip.side_effect = [
+                    {
+                        "ip": "37.230.117.113",
+                        "abuseipdb": {"abuse_score": 91, "reports": 11},
+                        "combined_risk": "HIGH",
+                        "queries": ["abuseipdb"],
+                    },
+                    {
+                        "ip": "82.146.61.17",
+                        "abuseipdb": {"abuse_score": 76, "reports": 5},
+                        "combined_risk": "HIGH",
+                        "queries": ["abuseipdb"],
+                    },
+                ]
+
+                result = run(context)
+
+        assert result["status"] == "ok"
+        assert len(result["verdicts"]) == 1
+        assert mock_get_ip.call_count == 2
 
     def test_conversation_history_to_threat_intel_complete_flow(self):
         """Complete workflow: history -> extract IP -> query APIs -> format response."""
@@ -132,15 +182,17 @@ class TestThreatIntelWorkflow:
             
             mock_intel.side_effect = get_intel_side_effect
             
-            # Question has no IP, should extract both from history
+            # Question has no IP, should extract public IPs from history
             result_string, queried_apis = _enrich_with_reputation("Get threat intel", conversation_history)
             
-            # Should have queried both IPs
-            assert mock_intel.call_count == 2
+            # Private IPs (192.168.0.1) should be filtered — only the public IP is checked
+            assert mock_intel.call_count == 1
+            assert mock_intel.call_args[0][0] == "62.60.131.168"
             
-            # Result should mention both IPs
+            # Result should mention the public IP
             assert "62.60.131.168" in result_string
-            assert "192.168.0.1" in result_string
+            # Private IP should NOT be queried for external reputation
+            assert "192.168.0.1" not in result_string
             
             # Should track which APIs were queried
             assert "abuseipdb" in queried_apis
@@ -225,3 +277,144 @@ class TestThreatIntelWorkflow:
             
             # Should only query the question's IP, not history's
             mock_intel.assert_called_once_with("8.8.8.8")
+
+
+def test_end_to_end_followup_reputation_uses_visible_ips_without_db_queries():
+    """Follow-up reputation analysis should use the listed IPs from history and never touch RAG/DB."""
+    from core.chat_router.logic import orchestrate_with_supervisor
+    from skills.threat_analyst.logic import run as threat_run
+
+    class _Cfg:
+        def get(self, section: str, key: str, default=None):
+            values = {
+                ("chat", "supervisor_max_steps"): 4,
+                ("llm", "anti_hallucination_check"): False,
+            }
+            return values.get((section, key), default)
+
+    class _StrictDB:
+        def __getattr__(self, name):
+            raise AssertionError(f"DB should not be touched for reputation-only follow-ups: {name}")
+
+    class _UnifiedLLM:
+        def __init__(self):
+            self.threat_prompts: list[str] = []
+            self.final_format_calls = 0
+
+        def chat(self, messages: list[dict]):
+            prompt = messages[-1].get("content", "")
+            if "SOC supervisor orchestrator" in prompt:
+                return json.dumps(
+                    {
+                        "reasoning": "Follow-up reputation question anchored to entities from the previous answer",
+                        "skills": ["threat_analyst"],
+                        "parameters": {},
+                    }
+                )
+            if "Evaluate whether the current skill outputs are sufficient" in prompt:
+                return json.dumps(
+                    {
+                        "satisfied": True,
+                        "confidence": 0.95,
+                        "reasoning": "Threat intelligence verdicts were produced for the requested IPs.",
+                        "missing": [],
+                    }
+                )
+            if "Based on these skill execution results" in prompt:
+                self.final_format_calls += 1
+                return "Eight IP addresses were identified: 8.8.8.8, 1.1.1.1, 203.0.113.5, and five others across 45 connection records."
+
+            self.threat_prompts.append(prompt)
+            return json.dumps(
+                {
+                    "verdict": "TRUE_THREAT",
+                    "confidence": 88,
+                    "reasoning": (
+                        "Eight IP addresses were identified: 8.8.8.8, 1.1.1.1, 203.0.113.5, "
+                        "37.230.117.113, 82.146.61.17, 82.202.197.102, 92.63.103.84, and 94.139.250.252."
+                    ),
+                    "recommended_action": "Block or monitor the listed IPs.",
+                }
+            )
+
+    class _Runner:
+        def __init__(self, llm):
+            self.llm = llm
+            self.calls: list[str] = []
+            self.contexts: dict[str, dict] = {}
+
+        def _build_context(self):
+            return {}
+
+        def dispatch(self, skill_name: str, context: dict):
+            self.calls.append(skill_name)
+            self.contexts[skill_name] = context
+            if skill_name != "threat_analyst":
+                raise AssertionError(f"Unexpected skill call in reputation follow-up: {skill_name}")
+
+            skill_context = {
+                "db": _StrictDB(),
+                "llm": self.llm,
+                "memory": None,
+                "config": Mock(),
+                "parameters": context.get("parameters", {}),
+                "conversation_history": context.get("conversation_history", []),
+            }
+            return threat_run(skill_context)
+
+    history = [
+        {
+            "role": "assistant",
+            "content": (
+                "Found 200 record(s) matching Russia in the last 30 days window. Countries seen: Russia. "
+                "Source IPs: 37.230.117.113, 82.146.61.17, 82.202.197.102, 92.63.103.84, 94.139.250.252. "
+                "Earliest: 2026-02-17T07:29:17.210Z. Latest: 2026-02-28T19:16:19.262Z."
+            ),
+        }
+    ]
+
+    llm = _UnifiedLLM()
+    runner = _Runner(llm)
+
+    with patch(
+        "core.rag_engine.RAGEngine",
+        side_effect=AssertionError("RAGEngine must not be initialized for reputation-only follow-ups"),
+    ):
+        with patch("skills.threat_analyst.reputation_intel.get_ip_reputation") as mock_get_ip:
+            mock_get_ip.side_effect = lambda ip: {
+                "ip": ip,
+                "abuseipdb": {"abuse_score": 80, "reports": 7},
+                "combined_risk": "HIGH",
+                "queries": ["abuseipdb"],
+            }
+
+            out = orchestrate_with_supervisor(
+                user_question="What is the reputation of these IPs?",
+                available_skills=[
+                    {"name": "fields_querier", "description": "Field schema discovery"},
+                    {"name": "opensearch_querier", "description": "Direct log search"},
+                    {"name": "threat_analyst", "description": "Reputation analysis"},
+                ],
+                runner=runner,
+                llm=llm,
+                instruction="You are a SOC assistant.",
+                cfg=_Cfg(),
+                conversation_history=history,
+            )
+
+    assert runner.calls == ["threat_analyst"]
+    enriched_question = runner.contexts["threat_analyst"]["parameters"]["question"]
+    assert "37.230.117.113" in enriched_question
+    assert "82.146.61.17" in enriched_question
+    assert "82.202.197.102" in enriched_question
+    assert "92.63.103.84" in enriched_question
+    assert "94.139.250.252" in enriched_question
+    assert mock_get_ip.call_count == 5
+    assert out["evaluation"]["satisfied"] is True
+    assert llm.final_format_calls == 0
+    assert "37.230.117.113" in out["response"]
+    assert "82.146.61.17" in out["response"]
+    assert "92.63.103.84" in out["response"]
+    assert "1.1.1.1" not in out["response"]
+    assert "8.8.8.8" not in out["response"]
+    assert "203.0.113.5" not in out["response"]

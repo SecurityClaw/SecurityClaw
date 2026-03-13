@@ -326,8 +326,14 @@ def run(context: dict) -> dict:
     force      = parameters.get("force_refresh", False)
 
     if db is None:
-        logger.warning("[%s] db not available — skipping.", SKILL_NAME)
-        return {"status": "skipped", "reason": "no db"}
+        msg = "[%s] db not available — cannot proceed."
+        if force:
+            # First-startup requires database access
+            logger.error(msg, SKILL_NAME)
+            return {"status": "error", "reason": "database unavailable on first startup"}
+        else:
+            logger.warning(msg, SKILL_NAME)
+            return {"status": "skipped", "reason": "no db"}
 
     logs_index = cfg.get("db", "logs_index", default="securityclaw-logs")
 
@@ -336,6 +342,17 @@ def run(context: dict) -> dict:
     last_count    = state.get("last_record_count", 0)
     current_count = _count_logs(db, logs_index)
     delta         = current_count - last_count
+
+    # On first startup (force=True), we need to detect if DB is actually unavailable
+    # vs just empty. If current_count is still 0 due to connection failure, that's an error.
+    if force and current_count == 0:
+        try:
+            # Try a simple connection test
+            if hasattr(db, "_client"):
+                db._client.info()
+        except Exception as exc:
+            logger.error("[%s] Database connection failed on first startup: %s", SKILL_NAME, exc)
+            return {"status": "error", "reason": f"database connection failed: {str(exc)[:100]}"}
 
     if not force and delta < RECORDS_THRESHOLD:
         logger.info(

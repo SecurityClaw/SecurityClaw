@@ -30,7 +30,7 @@ memory:
   query_repair_max_repairs: 128
   query_repair_max_field_types: 512
 rag:
-  embedding_model: all-MiniLM-L6-v2
+  embedding_model: nomic-embed-text:latest
   top_k: 5
   similarity_threshold: 0.65
 anomaly:

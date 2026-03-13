@@ -8,7 +8,7 @@ decide what to search for and how to build a timeline.
 Context keys consumed:
     context["db"]         -> BaseDBConnector
     context["llm"]        -> BaseLLMProvider
-    context["memory"]     -> AgentMemory
+    context["memory"]     -> Memory instance (StateBackedMemory or CheckpointBackedMemory)
     context["config"]     -> Config
     context["parameters"] -> {"question": "incident description"}
 """

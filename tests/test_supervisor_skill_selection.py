@@ -16,7 +16,7 @@ properly documented and that the LLM can be guided to follow them.
 
 import pytest
 from unittest.mock import MagicMock
-from skills.chat_router.logic import _supervisor_next_action
+from core.chat_router.logic import _supervisor_next_action
 
 
 class TestSupervisorRoutingRules:
@@ -35,7 +35,6 @@ class TestSupervisorRoutingRules:
             {"name": "forensic_examiner", "description": "Network forensic analysis"},
             {"name": "baseline_querier", "description": "RAG-enhanced behavioral log search"},
             {"name": "fields_querier", "description": "Field schema discovery from local field catalog"},
-            {"name": "rag_querier", "description": "Legacy RAG log search (deprecated, kept for compat)"},
             {"name": "opensearch_querier", "description": "Direct log search"},
             {"name": "anomaly_triage", "description": "Anomaly detection"},
             {"name": "threat_analyst", "description": "IP/domain reputation and threat intelligence"},
@@ -153,8 +152,8 @@ class TestSupervisorRoutingRules:
                 for kw in ["alert type", "event type", "alert_type", "log type", "signature"]
             ), f"Prompt should guide log search for alert type question: {question}"
 
-    def test_generic_alert_queries_use_rag_first(self, available_skills):
-        """RULE: Generic alert queries without specific type should use rag_querier first."""
+    def test_generic_alert_queries_use_field_discovery_then_log_search(self, available_skills):
+        """RULE: Generic alert queries without specific type should emphasize field discovery and log search."""
         generic_alert_questions = [
             "what are the top 10 alerts in the past month?",
             "show me a few alerts",
@@ -189,7 +188,7 @@ class TestSupervisorRoutingRules:
             # Should mention generic alert queries and field/baseline discovery
             assert any(
                 kw in prompt_text.lower()
-                for kw in ["generic alert", "alert field", "field discovery", "baseline_querier", "rag_querier"]
+                for kw in ["generic alert", "alert field", "field discovery", "baseline_querier", "opensearch_querier"]
             ), f"Prompt should guide log search for generic alert question: {question}"
             
             # Should mention that opensearch_querier needs specific criteria
@@ -367,7 +366,7 @@ class TestSupervisorRoutingRules:
     def test_malicious_alerts_could_use_both_skills(self, available_skills):
         """
         'Malicious alerts from Iran' could use:
-        1. Log search to find Iran alerts (rag_querier/opensearch_querier)
+        1. Log search to find Iran alerts (baseline_querier/opensearch_querier)
         2. Threat analysis to check IP reputation (threat_analyst)
         
         The supervisor should be guided by context to choose appropriately.
@@ -479,7 +478,7 @@ class TestSupervisorRoutingIntegration:
         # This is more of a documentation test — it verifies the prompt
         # contains rules in the right order.
         
-        from skills.chat_router.logic import _supervisor_next_action
+        from core.chat_router.logic import _supervisor_next_action
         
         llm = MagicMock()
         llm.chat.return_value = '{"skills": [], "reasoning": ""}'

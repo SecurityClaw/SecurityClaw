@@ -1,15 +1,16 @@
 """
-core/memory.py — Compact structured working memory persisted under /data.
+core/memory.py — Compact structured working memory.
 
 The memory store is intentionally bounded so it remains useful for agent
 reasoning without growing until it becomes expensive to serialize into model
-context. The on-disk format is JSON, while the public API still exposes the
-section-oriented helpers that existing skills rely on.
+context. Two public implementations are available: StateBackedMemory for in-memory
+work and CheckpointBackedMemory for persistent SQLite-backed storage.
 """
 from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +19,8 @@ from typing import Any, Optional
 from core.config import Config
 
 STORE_VERSION = 2
-DEFAULT_MEMORY_PATH = "data/agent_memory.json"
+DEFAULT_RUNTIME_MEMORY_PATH = "data/runtime_memory.db"
+DEFAULT_RUNTIME_THREAD_ID = "runtime-agent-memory"
 
 LIST_SECTION_KEYS = {
     "Open Findings": "findings",
@@ -43,8 +45,44 @@ def _display_timestamp(value: str | None) -> str:
         return value
 
 
-class AgentMemory:
-    """Bounded structured memory with a backwards-compatible section API."""
+def _store_to_state(store: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "mem_status": store["status"],
+        "mem_focus": store["focus"],
+        "mem_findings": store["sections"]["findings"],
+        "mem_decisions": store["sections"]["decisions"],
+        "mem_escalations": store["sections"]["escalations"],
+    }
+
+
+def _state_to_store(payload: dict[str, Any] | None) -> dict[str, Any]:
+    payload = payload or {}
+    return {
+        "status": payload.get("mem_status") or "IDLE",
+        "focus": payload.get("mem_focus") or "None",
+        "last_updated": payload.get("mem_last_updated") or _now_iso(),
+        "sections": {
+            "findings": payload.get("mem_findings") or [],
+            "decisions": payload.get("mem_decisions") or [],
+            "escalations": payload.get("mem_escalations") or [],
+        },
+    }
+
+
+def _build_checkpoint_graph(checkpointer: Any):
+    from langgraph.graph import START, StateGraph
+
+    def passthrough(state: dict[str, Any]) -> dict[str, Any]:
+        return state
+
+    graph = StateGraph(dict)
+    graph.add_node("memory", passthrough)
+    graph.add_edge(START, "memory")
+    return graph.compile(checkpointer=checkpointer)
+
+
+class _MemoryBase:
+    """Internal base class with shared memory implementation and section API."""
 
     SECTIONS = [
         "Agent Status",
@@ -56,7 +94,8 @@ class AgentMemory:
 
     def __init__(self, path: Optional[Path] = None) -> None:
         cfg = Config()
-        default = Path(cfg.get("memory", "path", default=DEFAULT_MEMORY_PATH))
+        # Note: path is always provided by subclasses (StateBackedMemory, CheckpointBackedMemory)
+        default = Path(cfg.get("memory", "path", default="data/memory") or "data/memory")
         self.path = path or default
         if not self.path.is_absolute():
             self.path = Path(__file__).parent.parent / self.path
@@ -179,6 +218,30 @@ class AgentMemory:
             "decisions": self.get_section("Recent Decisions"),
             "escalation": self.get_section("Escalation Queue"),
         }
+
+    @classmethod
+    def from_state(cls, state: dict) -> "_MemoryBase":
+        """Create a memory instance hydrated from a LangGraph AgentState dict.
+
+        This writes the in-state memory fields back to the underlying store so
+        that skills using context["memory"] see the correct accumulated state.
+        """
+        mem = cls()
+        with mem._lock:
+            store = mem._default_store()
+            store["status"] = state.get("mem_status") or "IDLE"
+            store["focus"] = state.get("mem_focus") or "None"
+            store["sections"]["findings"] = state.get("mem_findings") or []
+            store["sections"]["decisions"] = state.get("mem_decisions") or []
+            store["sections"]["escalations"] = state.get("mem_escalations") or []
+            mem._save_store(store)
+        return mem
+
+    def to_dict(self) -> dict:
+        """Return serializable memory fields suitable for a LangGraph state update."""
+        with self._lock:
+            store = self._load_store()
+        return _store_to_state(store)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -357,3 +420,106 @@ class AgentMemory:
         store["last_updated"] = _now_iso()
         if not store.get("focus"):
             store["focus"] = "None"
+
+
+class StateBackedMemory(_MemoryBase):
+    """In-memory LangGraph state-backed memory (no persistence)."""
+
+    def __init__(self, state: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(path=Path("langgraph-state"))
+        self._store = self._normalize_store(state or self._default_store())
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> "StateBackedMemory":
+        store = {
+            "status": state.get("mem_status") or "IDLE",
+            "focus": state.get("mem_focus") or "None",
+            "sections": {
+                "findings": state.get("mem_findings") or [],
+                "decisions": state.get("mem_decisions") or [],
+                "escalations": state.get("mem_escalations") or [],
+            },
+        }
+        return cls(store)
+
+    def _ensure_exists(self) -> None:
+        return
+
+    def _load_store(self) -> dict[str, Any]:
+        return self._normalize_store(self._store)
+
+    def _save_store(self, store: dict[str, Any]) -> None:
+        self._store = self._normalize_store(store)
+
+    def to_dict(self) -> dict:
+        with self._lock:
+            return _store_to_state(self._store)
+
+
+class CheckpointBackedMemory(_MemoryBase):
+    """SQLite checkpoint-backed memory with persistence (LangGraph)."""
+
+    def __init__(
+        self,
+        path: Optional[Path] = None,
+        *,
+        thread_id: str = DEFAULT_RUNTIME_THREAD_ID,
+        checkpointer: Any = None,
+    ) -> None:
+        self.thread_id = thread_id
+        self._external_checkpointer = checkpointer is not None
+        self._connection: sqlite3.Connection | None = None
+        self._checkpointer = None
+        self._graph = None
+        super().__init__(path=path or Path(DEFAULT_RUNTIME_MEMORY_PATH))
+        self._initialize_checkpoint_store(path=path, checkpointer=checkpointer)
+
+    def _ensure_exists(self) -> None:
+        if self.path and not self.path.is_absolute():
+            self.path = Path(__file__).parent.parent / self.path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _initialize_checkpoint_store(self, *, path: Optional[Path], checkpointer: Any) -> None:
+        if checkpointer is not None:
+            self._checkpointer = checkpointer
+            self._graph = _build_checkpoint_graph(checkpointer)
+            return
+
+        db_path = path or self.path
+        if not db_path.is_absolute():
+            db_path = Path(__file__).parent.parent / db_path
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = db_path
+        self._connection = sqlite3.connect(str(db_path), check_same_thread=False)
+        try:
+            from langgraph.checkpoint.sqlite import SqliteSaver
+
+            self._checkpointer = SqliteSaver(self._connection)
+        except ImportError:
+            from langgraph.checkpoint.memory import MemorySaver
+
+            self._checkpointer = MemorySaver()
+        self._graph = _build_checkpoint_graph(self._checkpointer)
+
+    def _config(self) -> dict[str, Any]:
+        return {"configurable": {"thread_id": self.thread_id}}
+
+    def _load_store(self) -> dict[str, Any]:
+        if self._graph is None:
+            return self._default_store()
+        snapshot = self._graph.get_state(self._config())
+        payload = snapshot.values if isinstance(snapshot.values, dict) else {}
+        return self._normalize_store(_state_to_store(payload))
+
+    def _save_store(self, store: dict[str, Any]) -> None:
+        if self._graph is None:
+            return
+        normalized = self._normalize_store(store)
+        state = _store_to_state(normalized)
+        state["mem_last_updated"] = normalized["last_updated"]
+        self._graph.update_state(self._config(), state)
+
+    def close(self) -> None:
+        if self._connection is not None:
+            self._connection.close()
+            self._connection = None

@@ -249,8 +249,10 @@ class TestThreatAnalyst:
     def test_skips_without_db_or_llm(self, runner_context):
         import importlib
         logic = importlib.import_module("skills.threat_analyst.logic")
+
         result = logic.run({**runner_context, "db": None})
-        assert result["status"] == "skipped"
+        assert result["status"] == "ok"
+        assert result["analyzed"] == 0
 
         result = logic.run({**runner_context, "llm": None})
         assert result["status"] == "skipped"

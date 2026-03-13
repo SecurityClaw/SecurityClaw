@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from skills.chat_router.logic import route_question
+from core.chat_router.logic import route_question
 
 
 class _StaticRoutingLLM:

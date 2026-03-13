@@ -1,11 +1,12 @@
 """
-skills/chat_router/logic.py
+core/chat_router/logic.py
 
 Intelligent skill router for conversational SOC queries.
 Routes user questions to appropriate skills, handles multi-skill workflows,
-and maintains conversation context.
+and maintains conversation context using LangGraph orchestration.
 
-This is not a periodic skill—it's invoked interactively via the chat command.
+This is the core orchestration module—not a periodic skill.
+LangGraph is a required dependency for the agent loop orchestration.
 """
 from __future__ import annotations
 
@@ -13,8 +14,15 @@ import ipaddress
 import json
 import logging
 import re
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
+
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.runnables.config import RunnableConfig
+
+from core.memory import StateBackedMemory
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +35,39 @@ RESPONSE_REFLECTION_PROMPT_PATH = Path(__file__).parent / "RESPONSE_REFLECTION_P
 RESPONSE_VERIFICATION_PROMPT_PATH = Path(__file__).parent / "RESPONSE_VERIFICATION_PROMPT.md"
 RESPONSE_FINAL_PROMPT_PATH = Path(__file__).parent / "RESPONSE_FINAL_PROMPT.md"
 SKILL_NAME = "chat_router"
+
+
+class AgentState(TypedDict, total=False):
+    """LangGraph state shared across all graph nodes for a single Q&A turn."""
+
+    # Conversation identity
+    thread_id: str
+    user_question: str
+    messages: list  # conversation_history (list[dict])
+
+    # Orchestration control
+    skill_plan: list        # skills chosen by the supervisor for this step
+    pending_parameters: dict  # parameters chosen by the supervisor for this step
+    pending_reasoning: str    # reasoning chosen by the supervisor for this step
+    skill_results: dict     # accumulated results from all executed skills
+    step_count: int
+    max_steps: int
+    previously_run_skills: list  # list of plan signatures for previously executed steps
+
+    # Evaluation
+    evaluation: dict        # {satisfied, confidence, reasoning, missing}
+    trace: list             # execution trace (list[dict])
+
+    # Agent memory (serializable LangGraph working memory)
+    mem_status: str
+    mem_focus: str
+    mem_findings: list      # list[{timestamp, text}]
+    mem_decisions: list
+    mem_escalations: list
+
+    # Output
+    response: str
+    routing_metadata: dict
 
 
 def _load_prompt_template(path: Path, fallback: str) -> str:
@@ -50,6 +91,38 @@ def _question_asks_for_reputation(user_question: str) -> bool:
         term in question_lower
         for term in ["reputation", "threat intel", "threat intelligence", "risk", "malicious", "verdict", "score"]
     )
+
+
+def _question_asks_for_baseline(user_question: str) -> bool:
+    question_lower = user_question.lower()
+    return any(
+        term in question_lower
+        for term in [
+            "baseline",
+            "normal behavior",
+            "is this normal",
+            "is it normal",
+            "what's normal",
+            "usual behavior",
+            "expected behavior",
+            "common behavior",
+            "frequent",
+            "frequency",
+            "how often",
+        ]
+    )
+
+
+def _normalize_plan_question(question: str) -> str:
+    return " ".join(str(question or "").lower().split())
+
+
+def _plan_signature(skills: list[str], parameters: dict | None) -> str:
+    payload = {
+        "skills": list(skills or []),
+        "question": _normalize_plan_question((parameters or {}).get("question", "")),
+    }
+    return json.dumps(payload, sort_keys=True)
 
 
 def _strip_unrequested_threat_intel(
@@ -178,7 +251,7 @@ Return a strict JSON object with reasoning, skills, and parameters.question.
         # Ensure parameters has the question
         if "parameters" not in result:
             result["parameters"] = {}
-        if "question" not in result["parameters"]:
+        if not result["parameters"].get("question"):
             result["parameters"]["question"] = user_question
 
         contextual_reputation_entities = _recover_threat_followup_entities(
@@ -250,18 +323,21 @@ Return a strict JSON object with reasoning, skills, and parameters.question.
             result.get("skills", []),
             user_question,
         )
+
+        if "opensearch_querier" in result.get("skills", []):
+            result["parameters"]["question"] = user_question
+
         return result
     except json.JSONDecodeError:
         logger.warning("[%s] Failed to parse LLM routing response: %s", SKILL_NAME, response)
         # Fallback: try to extract JSON from response
         try:
-            import re
             match = re.search(r"\{.*\}", response, re.DOTALL)
             if match:
                 result = json.loads(match.group(0))
                 if "parameters" not in result:
                     result["parameters"] = {}
-                if "question" not in result["parameters"]:
+                if not result["parameters"].get("question"):
                     result["parameters"]["question"] = user_question
                 return result
         except:
@@ -527,7 +603,6 @@ def _contains_specific_ip(user_question: str) -> bool:
     
     Returns False for general location queries like "traffic from Russia".
     """
-    import re
     question_lower = user_question.lower()
     
     # IP address patterns
@@ -617,6 +692,7 @@ def execute_skill_workflow(
     routing_decision: dict,
     conversation_history: list[dict] = None,
     aggregated_results: dict = None,
+    memory: Any = None,
 ) -> dict:
     """
     Execute one or more skills in sequence, passing context between them.
@@ -642,6 +718,8 @@ def execute_skill_workflow(
             # Build context with parameters
             skill_context = runner._build_context()
             skill_context["parameters"] = params.copy()
+            if memory is not None:
+                skill_context["memory"] = memory
             
             # Pass conversation history for context-aware skills
             if conversation_history:
@@ -665,6 +743,21 @@ def execute_skill_workflow(
                     enriched_q = _build_context_aware_threat_question(original_q, entities)
                     skill_context["parameters"]["question"] = enriched_q
                     logger.info("[%s] Enriched threat_analyst question with discovered entities", SKILL_NAME)
+            elif skill_name == "baseline_querier":
+                original_q = skill_context["parameters"].get("question", "")
+                entities = _recover_baseline_followup_entities(
+                    original_q,
+                    conversation_history,
+                    combined_previous_results,
+                )
+                enriched_q = _build_context_aware_baseline_question(
+                    original_q,
+                    entities,
+                    conversation_history,
+                )
+                if enriched_q != original_q:
+                    skill_context["parameters"]["question"] = enriched_q
+                    logger.info("[%s] Enriched baseline_querier question with follow-up context", SKILL_NAME)
             elif skill_name == "threat_analyst" and conversation_history:
                 original_q = skill_context["parameters"].get("question", "")
                 entities = _recover_threat_followup_entities(
@@ -694,6 +787,8 @@ def execute_skill_workflow(
                     try:
                         logger.info("[%s] Auto-chaining skill: threat_analyst", SKILL_NAME)
                         threat_context = runner._build_context()
+                        if memory is not None:
+                            threat_context["memory"] = memory
                         threat_params = dict(params)
                         threat_params["question"] = threat_question
                         threat_context["parameters"] = threat_params
@@ -767,6 +862,18 @@ def _apply_result_aware_recovery(
 
     entities = _extract_entities_from_previous_results(current_results) if current_results else {}
     has_ips = bool((entities or {}).get("ips"))
+    fields_result = current_results.get("fields_querier") or {}
+    fields_has_results = bool(
+        fields_result.get("field_mappings")
+        or (fields_result.get("findings") or {}).get("field_mappings")
+    )
+    asks_for_log_search = bool(
+        _question_has_explicit_entities(user_question)
+        or (
+            re.search(r"\b(traffic|flow|flows|connection|connections|log|logs|event|events|port|ports|protocol|country|countries|ip|ips|host|hosts)\b", question_lower)
+            and re.search(r"\b(show|find|search|check|list|get|what|which|when|who|where|display|pull|visited|visit|seen|look for|from|to)\b", question_lower)
+        )
+    )
 
     if os_validation_failed and missing_fields_or_schema:
         if "fields_querier" in available and "fields_querier" not in current_results:
@@ -777,6 +884,13 @@ def _apply_result_aware_recovery(
                 "[%s] Added fields_querier recovery after opensearch validation reported missing fields/schema",
                 SKILL_NAME,
             )
+
+    if fields_has_results and asks_for_log_search and "opensearch_querier" in available and "opensearch_querier" not in current_results:
+        ordered = ["opensearch_querier"] + [s for s in ordered if s not in {"opensearch_querier", "fields_querier"}]
+        logger.info(
+            "[%s] Promoted opensearch_querier after field discovery so the supervisor advances from schema to evidence",
+            SKILL_NAME,
+        )
 
     if asks_for_country and has_ips:
         if "geoip_lookup" in available and "geoip_lookup" not in ordered and "geoip_lookup" not in current_results:
@@ -789,7 +903,15 @@ def _apply_result_aware_recovery(
     if asks_for_reputation:
         threat_result = current_results.get("threat_analyst") or {}
         has_threat_intel = threat_result.get("status") == "ok"
-        if "threat_analyst" in available and not has_threat_intel and "threat_analyst" not in ordered:
+        # Only auto-add threat_analyst as a recovery action when opensearch has already
+        # found records to enrich.  If opensearch hasn't run yet (or returned nothing),
+        # the supervisor's own plan should decide whether to run threat_analyst — we
+        # must not pre-emptively inject it into step 1 and collapse a two-step flow.
+        opensearch_has_results = bool(
+            isinstance(current_results.get("opensearch_querier"), dict)
+            and current_results["opensearch_querier"].get("results_count", 0)
+        )
+        if "threat_analyst" in available and not has_threat_intel and "threat_analyst" not in ordered and opensearch_has_results:
             ordered.append("threat_analyst")
 
     deduped: list[str] = []
@@ -797,6 +919,402 @@ def _apply_result_aware_recovery(
         if skill and skill not in deduped:
             deduped.append(skill)
     return deduped
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LangGraph node functions
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _graph_runtime(config: dict) -> dict:
+    """Extract non-serializable runtime objects from LangGraph configurable."""
+    return config.get("configurable", {})
+
+
+def decide_node(state: AgentState, config: RunnableConfig) -> dict:
+    """DECIDE: ask the supervisor which skill(s) to run next, apply guards."""
+    rt = _graph_runtime(config)
+    available_skills = rt["available_skills"]
+    llm = rt["llm"]
+    instruction = rt["instruction"]
+    step_callback = rt.get("step_callback")
+
+    aggregated_results: dict = state.get("skill_results") or {}
+    previously_run_skills: list = list(state.get("previously_run_skills") or [])
+    step_count: int = (state.get("step_count") or 0) + 1
+    max_steps: int = state.get("max_steps") or 4
+    last_eval: dict = state.get("evaluation") or {}
+    trace: list = list(state.get("trace") or [])
+
+    decision = _supervisor_next_action(
+        user_question=state["user_question"],
+        available_skills=available_skills,
+        llm=llm,
+        instruction=instruction,
+        conversation_history=list(state.get("messages") or []),
+        previous_trace=trace[-3:],
+        current_results=aggregated_results,
+        previous_eval=last_eval,
+    )
+
+    # Apply routing guards (same as in the original loop)
+    selected: list[str] = _apply_forensic_intent_override(
+        user_question=state["user_question"],
+        selected_skills=decision.get("skills", []),
+        available_skills=available_skills,
+    )
+    selected = _filter_explicit_only_skills(selected, state["user_question"])
+    selected = _enforce_evidence_then_threat_intel(
+        user_question=state["user_question"],
+        selected_skills=selected,
+        available_skills=available_skills,
+        current_results=aggregated_results,
+    )
+    selected = _apply_result_aware_recovery(
+        user_question=state["user_question"],
+        selected_skills=selected,
+        available_skills=available_skills,
+        current_results=aggregated_results,
+    )
+    decision["skills"] = selected
+    current_parameters = dict(decision.get("parameters") or {"question": state["user_question"]})
+    current_signature = _plan_signature(selected, current_parameters)
+
+    # Anti-repeat guard compares the full plan, not just the skill names.
+    if selected and current_signature in previously_run_skills and aggregated_results:
+        improved = _enforce_evidence_then_threat_intel(
+            user_question=state["user_question"],
+            selected_skills=selected,
+            available_skills=available_skills,
+            current_results=aggregated_results,
+        )
+        improved = _apply_result_aware_recovery(
+            user_question=state["user_question"],
+            selected_skills=improved,
+            available_skills=available_skills,
+            current_results=aggregated_results,
+        )
+        improved_signature = _plan_signature(improved, current_parameters)
+        if improved != selected and improved_signature not in previously_run_skills:
+            logger.info(
+                "[%s] Supervisor repeated bad plan %s on step %d — upgrading to %s",
+                SKILL_NAME, selected, step_count, improved,
+            )
+            selected = improved
+            decision["skills"] = selected
+        else:
+            logger.info(
+                "[%s] Supervisor repeated identical plan %s on step %d — blocking",
+                SKILL_NAME, current_signature, step_count,
+            )
+            decision["skills"] = []
+            selected = []
+
+    if step_callback:
+        step_callback("deciding", decision, step_count, max_steps)
+
+    return {
+        "skill_plan": selected,
+        "step_count": step_count,
+        "pending_parameters": dict(decision.get("parameters") or {"question": state["user_question"]}),
+        "pending_reasoning": str(decision.get("reasoning", "")),
+    }
+
+
+def execute_node(state: AgentState, config: RunnableConfig) -> dict:
+    """EXECUTE: run the planned skills and merge results into aggregated_results."""
+    rt = _graph_runtime(config)
+    runner = rt["runner"]
+    step_callback = rt.get("step_callback")
+
+    skill_plan: list[str] = list(state.get("skill_plan") or [])
+    step_count: int = state.get("step_count") or 1
+    max_steps: int = state.get("max_steps") or 4
+    aggregated_results: dict = dict(state.get("skill_results") or {})
+    previously_run_skills: list = list(state.get("previously_run_skills") or [])
+    pending_parameters: dict = dict(state.get("pending_parameters") or {})
+    pending_reasoning: str = str(state.get("pending_reasoning") or "")
+
+    if not skill_plan:
+        return {}  # nothing to do
+
+    graph_memory = StateBackedMemory.from_state(state)
+
+    if step_callback:
+        step_callback("running", {"skills": skill_plan}, step_count, max_steps)
+
+    # Re-constitute a routing_decision dict compatible with execute_skill_workflow
+    routing_decision = {
+        "skills": skill_plan,
+        "parameters": pending_parameters or {"question": state["user_question"]},
+        "reasoning": pending_reasoning,
+    }
+
+    step_results = execute_skill_workflow(
+        skill_plan,
+        runner,
+        {},
+        routing_decision,
+        conversation_history=list(state.get("messages") or []),
+        aggregated_results=aggregated_results,
+        memory=graph_memory,
+    )
+    aggregated_results.update(step_results)
+    previously_run_skills.append(_plan_signature(skill_plan, pending_parameters))
+
+    mem_updates = graph_memory.to_dict()
+
+    return {
+        "skill_results": aggregated_results,
+        "previously_run_skills": previously_run_skills,
+        **mem_updates,
+    }
+
+
+def evaluate_node(state: AgentState, config: RunnableConfig) -> dict:
+    """EVALUATE: ask the supervisor whether current results satisfy the question."""
+    rt = _graph_runtime(config)
+    llm = rt["llm"]
+    instruction = rt["instruction"]
+    step_callback = rt.get("step_callback")
+
+    step_count: int = state.get("step_count") or 1
+    max_steps: int = state.get("max_steps") or 4
+    skill_plan: list = state.get("skill_plan") or []
+    aggregated_results: dict = state.get("skill_results") or {}
+    trace: list = list(state.get("trace") or [])
+
+    # If the decide_node blocked execution (empty plan after anti-repeat), short-circuit
+    if not skill_plan and step_count > 1:
+        last_eval = {
+            "satisfied": False,
+            "confidence": 0.4,
+            "reasoning": "Supervisor proposed the same unsuccessful plan again; duplicate execution was blocked.",
+            "missing": [],
+        }
+    else:
+        last_eval = _supervisor_evaluate_satisfaction(
+            user_question=state["user_question"],
+            llm=llm,
+            instruction=instruction,
+            conversation_history=list(state.get("messages") or []),
+            skill_results=aggregated_results,
+            step=step_count,
+            max_steps=max_steps,
+        )
+
+    trace.append({
+        "step": step_count,
+        "decision": {"skills": skill_plan},
+        "selected_skills": skill_plan,
+        "step_result_keys": list((state.get("skill_results") or {}).keys()),
+        "evaluation": last_eval,
+    })
+
+    logger.info(
+        "[%s] Graph step %d/%d | skills=%s | satisfied=%s (%.2f)",
+        SKILL_NAME, step_count, max_steps, skill_plan,
+        bool(last_eval.get("satisfied", False)),
+        float(last_eval.get("confidence", 0.0) or 0.0),
+    )
+
+    if step_callback:
+        step_callback("evaluated", last_eval, step_count, max_steps)
+
+    return {"evaluation": last_eval, "trace": trace}
+
+
+def memory_write_node(state: AgentState, config: RunnableConfig) -> dict:  # noqa: ARG001
+    """MEMORY_WRITE: funnel point before formatting; state is already in LangGraph."""
+    return {}
+
+
+def format_response_node(state: AgentState, config: RunnableConfig) -> dict:
+    """FORMAT: render the final natural-language response."""
+    rt = _graph_runtime(config)
+    llm = rt["llm"]
+    cfg = rt.get("cfg")
+    available_skills = rt.get("available_skills", [])
+
+    aggregated_results: dict = state.get("skill_results") or {}
+    trace: list = state.get("trace") or []
+    last_eval: dict = state.get("evaluation") or {}
+    user_question: str = state["user_question"]
+    graph_memory = StateBackedMemory.from_state(state)
+
+    # Build final_routing compatible with format_response()
+    final_routing = {
+        "reasoning": last_eval.get("reasoning", "Graph orchestration complete."),
+        "skills": list(aggregated_results.keys()),
+        "parameters": {"question": user_question},
+    }
+
+    # Absolute fallback: if no skills produced results, try single-pass routing
+    if not aggregated_results and trace:
+        runner = rt.get("runner")
+        instruction = rt["instruction"]
+        fallback_routing = route_question(
+            user_question,
+            available_skills,
+            llm,
+            instruction,
+            list(state.get("messages") or []),
+        )
+        if fallback_routing.get("skills") and runner:
+            fallback_results = execute_skill_workflow(
+                fallback_routing["skills"],
+                runner,
+                {},
+                fallback_routing,
+                conversation_history=list(state.get("messages") or []),
+                aggregated_results={},
+                memory=graph_memory,
+            )
+            aggregated_results = fallback_results
+            final_routing["skills"] = list(fallback_results.keys())
+
+    response = format_response(
+        user_question,
+        final_routing,
+        aggregated_results,
+        llm,
+        cfg,
+        available_skills=available_skills,
+    )
+
+    return {
+        "response": response,
+        "routing_metadata": final_routing,
+        "skill_results": aggregated_results,  # update in case fallback ran
+        **graph_memory.to_dict(),
+    }
+
+
+def should_loop(state: AgentState) -> str:
+    """Conditional edge after evaluate_node: loop back to decide or move to memory_write."""
+    evaluation: dict = state.get("evaluation") or {}
+    satisfied: bool = bool(evaluation.get("satisfied", False))
+    step_count: int = state.get("step_count") or 0
+    max_steps: int = state.get("max_steps") or 4
+    skill_plan: list = state.get("skill_plan") or []
+
+    if satisfied:
+        return "memory_write"
+    if step_count >= max_steps:
+        return "memory_write"
+    # No actionable plan after the first attempt → give up
+    if not skill_plan and step_count >= 1:
+        return "memory_write"
+    return "decide"
+
+
+def build_graph(checkpointer=None):
+    """Compile the SecurityClaw orchestration StateGraph.
+
+    Args:
+        checkpointer: An optional LangGraph checkpointer (e.g. SqliteSaver or MemorySaver).
+            Defaults to an in-memory MemorySaver if not provided.
+    """
+    _checkpointer = checkpointer if checkpointer is not None else MemorySaver()
+
+    builder = StateGraph(AgentState)
+    builder.add_node("decide", decide_node)
+    builder.add_node("execute", execute_node)
+    builder.add_node("evaluate", evaluate_node)
+    builder.add_node("memory_write", memory_write_node)
+    builder.add_node("format", format_response_node)
+
+    builder.add_edge(START, "decide")
+    builder.add_edge("decide", "execute")
+    builder.add_edge("execute", "evaluate")
+    builder.add_conditional_edges(
+        "evaluate",
+        should_loop,
+        {"decide": "decide", "memory_write": "memory_write"},
+    )
+    builder.add_edge("memory_write", "format")
+    builder.add_edge("format", END)
+
+    return builder.compile(checkpointer=_checkpointer)
+
+
+def run_graph(
+    user_question: str,
+    available_skills: list[dict],
+    runner: Any,
+    llm: Any,
+    instruction: str,
+    cfg: Any = None,
+    conversation_history: list[dict] | None = None,
+    step_callback: Any = None,
+    thread_id: str | None = None,
+    checkpointer: Any = None,
+) -> dict:
+    """Execute the LangGraph orchestration pipeline for a single Q&A turn.
+
+    Replaces ``orchestrate_with_supervisor``. All existing callers that pass
+    keyword-compatible arguments can switch to this function without any other
+    changes.
+
+    Args:
+        checkpointer: LangGraph checkpointer (SqliteSaver for persistence,
+            MemorySaver for tests). Created automatically when omitted.
+        thread_id: Unique ID for this turn's LangGraph thread. Defaults to a
+            fresh UUID so each turn starts from a clean slate.
+    """
+    max_steps = 4
+    if cfg:
+        max_steps = int(cfg.get("chat", "supervisor_max_steps", default=4) or 4)
+    max_steps = max(1, min(max_steps, 8))
+
+    # Fresh thread per turn so the graph always starts from a clean initial state
+    run_thread_id = thread_id or str(uuid.uuid4())
+
+    initial_state: AgentState = {
+        "thread_id": run_thread_id,
+        "user_question": user_question,
+        "messages": list(conversation_history or []),
+        "skill_plan": [],
+        "pending_parameters": {"question": user_question},
+        "pending_reasoning": "",
+        "skill_results": {},
+        "step_count": 0,
+        "max_steps": max_steps,
+        "previously_run_skills": [],
+        "evaluation": {},
+        "trace": [],
+        "mem_status": "IDLE",
+        "mem_focus": "None",
+        "mem_findings": [],
+        "mem_decisions": [],
+        "mem_escalations": [],
+        "response": "",
+        "routing_metadata": {},
+    }
+
+    # Runtime objects (non-serializable) travel via config["configurable"] and
+    # are NOT stored in the checkpoint.
+    graph_config = {
+        "configurable": {
+            "thread_id": run_thread_id,
+            "runner": runner,
+            "llm": llm,
+            "available_skills": available_skills,
+            "instruction": instruction,
+            "cfg": cfg,
+            "step_callback": step_callback,
+        }
+    }
+
+    graph = build_graph(checkpointer)
+    final_state = graph.invoke(initial_state, config=graph_config)
+
+    return {
+        "response": final_state.get("response") or "Unable to produce a response.",
+        "routing": final_state.get("routing_metadata") or {},
+        "skill_results": final_state.get("skill_results") or {},
+        "trace": final_state.get("trace") or [],
+        "evaluation": final_state.get("evaluation") or {},
+    }
 
 
 def orchestrate_with_supervisor(
@@ -809,201 +1327,22 @@ def orchestrate_with_supervisor(
     conversation_history: list[dict] | None = None,
     step_callback: Any = None,
 ) -> dict:
-    """Iterative LLM supervisor loop: decide skills, run, evaluate, repeat until satisfied.
+    """Backward-compatible wrapper around :func:`run_graph`.
 
-    Args:
-        step_callback: Optional callable(event, data, step, max_steps) for real-time display.
-            event is one of: "deciding", "running", "evaluated"
+    All existing callers (main.py, web/api/server.py, tests) continue to work
+    unchanged. New code should call ``run_graph`` directly to gain access to the
+    ``checkpointer`` and ``thread_id`` parameters.
     """
-    max_steps = 4
-    if cfg:
-        max_steps = int(cfg.get("chat", "supervisor_max_steps", default=4) or 4)
-    max_steps = max(1, min(max_steps, 8))
-
-    conversation_history = conversation_history or []
-    trace: list[dict] = []
-    aggregated_results: dict = {}
-    last_eval = {
-        "satisfied": False,
-        "reasoning": "No evaluation yet",
-        "confidence": 0.0,
-        "missing": ["No skills executed yet"],
-    }
-    # Track which skills were run in previous steps to detect unhelpful repetition.
-    previously_run_skills: list[list[str]] = []
-
-    for step in range(1, max_steps + 1):
-        decision = _supervisor_next_action(
-            user_question=user_question,
-            available_skills=available_skills,
-            llm=llm,
-            instruction=instruction,
-            conversation_history=conversation_history,
-            previous_trace=trace,
-            current_results=aggregated_results,
-            previous_eval=last_eval,
-        )
-
-        # Normalize skills with existing router guards.
-        selected = _apply_forensic_intent_override(
-            user_question=user_question,
-            selected_skills=decision.get("skills", []),
-            available_skills=available_skills,
-        )
-        selected = _filter_explicit_only_skills(selected, user_question)
-        selected = _enforce_evidence_then_threat_intel(
-            user_question=user_question,
-            selected_skills=selected,
-            available_skills=available_skills,
-            current_results=aggregated_results,
-        )
-        selected = _apply_result_aware_recovery(
-            user_question=user_question,
-            selected_skills=selected,
-            available_skills=available_skills,
-            current_results=aggregated_results,
-        )
-        decision["skills"] = selected
-
-        # ── Real-time callback: supervisor has decided ─────────────────────
-        if step_callback:
-            step_callback("deciding", decision, step, max_steps)
-
-        # Anti-repeat guard: if same skills chosen again and we already have
-        # results from them, try a recovery plan and otherwise refuse duplicates.
-        if selected and selected in previously_run_skills and aggregated_results:
-            improved = _enforce_evidence_then_threat_intel(
-                user_question=user_question,
-                selected_skills=selected,
-                available_skills=available_skills,
-                current_results=aggregated_results,
-            )
-            improved = _apply_result_aware_recovery(
-                user_question=user_question,
-                selected_skills=improved,
-                available_skills=available_skills,
-                current_results=aggregated_results,
-            )
-            if improved != selected and improved not in previously_run_skills:
-                logger.info(
-                    "[%s] Supervisor repeated bad plan %s on step %d — upgrading to %s instead of finalizing",
-                    SKILL_NAME, selected, step, improved,
-                )
-                selected = improved
-                decision["skills"] = selected
-            else:
-                logger.info(
-                    "[%s] Supervisor repeated identical skill set %s on step %d — blocking duplicate execution",
-                    SKILL_NAME, selected, step,
-                )
-                last_eval = {
-                    "satisfied": False,
-                    "confidence": 0.4,
-                    "reasoning": "Supervisor proposed the same unsuccessful skills again; duplicate execution was blocked.",
-                    "missing": last_eval.get("missing", []) if isinstance(last_eval, dict) else [],
-                }
-                trace.append({
-                    "step": step,
-                    "decision": decision,
-                    "selected_skills": selected,
-                    "step_result_keys": [],
-                    "evaluation": last_eval,
-                })
-                if step_callback:
-                    step_callback("evaluated", last_eval, step, max_steps)
-                break
-
-        step_results = {}
-        if selected:
-            if step_callback:
-                step_callback("running", {"skills": selected}, step, max_steps)
-            step_results = execute_skill_workflow(
-                selected,
-                runner,
-                {},
-                decision,
-                conversation_history=conversation_history,
-                aggregated_results=aggregated_results,
-            )
-            aggregated_results.update(step_results)
-            previously_run_skills.append(selected)
-
-        last_eval = _supervisor_evaluate_satisfaction(
-            user_question=user_question,
-            llm=llm,
-            instruction=instruction,
-            conversation_history=conversation_history,
-            skill_results=aggregated_results,
-            step=step,
-            max_steps=max_steps,
-        )
-
-        trace.append(
-            {
-                "step": step,
-                "decision": decision,
-                "selected_skills": selected,
-                "step_result_keys": list(step_results.keys()),
-                "evaluation": last_eval,
-            }
-        )
-
-        # ── Real-time callback: evaluation complete ────────────────────────
-        if step_callback:
-            step_callback("evaluated", last_eval, step, max_steps)
-
-        logger.info(
-            "[%s] Supervisor step %d/%d | skills=%s | satisfied=%s (%.2f)",
-            SKILL_NAME,
-            step,
-            max_steps,
-            selected,
-            bool(last_eval.get("satisfied", False)),
-            float(last_eval.get("confidence", 0.0) or 0.0),
-        )
-
-        if last_eval.get("satisfied", False):
-            break
-
-        if not selected and step > 1:
-            # No actionable next step from supervisor.
-            break
-
-    if not trace:
-        # Absolute fallback to single-pass routing.
-        routing = route_question(
-            user_question,
-            available_skills,
-            llm,
-            instruction,
-            conversation_history,
-        )
-        if routing.get("skills"):
-            aggregated_results = execute_skill_workflow(
-                routing["skills"],
-                runner,
-                {},
-                routing,
-                conversation_history=conversation_history,
-                aggregated_results=aggregated_results,
-            )
-        trace = [{"step": 1, "decision": routing, "selected_skills": routing.get("skills", []), "evaluation": last_eval}]
-
-    final_routing = {
-        "reasoning": last_eval.get("reasoning", "Supervisor completed orchestration."),
-        "skills": list(aggregated_results.keys()),
-        "parameters": {"question": user_question},
-    }
-    response = format_response(user_question, final_routing, aggregated_results, llm, cfg, 
-                             available_skills=available_skills)
-
-    return {
-        "response": response,
-        "routing": final_routing,
-        "skill_results": aggregated_results,
-        "trace": trace,
-        "evaluation": last_eval,
-    }
+    return run_graph(
+        user_question=user_question,
+        available_skills=available_skills,
+        runner=runner,
+        llm=llm,
+        instruction=instruction,
+        cfg=cfg,
+        conversation_history=conversation_history,
+        step_callback=step_callback,
+    )
 
 
 def _supervisor_next_action(
@@ -1098,7 +1437,8 @@ Return strict JSON with reasoning, skills, and parameters.question.
         parsed = _parse_json_object(response) or {}
         if "parameters" not in parsed:
             parsed["parameters"] = {}
-        parsed["parameters"]["question"] = user_question
+        if not parsed["parameters"].get("question"):
+            parsed["parameters"]["question"] = user_question
         if conversation_history:
             parsed["parameters"]["conversation_history"] = conversation_history
         if not isinstance(parsed.get("skills"), list):
@@ -1123,6 +1463,18 @@ Return strict JSON with reasoning, skills, and parameters.question.
             if conversation_history:
                 parsed["parameters"]["conversation_history"] = conversation_history
             return parsed
+
+        if "baseline_querier" in parsed.get("skills", []) and _question_asks_for_baseline(user_question):
+            baseline_entities = _recover_baseline_followup_entities(
+                user_question,
+                conversation_history,
+                current_results,
+            )
+            parsed["parameters"]["question"] = _build_context_aware_baseline_question(
+                user_question,
+                baseline_entities,
+                conversation_history,
+            )
         
         # Apply field discovery prepending for data type queries (same as route_question)
         parsed["skills"] = _prepend_field_discovery_for_data_types(
@@ -1207,6 +1559,12 @@ Return strict JSON with reasoning, skills, and parameters.question.
                         "[%s] Auto-queueing opensearch_querier: fields_querier discovered fields, now search logs with them",
                         SKILL_NAME
                     )
+
+        # When schema discovery and log search are linked, make sure opensearch_querier
+        # receives the original user request instead of a meta-level field-discovery
+        # paraphrase from the supervisor.
+        if "opensearch_querier" in parsed.get("skills", []):
+            parsed["parameters"]["question"] = user_question
         
         return parsed
     except Exception as exc:
@@ -1239,23 +1597,98 @@ def _supervisor_evaluate_satisfaction(
         )
         total_records_found += int(count or 0)
 
+    os_result = skill_results.get("opensearch_querier") or {}
+    country_buckets = os_result.get("country_buckets") or []
+
     # Check if question asks for reputation/threat intelligence
     question_lower = user_question.lower()
     asks_for_reputation = any(
         term in question_lower
         for term in ["reputation", "threat", "malicious", "risk", "dangerous", "score", "verdict"]
     )
+    asks_for_baseline = _question_asks_for_baseline(user_question)
     has_threat_intel = bool(
         skill_results.get("threat_analyst") and 
         skill_results["threat_analyst"].get("status") == "ok"
     )
     threat_verdicts = skill_results.get("threat_analyst", {}).get("verdicts") or []
+    baseline_result = skill_results.get("baseline_querier") or {}
+    baseline_findings = baseline_result.get("findings") or {}
     asks_for_additional_evidence = any(
         term in question_lower
         for term in ["traffic", "country", "countries", "log", "logs", "when", "where", "port", "protocol", "connection", "connections", "flow", "flows"]
     )
 
-    if asks_for_reputation and has_threat_intel and threat_verdicts and not asks_for_additional_evidence:
+    if asks_for_baseline and baseline_result.get("status") == "ok" and baseline_findings.get("answer"):
+        baseline_log_records = int(baseline_findings.get("log_records", 0) or 0)
+        baseline_sources = int(baseline_findings.get("rag_sources", 0) or 0)
+        if baseline_log_records > 0 or baseline_sources > 0:
+            logger.info(
+                "[%s] Evaluation: baseline_querier returned grounded baseline analysis — marking satisfied",
+                SKILL_NAME,
+            )
+            return {
+                "satisfied": True,
+                "confidence": 0.85 if baseline_log_records > 0 else 0.75,
+                "reasoning": (
+                    f"Baseline analysis returned {baseline_log_records} matching log record(s) "
+                    f"and {baseline_sources} relevant baseline document(s)."
+                ),
+                "missing": [],
+            }
+
+    # Satisfy if threat intel produced verdicts.
+    # Only keep looping for "additional evidence" terms (countries, traffic, etc.) when
+    # opensearch actually returned records — if there's nothing in the DB, looping won't help.
+    has_opensearch_records = total_records_found > 0
+    if asks_for_reputation and has_threat_intel and threat_verdicts and (
+        not asks_for_additional_evidence or not has_opensearch_records
+    ):
+        # Validate that verdict IPs match question IPs when possible
+        # Extract IPs from question to ensure response is about the right entities
+        ip_pattern = r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
+        question_ips = set(re.findall(ip_pattern, user_question))
+        
+        # Also look in recent conversation for mentioned IPs (for "these IPs" follow-ups)
+        history_text = "\n".join(
+            str(m.get("content", ""))
+            for m in (conversation_history or [])[-3:]
+        )
+        discovered_ips = set(re.findall(ip_pattern, history_text))
+        question_ips.update(discovered_ips)
+        
+        # If question had specific IPs, check that verdicts mention similar ones
+        verdicts_mention_wrong_ips = False
+        if question_ips:
+            # Extract IPs from verdict reasoning
+            verdict_text = "\n".join(
+                str(v.get("reasoning", ""))
+                for v in threat_verdicts
+            )
+            verdict_ips = set(re.findall(ip_pattern, verdict_text))
+            
+            # If verdict mentions IPs, at least one should overlap with question IPs
+            if verdict_ips and not verdict_ips.intersection(question_ips):
+                # Verdict IPs and question IPs don't overlap — likely analyzed wrong entities
+                verdicts_mention_wrong_ips = True
+                logger.warning(
+                    "[%s] Verdict mentions IPs %s but question asked about %s — possible IP mismatch",
+                    SKILL_NAME, verdict_ips, question_ips
+                )
+        
+        if verdicts_mention_wrong_ips:
+            # Re-run to get correct verdicts
+            logger.info(
+                "[%s] Detected IP mismatch in verdicts — requesting re-analysis",
+                SKILL_NAME,
+            )
+            return {
+                "satisfied": False,
+                "confidence": 0.3,
+                "reasoning": "Threat intel was produced but for wrong IPs; re-analyzing.",
+                "missing": ["threat reputation for correct IPs"],
+            }
+        
         logger.info(
             "[%s] Evaluation: threat_analyst returned %d verdict(s) for a reputation question — marking satisfied",
             SKILL_NAME,
@@ -1294,8 +1727,21 @@ def _supervisor_evaluate_satisfaction(
             "missing": [],
         }
 
-    os_result = skill_results.get("opensearch_querier") or {}
+    fields_result = skill_results.get("fields_querier") or {}
     directional_alternative = os_result.get("directional_alternative") or {}
+    if country_buckets:
+        logger.info(
+            "[%s] Evaluation: opensearch_querier returned %d aggregated country bucket(s) — marking satisfied",
+            SKILL_NAME,
+            len(country_buckets),
+        )
+        return {
+            "satisfied": True,
+            "confidence": 0.9,
+            "reasoning": f"OpenSearch returned {len(country_buckets)} aggregated country bucket(s).",
+            "missing": [],
+        }
+
     if int(directional_alternative.get("results_count", 0) or 0) > 0:
         alternative_direction = directional_alternative.get("direction", "opposite")
         alternative_count = int(directional_alternative.get("results_count", 0) or 0)
@@ -1310,6 +1756,43 @@ def _supervisor_evaluate_satisfaction(
             "reasoning": f"No records matched the requested direction, but {alternative_count} {alternative_direction}-direction records were found for the same IP.",
             "missing": [],
         }
+
+    if not total_records_found:
+        if os_result.get("status") == "no_action":
+            logger.info(
+                "[%s] Evaluation: opensearch_querier produced no actionable query — keeping the supervisor unsatisfied",
+                SKILL_NAME,
+            )
+            return {
+                "satisfied": False,
+                "confidence": 0.25,
+                "reasoning": "Field discovery completed, but the log search did not execute a grounded query for the original request.",
+                "missing": ["grounded log search results"],
+            }
+
+        if fields_result.get("status") == "ok" and "opensearch_querier" not in skill_results:
+            logger.info(
+                "[%s] Evaluation: fields_querier completed but no log search has run yet",
+                SKILL_NAME,
+            )
+            return {
+                "satisfied": False,
+                "confidence": 0.5,
+                "reasoning": "Field discovery completed, but no log records have been retrieved yet.",
+                "missing": ["matching log records"],
+            }
+
+        if os_result.get("status") == "ok" and int(os_result.get("results_count", 0) or 0) == 0 and not os_result.get("validation_failed"):
+            logger.info(
+                "[%s] Evaluation: opensearch_querier returned zero grounded results",
+                SKILL_NAME,
+            )
+            return {
+                "satisfied": False,
+                "confidence": 0.7,
+                "reasoning": "No matching log records were found for the requested criteria.",
+                "missing": ["matching log records"],
+            }
 
     history_text = "\n".join(
         f"- {m.get('role', '?')}: {str(m.get('content', ''))[:220]}"
@@ -1558,9 +2041,27 @@ def _extract_entities_from_conversation_history(conversation_history: list[dict]
     ip_pattern = r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
     domain_pattern = r"\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b"
 
+    def _is_grounded_assistant_message(role: str, text: str) -> bool:
+        if role != "assistant":
+            return True
+        grounded_markers = [
+            "Found ",
+            "No traffic ",
+            "No matching records found",
+            "Countries seen:",
+            "Source IPs:",
+            "Source/destination IPs:",
+            "Remote peers:",
+            "Reputation analysis for ",
+        ]
+        return any(marker in text for marker in grounded_markers)
+
     for msg in reversed(conversation_history[-8:]):
         text = str(msg.get("content", "") or "")
         if not text:
+            continue
+        role = str(msg.get("role", ""))
+        if not _is_grounded_assistant_message(role, text):
             continue
 
         ips = list(dict.fromkeys(re.findall(ip_pattern, text)))
@@ -1610,10 +2111,17 @@ def _followup_reputation_entities(user_question: str, conversation_history: list
         return {}
 
     question_lower = user_question.lower()
-    referential_cues = [
+    plural_referential_cues = [
         "those",
         "them",
         "above",
+        "listed",
+        "list above",
+        "listed above",
+        "the ip listed",
+        "the ips listed",
+        "listed ip",
+        "listed ips",
         "above ip",
         "above ips",
         "the others",
@@ -1636,35 +2144,43 @@ def _followup_reputation_entities(user_question: str, conversation_history: list
         "except",
         "other than",
     ]
-    asks_for_new_evidence = any(
-        token in question_lower
-        for token in [
-            "traffic",
-            "country",
-            "countries",
-            "log",
-            "logs",
-            "port",
-            "protocol",
-            "connection",
-            "connections",
-            "flow",
-            "flows",
-            "when",
-            "where",
-            "search",
-            "show",
-            "find",
-            "list",
-        ]
+    singular_referential_cues = [
+        "the ip",
+        "that ip",
+        "this ip",
+        "the address",
+        "that address",
+        "this address",
+        "the host",
+        "that host",
+        "this host",
+    ]
+    asks_for_new_evidence = bool(
+        re.search(
+            r"\b(?:traffic|country|countries|log|logs|port|protocol|connection|connections|flow|flows|when|where|search|show|find|list)\b",
+            question_lower,
+        )
     )
-    if not any(cue in question_lower for cue in referential_cues):
-        return {}
     if asks_for_new_evidence and not _question_excludes_private_ips(user_question):
         return {}
 
     history_entities = _extract_entities_from_conversation_history(conversation_history)
     history_entities = _filter_entities_for_question(history_entities, user_question)
+    public_history_ips = [ip for ip in history_entities.get("ips", []) if not _is_private_ip(ip)]
+    singular_reference = any(re.search(rf"\b{re.escape(cue)}\b", question_lower) for cue in singular_referential_cues)
+    plural_reference = any(re.search(rf"\b{re.escape(cue)}\b", question_lower) for cue in plural_referential_cues)
+
+    if singular_reference:
+        if len(public_history_ips) == 1:
+            singular_entities = dict(history_entities)
+            singular_entities["ips"] = [public_history_ips[0]]
+            singular_entities["domains"] = []
+            return singular_entities
+        return {}
+
+    if not plural_reference:
+        return {}
+
     if history_entities.get("ips") or history_entities.get("domains"):
         return history_entities
     return {}
@@ -1689,6 +2205,93 @@ def _recover_threat_followup_entities(
     return {}
 
 
+def _recover_baseline_followup_entities(
+    user_question: str,
+    conversation_history: list[dict] | None,
+    aggregated_results: dict | None = None,
+) -> dict:
+    if not _question_asks_for_baseline(user_question):
+        return {}
+
+    explicit_ips = list(dict.fromkeys(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", user_question or "")))
+    entities = {
+        "ips": explicit_ips,
+        "domains": [],
+        "countries": [],
+        "ports": [],
+        "sources": [],
+    }
+
+    history_entities = _extract_entities_from_conversation_history(conversation_history)
+    previous_entities = _extract_entities_from_previous_results(aggregated_results or {}) if aggregated_results else {}
+
+    for key in ("ips", "domains", "countries", "ports"):
+        combined = entities.get(key, []) + history_entities.get(key, []) + previous_entities.get(key, [])
+        entities[key] = list(dict.fromkeys(combined))
+
+    return _filter_entities_for_question(entities, user_question)
+
+
+def _latest_assistant_observation(conversation_history: list[dict] | None) -> str:
+    if not conversation_history:
+        return ""
+    for msg in reversed(conversation_history[-8:]):
+        if msg.get("role") == "assistant":
+            content = " ".join(str(msg.get("content", "") or "").split())
+            if content and any(
+                marker in content
+                for marker in [
+                    "Found ",
+                    "No traffic ",
+                    "No matching records found",
+                    "Countries seen:",
+                    "Source IPs:",
+                    "Source/destination IPs:",
+                    "Remote peers:",
+                ]
+            ):
+                return content[:600]
+    return ""
+
+
+def _build_context_aware_baseline_question(
+    original_question: str,
+    entities: dict,
+    conversation_history: list[dict] | None = None,
+) -> str:
+    if not _question_asks_for_baseline(original_question):
+        return original_question
+
+    entities = _filter_entities_for_question(entities or {}, original_question)
+    ips = entities.get("ips", [])
+    domains = entities.get("domains", [])
+    countries = entities.get("countries", [])
+    ports = [str(port) for port in entities.get("ports", [])]
+    history_summary = _latest_assistant_observation(conversation_history)
+
+    context_parts = []
+    if ips:
+        context_parts.append(f"Focus entities: IPs {', '.join(ips[:5])}")
+    if domains:
+        context_parts.append(f"Domains {', '.join(domains[:3])}")
+    if countries:
+        context_parts.append(f"Countries {', '.join(countries[:5])}")
+    if ports:
+        context_parts.append(f"Ports {', '.join(ports[:5])}")
+    if history_summary:
+        context_parts.append(f"Recent observed traffic: {history_summary}")
+
+    if not context_parts:
+        return original_question
+
+    return (
+        f"{original_question}\n\n"
+        "Compare the requested behavior against known baseline patterns and any observed traffic evidence. "
+        "If possible, quantify how often the entity appears and whether the behavior looks routine or unusual.\n"
+        + " | ".join(context_parts)
+    )
+
+
 def _build_context_aware_threat_question(original_question: str, entities: dict) -> str:
     """
     Build a context-aware question for threat_analyst when prior results found entities.
@@ -1701,7 +2304,9 @@ def _build_context_aware_threat_question(original_question: str, entities: dict)
         # If no entities extracted, use original question
         return original_question
     
-    ips = entities.get("ips", [])
+    # Filter private IPs: they have no external threat reputation,
+    # and including them causes the LLM to look up or reason about meaningless internal addresses.
+    ips = [ip for ip in entities.get("ips", []) if not _is_private_ip(ip)]
     domains = entities.get("domains", [])
     countries = entities.get("countries", [])
     ports = [str(port) for port in entities.get("ports", [])]
@@ -1777,13 +2382,31 @@ def format_response(
     rag_result = skill_results.get("baseline_querier") or skill_results.get("fields_querier") or {}
     rag_has_data = rag_result and rag_result.get("status") == "ok" and rag_result.get("log_records", 0) > 0
     
-    # If opensearch has records, prioritize it (likely more precise results)
+    baseline_result = skill_results.get("baseline_querier", {})
+    if baseline_result and baseline_result.get("status") in {"ok", "no_data"}:
+        findings = baseline_result.get("findings") or {}
+        if findings.get("answer") and _question_asks_for_baseline(user_question):
+            return _format_baseline_response(user_question, baseline_result)
+
+    # If opensearch has records, prioritize it for non-baseline questions.
     if os_has_data:
         response = _format_opensearch_response(user_question, os_result)
         threat_result = skill_results.get("threat_analyst", {})
         if threat_result and threat_result.get("status") == "ok":
             response = _append_threat_intel_summary(response, threat_result)
         return response
+
+    if baseline_result and baseline_result.get("status") in {"ok", "no_data"}:
+        findings = baseline_result.get("findings") or {}
+        if findings.get("answer"):
+            return _format_baseline_response(user_question, baseline_result)
+
+    if os_result and os_result.get("status") in {"ok", "no_action"} and not os_result.get("validation_failed"):
+        return _format_opensearch_response(user_question, os_result)
+
+    threat_only_result = skill_results.get("threat_analyst", {})
+    if threat_only_result and threat_only_result.get("status") == "ok" and threat_only_result.get("verdicts"):
+        return _format_threat_only_response(user_question, threat_only_result)
 
     if geoip_result and geoip_result.get("status") in {"ok", "not_found"}:
         return _format_geoip_response(geoip_result)
@@ -1800,7 +2423,11 @@ Analyze what the user is asking for.
 
 Question: "{{USER_QUESTION}}"
 
-Extract the main intent, key entities, and success criteria.
+Extract:
+1. Main intent: what they are trying to understand.
+2. Key entities: IPs, domains, services, alerts, users, or hosts.
+3. Success criteria: what would make the answer complete.
+
 Be specific and concise.
 """,
     )
@@ -1816,7 +2443,7 @@ Be specific and concise.
     
     # ── PHASE 3: REFLECTION ─────────────────────────────────────────────────
     results_text = "\n".join([
-        f"\n[{skill_name}]\n{json.dumps(result, indent=2)}"
+        f"\n[{skill_name}]\n{json.dumps(result, indent=2, default=str)}"
         for skill_name, result in skill_results.items()
     ])
     
@@ -1829,7 +2456,13 @@ You extracted the user's intent as:
 Now you received these skill results:
 {{RESULTS_TEXT}}
 
-Briefly assess whether the results cover the intent, entities, success criteria, and any gaps.
+REFLECTION QUESTIONS:
+1. Do the results address the main intent?
+2. Are all key entities covered?
+3. Do the results meet the success criteria?
+4. Are there any inconsistencies or gaps?
+
+Briefly assess coverage in 2-3 sentences.
 """,
     )
     reflection_prompt = _render_prompt(
@@ -1856,13 +2489,22 @@ Briefly assess whether the results cover the intent, entities, success criteria,
         verification_template = _load_prompt_template(
             RESPONSE_VERIFICATION_PROMPT_PATH,
             """
-Internally verify your answer against these facts.
+Internally verify your answer against these facts:
 
 User question: "{{USER_QUESTION}}"
 Skill results:
 {{RESULTS_TEXT}}
 
-Provide only the direct answer in 2-4 sentences with no verification text or preamble.
+VERIFICATION (DO INTERNALLY, DO NOT SHOW IN ANSWER):
+- Are the statements supported by the skill results?
+- Did you infer something not present in the data?
+- Did you make up or assume any facts?
+- Is everything grounded in actual findings?
+
+NOW PROVIDE ONLY THE ANSWER to the user's question in 2-4 sentences.
+Do NOT include verification text.
+Do NOT say "Based on the skill results" or "Here is the answer".
+Provide only the direct answer.
 """,
         )
         verification_prompt = _render_prompt(
@@ -1950,6 +2592,74 @@ def _append_threat_intel_summary(base_response: str, threat_result: dict) -> str
     if all_apis:
         suffix += f" Sources queried: {', '.join(all_apis)}."
     return base_response + suffix
+
+
+def _format_threat_only_response(user_question: str, threat_result: dict) -> str:
+    """Render a threat_analyst-only answer without another LLM formatting pass."""
+    if not threat_result or threat_result.get("status") != "ok":
+        return "No threat intelligence verdict was produced."
+
+    verdicts = threat_result.get("verdicts") or []
+    if not verdicts:
+        return "No threat intelligence verdict was produced."
+
+    requested_ips: list[str] = []
+    for verdict in verdicts:
+        for ip in verdict.get("_requested_ips", []):
+            if ip not in requested_ips:
+                requested_ips.append(ip)
+
+    if not requested_ips:
+        requested_ips = list(dict.fromkeys(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", user_question or "")))
+
+    primary = verdicts[0]
+    verdict_label = str(primary.get("verdict", "UNKNOWN") or "UNKNOWN")
+    confidence = int(primary.get("confidence", 0) or 0)
+    reasoning = _shorten_naturally(" ".join(str(primary.get("reasoning", "") or "").split()), 320)
+    subject = ", ".join(requested_ips) if requested_ips else "the requested IPs"
+
+    response = f"Reputation analysis for {subject}: {verdict_label} ({confidence}% confidence)."
+    if reasoning:
+        response += f" {reasoning}"
+
+    all_apis = sorted({api for verdict in verdicts for api in verdict.get("_queried_apis", [])})
+    if all_apis:
+        response += f"\n\n_[Threat Intelligence Sources Queried: {', '.join(all_apis)}]_"
+    return response
+
+
+def _format_baseline_response(user_question: str, baseline_result: dict) -> str:
+    findings = baseline_result.get("findings") or {}
+    grounded_assessment = " ".join(str(findings.get("grounded_assessment", "") or "").split())
+    if grounded_assessment and _question_asks_for_baseline(user_question):
+        return grounded_assessment
+
+    answer = " ".join(str(findings.get("answer", "") or "").split())
+    if not answer:
+        return "No grounded baseline analysis was produced."
+
+    log_records = int(findings.get("log_records", 0) or 0)
+    rag_sources = int(findings.get("rag_sources", 0) or 0)
+    evidence = findings.get("evidence") or {}
+    timestamps = evidence.get("timestamps") or []
+    ips = evidence.get("ips") or []
+    ports = evidence.get("ports") or []
+
+    details = []
+    if log_records > 0:
+        details.append(f"Observed records: {log_records}.")
+    elif rag_sources > 0:
+        details.append(f"Baseline documents consulted: {rag_sources}.")
+    if ips:
+        details.append(f"IPs referenced: {', '.join(ips[:10])}.")
+    if ports:
+        details.append(f"Ports referenced: {', '.join(ports[:10])}.")
+    if timestamps:
+        ts_sorted = sorted(str(ts) for ts in timestamps)
+        details.append(f"Earliest: {ts_sorted[0]}. Latest: {ts_sorted[-1]}.")
+
+    suffix = " " + " ".join(details) if details else ""
+    return answer + suffix
 
 
 def _shorten_naturally(text: str, max_len: int = 180) -> str:
@@ -2048,13 +2758,43 @@ def _format_forensic_response(user_question: str, forensic_result: dict, threat_
 def _format_opensearch_response(user_question: str, os_result: dict) -> str:
     """Render opensearch_querier results with evidence detail."""
     results = os_result.get("results") or []
+    summary_results = os_result.get("summary_results") or results
     results_count = os_result.get("results_count", len(results))
+    sampled_results_count = int(os_result.get("sampled_results_count", len(summary_results)) or 0)
+    sample_strategy = os_result.get("sample_strategy") or "page"
+    oldest_sample_count = int(os_result.get("oldest_sample_count", sampled_results_count) or 0)
+    newest_sample_count = int(os_result.get("newest_sample_count", sampled_results_count) or 0)
     countries = os_result.get("countries", [])
     ports = os_result.get("ports", [])
     protocols = os_result.get("protocols", [])
     time_range = os_result.get("time_range_label") or os_result.get("time_range", "")
     search_terms = os_result.get("search_terms", [])
     directional_alternative = os_result.get("directional_alternative") or {}
+    country_buckets = os_result.get("country_buckets") or []
+
+    if os_result.get("aggregation_type") == "country_terms":
+        excluded_countries = os_result.get("excluded_countries") or []
+        if not country_buckets:
+            exclusion_text = f" excluding {', '.join(excluded_countries)}" if excluded_countries else ""
+            return f"No matching country aggregates were found in the {time_range} window{exclusion_text}."
+
+        bucket_summary = ", ".join(
+            f"{bucket.get('country')} ({int(bucket.get('count', 0) or 0)})"
+            for bucket in country_buckets[:10]
+            if bucket.get("country")
+        )
+        exclusion_text = f" excluding {', '.join(excluded_countries)}" if excluded_countries else ""
+        return (
+            f"Observed traffic from {len(country_buckets)} country(s) in the {time_range} window{exclusion_text}: "
+            f"{bucket_summary}."
+        )
+
+    if os_result.get("status") == "no_action":
+        time_range = time_range or "requested time range"
+        return (
+            f"I couldn't produce a grounded OpenSearch query for that request, so I do not have log evidence to answer it for the {time_range} window. "
+            "The previous step only identified schema/field information, not matching traffic records."
+        )
 
     if not results:
         if directional_alternative:
@@ -2102,7 +2842,7 @@ def _format_opensearch_response(user_question: str, os_result: dict) -> str:
         alert_countries: set = set()
         alert_timestamps: list[str] = []
         
-        for row in results:
+        for row in summary_results:
             # Extract alert signatures
             sig = row.get("alert.signature") or row.get("signature") or row.get("alert", {}).get("signature")
             if sig:
@@ -2145,7 +2885,15 @@ def _format_opensearch_response(user_question: str, os_result: dict) -> str:
                     alert_countries.add(str(cn))
         
         # Build alert-focused summary
-        summary = f"Found {results_count} alert record(s) matching {' / '.join(search_terms)} in the {time_range} window."
+        summary = f"Found {results_count} total alert record(s) matching {' / '.join(search_terms)} in the {time_range} window."
+        if sampled_results_count and sampled_results_count < int(results_count or 0):
+            if sample_strategy == "edge_windows":
+                summary += (
+                    f" Details below are sampled from up to {oldest_sample_count} earliest and "
+                    f"{newest_sample_count} latest matching records."
+                )
+            else:
+                summary += f" Details below are sampled from {sampled_results_count} matching records."
         
         detail_parts = []
         if alert_signatures:
@@ -2175,13 +2923,12 @@ def _format_opensearch_response(user_question: str, os_result: dict) -> str:
 
     # ── STANDARD TRAFFIC QUERY FORMATTING ──────────────────────────────────
     # Extract key evidence
-    import re as _re
     ips: set = set()
     source_ips: set = set()
     ts_list: list = []
     countries_seen: set = set()
 
-    for row in results:
+    for row in summary_results:
         # Timestamps
         ts = row.get("@timestamp") or row.get("timestamp")
         if ts:
@@ -2236,12 +2983,20 @@ def _format_opensearch_response(user_question: str, os_result: dict) -> str:
         filter_parts.append(shown_terms)
     filter_desc = ", ".join(filter_parts) or "the query criteria"
 
-    summary = f"Found {results_count} record(s) matching {filter_desc} in the {time_range} window."
+    summary = f"Found {results_count} total record(s) matching {filter_desc} in the {time_range} window."
+    if sampled_results_count and sampled_results_count < int(results_count or 0):
+        if sample_strategy == "edge_windows":
+            summary += (
+                f" Details below are sampled from up to {oldest_sample_count} earliest and "
+                f"{newest_sample_count} latest matching records."
+            )
+        else:
+            summary += f" Details below are sampled from {sampled_results_count} matching records."
 
     # For port-specific queries, extract discovered port values from results (not just restate filter)
     extracted_ports: set = set()
     if ports:  # Only extract if a port was specifically queried
-        for row in results:
+        for row in summary_results:
             # Try both nested and flat field names
             port_candidates = [
                 row.get("destination.port"),
@@ -2263,7 +3018,15 @@ def _format_opensearch_response(user_question: str, os_result: dict) -> str:
     if countries_seen:
         detail_parts.append(f"Countries seen: {', '.join(sorted(countries_seen))}.")
     if ips:
-        if ports and source_ips:
+        if countries:
+            # Country-filtered query: the foreign IPs are sources (public).
+            # Internal destination IPs (private RFC-1918 space) are not from that country
+            # and would mislead the user if listed alongside Russian/etc. sources.
+            public_ips = {ip for ip in ips if not _is_private_ip(ip)}
+            display_ips = sorted(public_ips)[:10] if public_ips else sorted(source_ips)[:10]
+            if display_ips:
+                detail_parts.append(f"Source IPs: {', '.join(display_ips)}.")
+        elif ports and source_ips:
             detail_parts.append(f"Remote peers: {', '.join(sorted(source_ips)[:10])}.")
         else:
             detail_parts.append(f"Source/destination IPs: {', '.join(sorted(ips)[:10])}.")

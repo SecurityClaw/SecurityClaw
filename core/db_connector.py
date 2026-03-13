@@ -61,6 +61,10 @@ class BaseDBConnector(ABC):
         """Execute a search query and return hits as dicts."""
 
     @abstractmethod
+    def search_with_metadata(self, index: str, query: dict, size: int = 100) -> dict[str, Any]:
+        """Execute a search query and return hits plus metadata such as total hit count."""
+
+    @abstractmethod
     def index_document(self, index: str, doc_id: str, body: dict) -> dict:
         """Index a single document."""
 
@@ -155,6 +159,11 @@ class OpenSearchConnector(BaseDBConnector):
         Raises QueryMalformedException if the query has syntax errors.
         The caller (skill) should catch this and use LLM to repair the query.
         """
+        response = self.search_with_metadata(index, query, size=size)
+        return response.get("results", [])
+
+    def search_with_metadata(self, index: str, query: dict, size: int = 100) -> dict[str, Any]:
+        """Execute a search query and return hits plus total hit count."""
         try:
             resp = self._client.search(index=index, body=query, size=size)
             results = []
@@ -164,7 +173,10 @@ class OpenSearchConnector(BaseDBConnector):
                 if hit_id is not None and "_id" not in src:
                     src["_id"] = hit_id
                 results.append(src)
-            return results
+            total_hits = resp.get("hits", {}).get("total", 0)
+            if isinstance(total_hits, dict):
+                total_hits = total_hits.get("value", 0)
+            return {"results": results, "total": int(total_hits or 0)}
         except Exception as exc:
             error_str = str(exc)
             
@@ -176,7 +188,7 @@ class OpenSearchConnector(BaseDBConnector):
             else:
                 # Other errors - log and return empty
                 logger.error("search(%s) failed: %s", index, exc)
-                return []
+                return {"results": [], "total": 0}
 
     def get_document(self, index: str, doc_id: str) -> Optional[dict]:
         try:

@@ -4,7 +4,7 @@ import json
 from unittest.mock import Mock, patch
 
 from core.query_repair import _is_valid_query_structure
-from skills.chat_router.logic import route_question
+from core.chat_router.logic import route_question
 from skills.forensic_examiner import logic as forensic_logic
 
 

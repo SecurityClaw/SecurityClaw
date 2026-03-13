@@ -4,6 +4,7 @@ core/skill_loader.py — Dynamic skill discovery and registry.
 Each skill lives in skills/<skill_name>/ and contains:
   - logic.py        Python module with a `run(context: dict) -> dict` function
   - instruction.md  LLM system-prompt / guidance for that skill
+  - manifest.yaml   Skill metadata (description, can_answer, run_on_first_startup, etc.)
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ class Skill:
     run: Callable[[dict], dict]
     schedule_interval_seconds: Optional[int] = None
     schedule_cron_expr: Optional[str] = None
+    run_on_first_startup: bool = False
     metadata: dict = field(default_factory=dict)
 
     def __repr__(self) -> str:
@@ -60,6 +62,7 @@ class SkillLoader:
                 continue
             logic_path = skill_dir / "logic.py"
             instruction_path = skill_dir / "instruction.md"
+            manifest_path = skill_dir / "manifest.yaml"
 
             if not logic_path.exists():
                 logger.debug("Skipping %s — no logic.py", skill_dir.name)
@@ -75,17 +78,21 @@ class SkillLoader:
 
             interval = self._extract_interval(instruction)
             cron_expr = self._extract_cron_expr(instruction)
+            run_on_first_startup = self._extract_run_on_first_startup(manifest_path)
+            
             skill = Skill(
                 name=skill_dir.name,
                 instruction=instruction,
                 run=run_fn,
                 schedule_interval_seconds=interval,
                 schedule_cron_expr=cron_expr,
+                run_on_first_startup=run_on_first_startup,
                 metadata={"dir": str(skill_dir)},
             )
             self._registry[skill.name] = skill
             log_schedule = cron_expr if cron_expr else f"{interval}s" if interval else "manual"
-            logger.info("Loaded skill: %s (schedule=%s)", skill.name, log_schedule)
+            startup_marker = " [FIRST_STARTUP]" if run_on_first_startup else ""
+            logger.info("Loaded skill: %s (schedule=%s)%s", skill.name, log_schedule, startup_marker)
 
         return self._registry
 
@@ -154,3 +161,27 @@ class SkillLoader:
             expr = match.group(1).strip()
             return expr if expr else None
         return None
+
+    @staticmethod
+    def _extract_run_on_first_startup(manifest_path: Path) -> bool:
+        """
+        Extract run_on_first_startup flag from manifest.yaml.
+
+        Example:
+            ---
+            name: fields_baseliner
+            run_on_first_startup: true
+            ---
+        """
+        if not manifest_path.exists():
+            return False
+        
+        try:
+            import yaml
+            manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+            if manifest and isinstance(manifest, dict):
+                return manifest.get("run_on_first_startup", False)
+        except Exception as exc:
+            logger.debug("Could not parse manifest %s: %s", manifest_path, exc)
+        
+        return False

@@ -12,6 +12,7 @@
 .env
 config.yaml
 data/agent_memory.json
+data/.startup_complete
 .coverage
 htmlcov/
 

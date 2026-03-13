@@ -5,7 +5,7 @@ import tarfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from skills.chat_router.logic import format_response
+from core.chat_router.logic import format_response
 from skills.geoip_lookup.logic import run
 
 

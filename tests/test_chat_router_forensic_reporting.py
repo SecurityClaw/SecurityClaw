@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from skills.chat_router.logic import execute_skill_workflow, format_response
+from core.memory import StateBackedMemory
+from core.chat_router.logic import execute_skill_workflow, format_response
 
 
 class _RunnerStub:
@@ -106,6 +107,35 @@ def test_execute_skill_workflow_passes_same_step_results_to_later_skills():
     previous_results = runner.contexts["opensearch_querier"].get("previous_results", {})
     assert "fields_querier" in previous_results
     assert previous_results["fields_querier"]["field_mappings"]["country_fields"] == ["geoip.country_name"]
+
+
+def test_execute_skill_workflow_prefers_graph_memory_override(tmp_path):
+    class _MemoryRunner:
+        def __init__(self, file_memory):
+            self.file_memory = file_memory
+
+        def _build_context(self):
+            return {"memory": self.file_memory}
+
+        def dispatch(self, skill_name: str, context: dict):
+            context["memory"].add_decision("graph memory update")
+            return {"status": "ok", "memory_type": type(context["memory"]).__name__}
+
+    file_memory = StateBackedMemory.from_state({})
+    graph_memory = StateBackedMemory.from_state({})
+    runner = _MemoryRunner(file_memory)
+
+    results = execute_skill_workflow(
+        ["baseline_querier"],
+        runner,
+        {},
+        {"parameters": {"question": "follow-up"}},
+        memory=graph_memory,
+    )
+
+    assert results["baseline_querier"]["memory_type"] == "StateBackedMemory"
+    assert "graph memory update" in graph_memory.snapshot()["decisions"]
+    assert "graph memory update" not in file_memory.snapshot()["decisions"]
 
 
 def test_format_response_forensic_is_detailed_and_multi_paragraph():

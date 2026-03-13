@@ -451,7 +451,7 @@ class TestFormatOpenSearchResponse:
     """format_response must render opensearch_querier results — not say 'no traffic'."""
 
     def test_formats_iran_traffic_correctly(self):
-        from skills.chat_router.logic import _format_opensearch_response
+        from core.chat_router.logic import _format_opensearch_response
 
         result = _format_opensearch_response(
             "any traffic from iran in the past 3 months",
@@ -467,7 +467,7 @@ class TestFormatOpenSearchResponse:
         assert "not contain" not in result.lower(), f"Must not deny traffic: {result}"
 
     def test_formats_correct_timestamps(self):
-        from skills.chat_router.logic import _format_opensearch_response
+        from core.chat_router.logic import _format_opensearch_response
 
         result = _format_opensearch_response(
             "any traffic from iran",
@@ -477,7 +477,7 @@ class TestFormatOpenSearchResponse:
         assert "2026-02-13" in result, f"Should include timestamp, got: {result}"
 
     def test_formats_correct_ips(self):
-        from skills.chat_router.logic import _format_opensearch_response
+        from core.chat_router.logic import _format_opensearch_response
 
         result = _format_opensearch_response(
             "any traffic from iran",
@@ -487,7 +487,7 @@ class TestFormatOpenSearchResponse:
         assert "62.60.131.168" in result, f"Should include source IP, got: {result}"
 
     def test_formats_flat_geoip_country_fields(self):
-        from skills.chat_router.logic import _format_opensearch_response
+        from core.chat_router.logic import _format_opensearch_response
 
         flat_result = {
             "status": "ok",
@@ -515,8 +515,60 @@ class TestFormatOpenSearchResponse:
         assert "Iran" in result, f"Should include flat geoip country fields, got: {result}"
         assert "62.60.131.168" in result, f"Should include flat source IP, got: {result}"
 
+    def test_formats_total_hits_with_edge_window_sampling_note(self):
+        from core.chat_router.logic import _format_opensearch_response
+
+        sampled_result = {
+            "status": "ok",
+            "results_count": 842,
+            "sampled_results_count": 400,
+            "sample_strategy": "edge_windows",
+            "oldest_sample_count": 200,
+            "newest_sample_count": 200,
+            "results": [
+                {
+                    "@timestamp": "2025-12-30T22:05:25.936Z",
+                    "src_ip": "104.156.155.5",
+                    "dest_ip": "192.168.0.85",
+                    "destination.port": 1194,
+                    "geoip.country_name": "China",
+                }
+            ],
+            "summary_results": [
+                {
+                    "@timestamp": "2025-09-30T00:00:00.000Z",
+                    "src_ip": "18.218.174.114",
+                    "dest_ip": "192.168.0.85",
+                    "destination.port": 1194,
+                    "geoip.country_name": "Singapore",
+                },
+                {
+                    "@timestamp": "2025-12-30T22:05:25.936Z",
+                    "src_ip": "104.156.155.5",
+                    "dest_ip": "192.168.0.85",
+                    "destination.port": 1194,
+                    "geoip.country_name": "China",
+                },
+            ],
+            "countries": [],
+            "ports": [1194],
+            "protocols": [],
+            "time_range_label": "now-90d",
+            "search_terms": [],
+        }
+
+        result = _format_opensearch_response(
+            "What countries aside from the usa have hit the network at 1194 port",
+            sampled_result,
+        )
+
+        assert "Found 842 total record(s) matching port 1194 in the now-90d window." in result
+        assert "sampled from up to 200 earliest and 200 latest matching records" in result
+        assert "Earliest: 2025-09-30T00:00:00.000Z. Latest: 2025-12-30T22:05:25.936Z." in result
+        assert "Countries seen: China, Singapore." in result
+
     def test_empty_results_says_no_records(self):
-        from skills.chat_router.logic import _format_opensearch_response
+        from core.chat_router.logic import _format_opensearch_response
 
         empty_result = {
             "status": "ok",
@@ -531,7 +583,7 @@ class TestFormatOpenSearchResponse:
         assert "no matching" in result.lower() or "0" in result, f"Should say no records: {result}"
 
     def test_empty_results_with_directional_alternative_explains_opposite_hits(self):
-        from skills.chat_router.logic import _format_opensearch_response
+        from core.chat_router.logic import _format_opensearch_response
 
         result = _format_opensearch_response(
             "any traffic from 1.1.1.1 today?",
@@ -563,7 +615,7 @@ class TestFormatResponseDispatching:
     """format_response must route opensearch_querier results through _format_opensearch_response."""
 
     def test_format_response_uses_opensearch_result(self):
-        from skills.chat_router.logic import format_response
+        from core.chat_router.logic import format_response
 
         mock_llm = MagicMock()
         routing = {"skills": ["opensearch_querier"], "parameters": {}}
@@ -582,10 +634,9 @@ class TestFormatResponseDispatching:
         assert "no traffic" not in result.lower(), f"Must not deny traffic: {result}"
 
     def test_format_response_skips_validation_failed_opensearch_result(self):
-        from skills.chat_router.logic import format_response
+        from core.chat_router.logic import format_response
 
         mock_llm = MagicMock()
-        mock_llm.chat.return_value = "Threat verdicts are available for the previously discovered IPs."
 
         result = format_response(
             "Aside from the private IPs, what is the reputation of the others?",
@@ -605,8 +656,9 @@ class TestFormatResponseDispatching:
             mock_llm,
         )
 
-        mock_llm.chat.assert_called()
+        mock_llm.chat.assert_not_called()
         assert "75.75.75.75" not in result
+        assert "FALSE_POSITIVE" in result
 
 
 # ── Test 4: supervisor evaluation satisfies immediately when records found ─────
@@ -614,7 +666,7 @@ class TestSupervisorEvaluationFastPath:
     """Supervisor must mark satisfied after first skill run when records_count > 0."""
 
     def test_satisfied_immediately_when_records_found(self):
-        from skills.chat_router.logic import _supervisor_evaluate_satisfaction
+        from core.chat_router.logic import _supervisor_evaluate_satisfaction
 
         mock_llm = MagicMock()
 
@@ -635,15 +687,9 @@ class TestSupervisorEvaluationFastPath:
         assert "2" in eval_result["reasoning"], f"Reasoning should mention record count: {eval_result}"
 
     def test_not_satisfied_when_no_records(self):
-        from skills.chat_router.logic import _supervisor_evaluate_satisfaction
+        from core.chat_router.logic import _supervisor_evaluate_satisfaction
 
         mock_llm = MagicMock()
-        mock_llm.chat.return_value = json.dumps({
-            "satisfied": False,
-            "confidence": 0.1,
-            "reasoning": "No data found",
-            "missing": ["Iran traffic records"],
-        })
 
         eval_result = _supervisor_evaluate_satisfaction(
             user_question="any traffic from iran",
@@ -655,12 +701,12 @@ class TestSupervisorEvaluationFastPath:
             max_steps=4,
         )
 
-        # LLM SHOULD be called (no fast path)
-        mock_llm.chat.assert_called_once()
+        mock_llm.chat.assert_not_called()
         assert eval_result["satisfied"] is False
+        assert "No matching log records" in eval_result["reasoning"]
 
     def test_invalid_nonzero_results_do_not_trigger_fast_path(self):
-        from skills.chat_router.logic import _supervisor_evaluate_satisfaction
+        from core.chat_router.logic import _supervisor_evaluate_satisfaction
 
         mock_llm = MagicMock()
         mock_llm.chat.return_value = json.dumps({
@@ -691,7 +737,7 @@ class TestSupervisorEvaluationFastPath:
         mock_llm.chat.assert_called_once()
 
     def test_directional_alternative_satisfies_supervisor(self):
-        from skills.chat_router.logic import _supervisor_evaluate_satisfaction
+        from core.chat_router.logic import _supervisor_evaluate_satisfaction
 
         mock_llm = MagicMock()
 
@@ -726,7 +772,7 @@ class TestSupervisorLoopTermination:
     """Supervisor must stop looping after the first step when data is already found."""
 
     def test_supervisor_stops_after_first_step_with_data(self):
-        from skills.chat_router.logic import orchestrate_with_supervisor
+        from core.chat_router.logic import orchestrate_with_supervisor
 
         mock_llm = MagicMock()
         mock_runner = MagicMock()
@@ -773,7 +819,7 @@ class TestSupervisorLoopTermination:
 
     def test_supervisor_does_not_repeat_same_skill_when_already_satisfied(self):
         """Anti-repeat: same skill list chosen twice → forces finalization."""
-        from skills.chat_router.logic import orchestrate_with_supervisor
+        from core.chat_router.logic import orchestrate_with_supervisor
 
         mock_llm = MagicMock()
         mock_runner = MagicMock()

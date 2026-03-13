@@ -7,6 +7,8 @@ description: >
   Keeps a maximum of 100 docs (evicts oldest on overflow).
   Field-schema documentation is handled by fields_baseliner.
 
+run_on_first_startup: true
+
 can_answer:
   - "behavioral baseline creation"
   - "normal traffic pattern definition"

@@ -21,12 +21,12 @@ from pydantic import BaseModel
 
 from core.config import Config
 from core.skill_onboarding import discover_skill_requirements, get_missing_skill_variables
-from skills.chat_router.logic import (
+from core.chat_router.logic import (
     add_to_history,
     get_context_summary,
     list_conversations,
     load_conversation_history,
-    orchestrate_with_supervisor,
+    run_graph,
 )
 from web.api.service import SecurityClawService
 
@@ -239,8 +239,26 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
     async def lifespan(app: FastAPI):
         service.start()
         app.state.service = service
+
+        # Persistent SQLite checkpointer shared across all chat requests
+        import sqlite3 as _sqlite3
+        _conversations_db = ROOT / "data" / "conversations.db"
+        _conversations_db.parent.mkdir(parents=True, exist_ok=True)
+        _conn = _sqlite3.connect(str(_conversations_db), check_same_thread=False)
+        try:
+            from langgraph.checkpoint.sqlite import SqliteSaver as _SqliteSaver
+            app.state.checkpointer = _SqliteSaver(_conn)
+        except ImportError:
+            from langgraph.checkpoint.memory import MemorySaver as _MemorySaver
+            app.state.checkpointer = _MemorySaver()
+            _conn.close()
+            _conn = None
+
         yield
+
         service.stop()
+        if _conn is not None:
+            _conn.close()
 
     app = FastAPI(title="SecurityClaw Service", lifespan=lifespan)
     app.add_middleware(
@@ -410,8 +428,8 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
         def worker() -> None:
             try:
                 ctx = app.state.service.context
-                instruction = _read_text(SKILLS_DIR / "chat_router" / "instruction.md")
-                orchestration = orchestrate_with_supervisor(
+                instruction = _read_text(ROOT / "core" / "chat_router" / "instruction.md")
+                orchestration = run_graph(
                     user_question=body.message,
                     available_skills=_build_available_skills(),
                     runner=ctx.runner,
@@ -420,6 +438,8 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
                     cfg=ctx.cfg,
                     conversation_history=_chat_history_for_router(conversation_id),
                     step_callback=callback,
+                    checkpointer=app.state.checkpointer,
+                    thread_id=f"{conversation_id}-{uuid.uuid4().hex[:8]}",
                 )
                 result_box.update(orchestration)
                 add_to_history(

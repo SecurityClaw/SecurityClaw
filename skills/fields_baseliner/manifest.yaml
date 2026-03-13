@@ -4,6 +4,8 @@ description: >
   data/fields_rag.json. Runs automatically every 10,000 new records; can also
   be triggered explicitly with force_refresh=true.
 
+run_on_first_startup: true
+
 can_answer:
   - "field schema discovery"
   - "building field catalog"

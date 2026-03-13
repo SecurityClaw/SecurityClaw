@@ -19,9 +19,13 @@ Respond in STRICT JSON:
   "detected_time_range": "Time period description (or 'none')",
   "time_range": "Elasticsearch range code (now-3M, now-1w, now-7d, now-1d, now-90d, etc.)",
   "countries": ["CountryName1", "CountryName2"],
+  "exclude_countries": ["CountryName3"],
   "ports": [1194, 443],
   "protocols": ["TCP", "UDP"],
   "search_terms": ["keyword1", "keyword2"],
+  "aggregation_type": "none|country_terms",
+  "aggregation_field": "country|none",
+  "result_limit": 10,
   "matching_strategy": "phrase|token|term|match",
   "field_analysis": "Which field categories are most relevant and why",
   "skip_search": false
@@ -35,6 +39,7 @@ Extract country NAMES (not codes). Examples: "Iran", "Russia", "China"
 - Look for explicit country mentions: "from Iran", "in Russia", "China traffic"
 - Look in conversation context for previously mentioned countries
 - **Do NOT assume** — only extract if clearly stated
+- If the question excludes a country ("other than the USA", "excluding Russia"), place that country in `exclude_countries` instead of `countries`
 
 ### Ports
 Extract as integers. Examples: 443, 1194, 22, 53
@@ -77,6 +82,12 @@ Pick the dominant category of the user's intent:
 - `domain`: domain/DNS/FQDN-focused searches
 - `general`: fallback when none of the above cleanly fit
 
+### Aggregation
+- Use `aggregation_type="country_terms"` and `aggregation_field="country"` when the user wants a distinct/top list of countries rather than raw matching documents
+- Examples: "What countries do we get traffic from?", "What countries other than the USA do we get traffic from in the past month?", "Top 10 source countries this week"
+- When using country aggregation, `countries` may be empty and `exclude_countries` should hold exclusions like USA
+- Set `result_limit` from phrases like "top 5"; otherwise default to 10
+
 ### Matching Strategy
 - `term`: exact values like IPs, ports, keyword fields, protocol literals
 - `phrase`: exact signature or rule names where tokenization would broaden matches too much
@@ -104,9 +115,13 @@ Example 1: "Show me traffic from Iran in the past 3 months"
   "detected_time_range": "past 3 months",
   "time_range": "now-3M",
   "countries": ["Iran"],
+  "exclude_countries": [],
   "ports": [],
   "protocols": [],
   "search_terms": [],
+  "aggregation_type": "none",
+  "aggregation_field": "none",
+  "result_limit": 10,
   "matching_strategy": "token",
   "field_analysis": "Use country/geo fields plus timestamp fields for a traffic search.",
   "skip_search": false
@@ -121,9 +136,13 @@ Example 2: "Port 1194 activity in Russia last week"
   "detected_time_range": "last week",
   "time_range": "now-7d",
   "countries": ["Russia"],
+  "exclude_countries": [],
   "ports": [1194],
   "protocols": [],
   "search_terms": [],
+  "aggregation_type": "none",
+  "aggregation_field": "none",
+  "result_limit": 10,
   "matching_strategy": "term",
   "field_analysis": "Use port fields, country fields, and timestamp fields.",
   "skip_search": false
@@ -138,9 +157,13 @@ Example 3: "Find TCP connections to example.com"
   "detected_time_range": "not specified",
   "time_range": "now-90d",
   "countries": [],
+  "exclude_countries": [],
   "ports": [],
   "protocols": ["TCP"],
   "search_terms": ["example.com"],
+  "aggregation_type": "none",
+  "aggregation_field": "none",
+  "result_limit": 10,
   "matching_strategy": "term",
   "field_analysis": "Use domain fields plus protocol and timestamp fields.",
   "skip_search": false
@@ -155,9 +178,13 @@ Example 4: "What fields are available for byte transfers?"
   "detected_time_range": "N/A",
   "time_range": "now-90d",
   "countries": [],
+  "exclude_countries": [],
   "ports": [],
   "protocols": [],
   "search_terms": [],
+  "aggregation_type": "none",
+  "aggregation_field": "none",
+  "result_limit": 10,
   "matching_strategy": "token",
   "field_analysis": "Schema question only; no OpenSearch execution needed.",
   "skip_search": true
@@ -172,9 +199,13 @@ Example 5: "China TCP connections on port 443 or 22 past 90 days"
   "detected_time_range": "past 90 days",
   "time_range": "now-90d",
   "countries": ["China"],
+  "exclude_countries": [],
   "ports": [443, 22],
   "protocols": ["TCP"],
   "search_terms": [],
+  "aggregation_type": "none",
+  "aggregation_field": "none",
+  "result_limit": 10,
   "matching_strategy": "term",
   "field_analysis": "Use country, port, protocol, and timestamp fields.",
   "skip_search": false
@@ -189,11 +220,36 @@ Example 6: "Traffic from Iran in the past 3 years"
   "detected_time_range": "past 3 years",
   "time_range": "now-3y",
   "countries": ["Iran"],
+  "exclude_countries": [],
   "ports": [],
   "protocols": [],
   "search_terms": [],
+  "aggregation_type": "none",
+  "aggregation_field": "none",
+  "result_limit": 10,
   "matching_strategy": "token",
   "field_analysis": "Use country/geo fields and timestamp fields for a long-range traffic search.",
+  "skip_search": false
+}
+```
+
+Example 7: "What countries other than the USA do we get traffic from in the past month"
+```json
+{
+  "reasoning": "User wants a distinct list of non-US source countries seen in traffic over the past month.",
+  "search_type": "traffic",
+  "detected_time_range": "past month",
+  "time_range": "now-30d",
+  "countries": [],
+  "exclude_countries": ["United States"],
+  "ports": [],
+  "protocols": [],
+  "search_terms": [],
+  "aggregation_type": "country_terms",
+  "aggregation_field": "country",
+  "result_limit": 10,
+  "matching_strategy": "term",
+  "field_analysis": "Use country/geo fields with a terms aggregation plus timestamp filtering.",
   "skip_search": false
 }
 ```

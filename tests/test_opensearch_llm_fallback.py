@@ -14,6 +14,7 @@ from skills.opensearch_querier.logic import (
     _fallback_plan_from_question,
     _extract_ports_from_text,
     _extract_countries_from_text,
+    _question_asks_for_country_aggregation,
     _question_asks_for_followup_details,
     _recover_followup_plan_from_context,
     _plan_opensearch_query_with_llm_simplified,
@@ -74,6 +75,11 @@ class TestFallbackExtraction:
 
 class TestQuestionClassification:
     """Test classification of follow-up questions."""
+
+    def test_identifies_country_aggregation_question(self):
+        assert _question_asks_for_country_aggregation(
+            "What countries other than the USA do we get traffic from in the past month"
+        )
     
     def test_identifies_port_followup(self):
         """Recognize questions asking about port details."""
@@ -215,3 +221,136 @@ Here's the plan:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_run_uses_country_aggregation_for_non_us_country_summary():
+    from skills.opensearch_querier import logic
+    from tests.mock_opensearch import MockDBConnector
+
+    class _Cfg:
+        def get(self, section: str, key: str, default=None):
+            if (section, key) == ("db", "logs_index"):
+                return "logstash*"
+            return default
+
+    db = MockDBConnector()
+    db._client = MagicMock()
+    db._client.search.return_value = {
+        "aggregations": {
+            "country_counts": {
+                "buckets": [
+                    {"key": "United States", "doc_count": 15},
+                    {"key": "Iran", "doc_count": 2},
+                    {"key": "Russia", "doc_count": 1},
+                ]
+            }
+        }
+    }
+
+    llm = MagicMock()
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            "core.query_builder.discover_field_mappings",
+            lambda db, llm: {
+                "country_fields": ["geoip.country_name"],
+                "all_fields": ["geoip.country_name", "@timestamp"],
+                "timestamp_fields": ["@timestamp"],
+                "ip_fields": [],
+                "source_ip_fields": [],
+                "destination_ip_fields": [],
+                "port_fields": [],
+                "text_fields": [],
+            },
+        )
+        mp.setattr(
+            logic,
+            "_plan_opensearch_query_with_llm",
+            lambda question, conversation_history, field_mappings, llm: {
+                "reasoning": "User wants distinct non-US countries.",
+                "search_type": "traffic",
+                "search_terms": [],
+                "countries": [],
+                "ports": [],
+                "protocols": [],
+                "time_range": "custom",
+                "matching_strategy": "token",
+            },
+        )
+
+        result = logic.run(
+            {
+                "db": db,
+                "llm": llm,
+                "config": _Cfg(),
+                "parameters": {"question": "What countries other than the USA do we get traffic from in the past month"},
+                "previous_results": {},
+            }
+        )
+
+    assert result["status"] == "ok"
+    assert result["aggregation_type"] == "country_terms"
+    assert result["time_range_label"] == "past month"
+    assert result["excluded_countries"] == ["United States"]
+    assert result["country_buckets"] == [
+        {"country": "Iran", "count": 2},
+        {"country": "Russia", "count": 1},
+    ]
+
+
+def test_country_aggregation_tries_keyword_variant_before_hit_fallback():
+    from skills.opensearch_querier import logic
+
+    class _Client:
+        def __init__(self):
+            self.fields = []
+
+        def search(self, index=None, body=None, size=0):
+            field_name = body["aggs"]["country_counts"]["terms"]["field"]
+            self.fields.append(field_name)
+            if field_name == "geoip.country_name.keyword":
+                return {
+                    "aggregations": {
+                        "country_counts": {
+                            "buckets": [
+                                {"key": "Iran", "doc_count": 2},
+                                {"key": "United Kingdom", "doc_count": 1},
+                            ]
+                        }
+                    }
+                }
+            if field_name == "geoip.country_name":
+                raise RuntimeError("fielddata disabled")
+            return {"aggregations": {"country_counts": {"buckets": []}}}
+
+    class _DB:
+        def __init__(self):
+            self._client = _Client()
+            self.search_called = False
+
+        def search(self, index, query, size=10):
+            self.search_called = True
+            raise AssertionError("hit fallback should not run when a direct aggregation succeeds")
+
+    db = _DB()
+    result = logic._execute_country_aggregation_query(
+        db=db,
+        index="logstash*",
+        field_mappings={
+            "country_fields": ["geoip.country_name", "geoip.country_code2"],
+            "all_fields": ["geoip.country_name", "geoip.country_code2", "@timestamp"],
+        },
+        time_range="now-30d",
+        exclude_countries=["United States"],
+        result_limit=5,
+    )
+
+    assert result["status"] == "ok"
+    assert result["aggregation_type"] == "country_terms"
+    assert result["aggregation_field"] == "geoip.country_name.keyword"
+    assert result["country_buckets"] == [
+        {"country": "Iran", "count": 2},
+        {"country": "United Kingdom", "count": 1},
+    ]
+    assert db.search_called is False
+    assert db._client.fields[0] == "geoip.country_name.keyword"

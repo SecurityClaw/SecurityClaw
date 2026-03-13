@@ -6,16 +6,18 @@ and the main event loop.
 """
 from __future__ import annotations
 
+import json
 import logging
 import signal
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from rich.console import Console
 from rich.table import Table
 
 from core.config import Config
-from core.memory import AgentMemory
+from core.memory import CheckpointBackedMemory
 from core.scheduler import AgentScheduler
 from core.skill_loader import Skill, SkillLoader
 
@@ -48,13 +50,49 @@ class Runner:
         memory_path=None,
     ) -> None:
         self.cfg = Config()
-        self.memory = AgentMemory(path=memory_path)
+        self.memory = CheckpointBackedMemory(path=memory_path)
         self.scheduler = AgentScheduler()
         self.loader = SkillLoader(skills_dir=skills_dir)
         self.db = db_connector
         self.llm = llm_provider
         self._running = False
         self._skills: dict[str, Skill] = {}
+        # Path to per-skill startup completion tracking
+        self._startup_marker_path = Path("data") / ".startup_complete"
+
+    def _is_first_startup_for_skill(self, skill_name: str) -> bool:
+        """Check if a specific skill's first startup has completed."""
+        if not self._startup_marker_path.exists():
+            return True
+        
+        try:
+            data = json.loads(self._startup_marker_path.read_text(encoding="utf-8"))
+            return skill_name not in data
+        except Exception:
+            # If marker file is corrupted, treat as first startup
+            return True
+
+    def _mark_skill_startup_complete(self, skill_name: str) -> None:
+        """Mark that a specific skill's first startup has completed successfully."""
+        self._startup_marker_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Load existing data or start fresh
+        existing_data = {}
+        if self._startup_marker_path.exists():
+            try:
+                existing_data = json.loads(
+                    self._startup_marker_path.read_text(encoding="utf-8")
+                )
+            except Exception:
+                existing_data = {}
+        
+        # Add this skill's completion timestamp
+        existing_data[skill_name] = time.time()
+        
+        # Write back the updated data
+        self._startup_marker_path.write_text(
+            json.dumps(existing_data, indent=2)
+        )
 
     # ------------------------------------------------------------------
     # Public
@@ -65,6 +103,57 @@ class Runner:
         self._skills = self.loader.discover()
         if not self._skills:
             logger.warning("No skills found — check your skills/ directory.")
+
+        # Run first-startup skills only on their first startup
+        # They will be scheduled via cron/intervals after that
+        startup_errors = []
+        skills_run_on_startup = []
+        
+        for name, skill in self._skills.items():
+            if skill.run_on_first_startup:
+                # Check if this specific skill has already completed first startup
+                if not self._is_first_startup_for_skill(name):
+                    # Already completed first startup for this skill in a prior session
+                    logger.debug(
+                        "[%s] Skipping first-startup run (already completed in prior session)",
+                        name,
+                    )
+                    continue
+                
+                logger.info("[%s] Running on startup…", name)
+                skills_run_on_startup.append(name)
+                try:
+                    context = self._build_context()
+                    # Pass force_refresh=true for startup runs to ensure initialization
+                    context.setdefault("parameters", {})["force_refresh"] = True
+                    result = skill.run(context)
+                    
+                    # Check if result indicates success
+                    status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
+                    if status in ("ok", "initialized"):
+                        logger.info("[%s] Startup run completed successfully (status=%s).", name, status)
+                        # Mark this specific skill as startup-complete
+                        self._mark_skill_startup_complete(name)
+                    else:
+                        error_msg = f"[{name}] Startup run returned status='{status}' (result: {result})"
+                        logger.error(error_msg)
+                        startup_errors.append(error_msg)
+                except Exception as exc:
+                    error_msg = f"[{name}] Startup run failed: {exc}"
+                    logger.error(error_msg)
+                    startup_errors.append(error_msg)
+        
+        # Log summary of startup runs
+        if skills_run_on_startup:
+            logger.info(
+                "First-startup skills completed: %s. Future runs will use scheduler only.",
+                ", ".join(skills_run_on_startup),
+            )
+        
+        # If any startup skills failed, raise an error to prevent normal operation
+        if startup_errors:
+            error_summary = "\n".join(startup_errors)
+            raise RuntimeError(f"Startup initialization failed:\n{error_summary}")
 
         self.scheduler.set_context_factory(self._build_context)
 
@@ -164,6 +253,8 @@ class Runner:
     def stop(self) -> None:
         """Stop the scheduler and update agent memory."""
         if not self._running:
+            if hasattr(self.memory, "close"):
+                self.memory.close()
             return
 
         self._running = False
@@ -171,6 +262,8 @@ class Runner:
         self.scheduler.stop()
         self.memory.set_status("IDLE")
         self.memory.add_decision("Agent shut down cleanly.")
+        if hasattr(self.memory, "close"):
+            self.memory.close()
         console.print("[green]Done.[/]")
 
     @property

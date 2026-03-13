@@ -49,9 +49,16 @@ class MockDBConnector(BaseDBConnector):
         Simplified search: supports range filters on @timestamp and
         full-scan for everything else.
         """
+        response = self.search_with_metadata(index, query, size=size)
+        return response["results"]
+
+    def search_with_metadata(self, index: str, query: dict, size: int = 100) -> dict[str, Any]:
+        """Simplified search with hit-count metadata and basic sort support."""
         docs = list(self._store.get(index, {}).values())
         docs = _apply_query_filter(docs, query)
-        return docs[:size]
+        total = len(docs)
+        docs = _apply_sort(docs, query.get("sort"))
+        return {"results": docs[:size], "total": total}
 
     def index_document(self, index: str, doc_id: str, body: dict) -> dict:
         if doc_id is None:
@@ -203,6 +210,35 @@ def _apply_range(docs: list[dict], range_clause: dict) -> list[dict]:
             filtered.append(doc)
         result = filtered
     return result
+
+
+def _apply_sort(docs: list[dict], sort_clause: Any) -> list[dict]:
+    if not sort_clause:
+        return docs
+
+    sorted_docs = list(docs)
+    clauses = sort_clause if isinstance(sort_clause, list) else [sort_clause]
+    for clause in reversed(clauses):
+        if not isinstance(clause, dict) or not clause:
+            continue
+        field, options = next(iter(clause.items()))
+        order = "asc"
+        if isinstance(options, dict):
+            order = str(options.get("order", "asc")).lower()
+        reverse = order == "desc"
+        sorted_docs.sort(key=lambda doc: _sort_value(_get_nested(doc, field)), reverse=reverse)
+    return sorted_docs
+
+
+def _sort_value(value: Any) -> tuple[int, Any]:
+    if value is None:
+        return (1, "")
+    if isinstance(value, str):
+        try:
+            return (0, _iso_to_epoch_ms(value))
+        except ValueError:
+            return (0, value)
+    return (0, value)
 
 
 def _get_nested(doc: dict, field: str) -> Any:

@@ -1,14 +1,10 @@
-"""tests/test_memory.py — Unit tests for the structured agent memory store."""
+"""tests/test_memory.py - Unit tests for the structured agent memory store."""
 from __future__ import annotations
 
-from core.memory import AgentMemory
+from core.memory import CheckpointBackedMemory, StateBackedMemory
 
 
 class TestMemoryInitialization:
-    def test_file_created_on_init(self, tmp_path):
-        mem = AgentMemory(path=tmp_path / "agent_memory.json")
-        assert (tmp_path / "agent_memory.json").exists()
-
     def test_initial_status_idle(self, tmp_memory):
         snap = tmp_memory.snapshot()
         assert snap["status"] == "IDLE"
@@ -152,3 +148,51 @@ class TestMemoryBounds:
 
         context = tmp_memory.compact_context(max_chars=1500)
         assert len(context) <= 1500
+
+
+class TestStateBackedMemory:
+    def test_from_state_keeps_memory_in_process(self):
+        mem = StateBackedMemory.from_state(
+            {
+                "mem_status": "INVESTIGATING",
+                "mem_focus": "Track Iran traffic",
+                "mem_findings": [{"timestamp": "2026-01-01T00:00:00+00:00", "text": "finding"}],
+                "mem_decisions": [],
+                "mem_escalations": [],
+            }
+        )
+
+        snapshot = mem.snapshot()
+
+        assert snapshot["status"] == "INVESTIGATING"
+        assert "Track Iran traffic" in snapshot["focus"]
+        assert "finding" in snapshot["findings"]
+
+    def test_to_dict_reflects_in_memory_mutations(self):
+        mem = StateBackedMemory()
+        mem.set_focus("Investigate port 443")
+        mem.add_decision("Used graph state memory")
+
+        state = mem.to_dict()
+
+        assert state["mem_status"] == "INVESTIGATING"
+        assert state["mem_focus"] == "Investigate port 443"
+        assert state["mem_decisions"][-1]["text"] == "Used graph state memory"
+
+
+class TestCheckpointBackedMemory:
+    def test_checkpoint_memory_persists_across_instances(self, tmp_path):
+        db_path = tmp_path / "runtime_memory.db"
+
+        first = CheckpointBackedMemory(path=db_path)
+        first.set_focus("Investigate outbound DNS")
+        first.add_decision("Started runtime checkpoint memory")
+        first.close()
+
+        second = CheckpointBackedMemory(path=db_path)
+        snapshot = second.snapshot()
+        second.close()
+
+        assert snapshot["status"] == "INVESTIGATING"
+        assert "Investigate outbound DNS" in snapshot["focus"]
+        assert "Started runtime checkpoint memory" in snapshot["decisions"]

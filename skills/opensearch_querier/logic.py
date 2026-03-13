@@ -11,6 +11,7 @@ All query logic is in core.query_builder (DRY principle).
 """
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -36,6 +37,20 @@ _NON_IP_FIELD_TERMS = {
     "continent",
     "location",
     "asn",
+}
+_COUNTRY_CODE_REVERSE_MAP = {
+    "IR": "Iran",
+    "IQ": "Iraq",
+    "SY": "Syria",
+    "KP": "North Korea",
+    "CN": "China",
+    "RU": "Russia",
+    "US": "United States",
+    "GB": "United Kingdom",
+    "FR": "France",
+    "DE": "Germany",
+    "IN": "India",
+    "PK": "Pakistan",
 }
 
 
@@ -102,6 +117,10 @@ def _resolve_time_range_for_question(question: str, raw_time_range: Any) -> tupl
         return "now/w", "this week"
     if re.search(r"\b(this\s+month)\b", q_lower):
         return "now/M", "this month"
+    if re.search(r"\b(?:past|last)\s+month\b", q_lower):
+        return "now-30d", "past month"
+    if re.search(r"\b(?:past|last)\s+year\b", q_lower):
+        return "now-1y", "past year"
 
     relative_match = re.search(r"\b(?:past|last)\s+(\d+)\s+(hour|hours|day|days|week|weeks|month|months)\b", q_lower)
     if relative_match:
@@ -325,6 +344,266 @@ def _extract_countries_from_text(text: str) -> list[str]:
             countries.add(country_name)
     
     return sorted(list(countries))
+
+
+def _question_asks_for_country_aggregation(question: str) -> bool:
+    q = str(question or "").lower()
+    asks_for_country_list = any(
+        phrase in q
+        for phrase in (
+            "what countries",
+            "which countries",
+            "countries other than",
+            "countries besides",
+            "countries except",
+            "countries excluding",
+            "non-us countries",
+            "countries outside",
+        )
+    )
+    asks_about_traffic = any(
+        token in q
+        for token in ("traffic", "connection", "connections", "flow", "flows", "activity", "activities", "do we get")
+    )
+    return asks_for_country_list and asks_about_traffic
+
+
+def _extract_excluded_countries_from_text(text: str) -> list[str]:
+    if not re.search(r"\b(other than|except|excluding|exclude|besides|outside)\b", str(text or "").lower()):
+        return []
+    return _extract_countries_from_text(text)
+
+
+def _extract_result_limit(question: str, default: int = 10) -> int:
+    match = re.search(r"\btop\s+(\d+)\b", str(question or "").lower())
+    if not match:
+        return default
+    try:
+        return max(1, min(50, int(match.group(1))))
+    except Exception:
+        return default
+
+
+def _maybe_attach_country_aggregation_plan(question: str, plan: dict | None) -> dict:
+    normalized = dict(plan or {})
+    if not _question_asks_for_country_aggregation(question):
+        return normalized
+
+    excluded_countries = normalized.get("exclude_countries")
+    if not isinstance(excluded_countries, list):
+        excluded_countries = []
+
+    question_exclusions = _extract_excluded_countries_from_text(question)
+    if question_exclusions:
+        excluded_countries = question_exclusions
+
+    countries = normalized.get("countries")
+    if not isinstance(countries, list):
+        countries = []
+    if not excluded_countries and countries and re.search(r"\b(other than|except|excluding|exclude|besides|outside)\b", str(question or "").lower()):
+        excluded_countries = countries
+        countries = []
+
+    normalized["countries"] = countries
+    normalized["exclude_countries"] = excluded_countries
+    normalized["aggregation_type"] = "country_terms"
+    normalized["aggregation_field"] = "country"
+    normalized["result_limit"] = _extract_result_limit(question)
+    normalized["search_type"] = normalized.get("search_type") or "traffic"
+    normalized["matching_strategy"] = normalized.get("matching_strategy") or "term"
+    normalized["skip_search"] = False
+    normalized["reasoning"] = (
+        (str(normalized.get("reasoning", "")).strip() + " ") if normalized.get("reasoning") else ""
+    ) + "Use a country aggregation over traffic logs instead of a document hit query."
+    return normalized
+
+
+def _rank_country_aggregation_fields(field_mappings: dict) -> list[str]:
+    candidates = [str(field) for field in _candidate_country_fields(field_mappings)]
+    if not candidates:
+        return []
+
+    def _score(field_name: str) -> tuple[int, int, str]:
+        lower_name = field_name.lower()
+        rank = 0
+        if "country_name" in lower_name:
+            rank += 30
+        elif "country" in lower_name and "code" not in lower_name:
+            rank += 20
+        elif "country_code" in lower_name:
+            rank += 10
+        if ".keyword" in lower_name or lower_name.endswith("keyword"):
+            rank += 5
+        return (-rank, len(field_name), field_name)
+
+    ranked = sorted(dict.fromkeys(candidates), key=_score)
+    expanded: list[str] = []
+    for field_name in ranked:
+        lower_name = field_name.lower()
+        if ".keyword" not in lower_name and not lower_name.endswith("keyword"):
+            expanded.append(f"{field_name}.keyword")
+        expanded.append(field_name)
+    return list(dict.fromkeys(expanded))
+
+
+def _country_terms_for_field(country_name: str, field_name: str) -> list[str]:
+    lower_country = str(country_name or "").lower()
+    lower_field = str(field_name or "").lower()
+
+    if "country_code" in lower_field:
+        code = _COUNTRY_CODE_MAP.get(lower_country)
+        return [code] if code else []
+
+    if lower_country == "united states":
+        return ["United States", "USA", "US"]
+    if lower_country == "united kingdom":
+        return ["United Kingdom", "UK", "GB"]
+    return [str(country_name)]
+
+
+def _normalize_country_bucket_label(field_name: str, raw_value: Any) -> str:
+    value = str(raw_value or "").strip()
+    if not value:
+        return value
+    if "country_code" in str(field_name or "").lower():
+        return _COUNTRY_CODE_REVERSE_MAP.get(value.upper(), value.upper())
+    return value
+
+
+def _build_country_aggregation_query(
+    field_name: str,
+    time_range: str | dict[str, str],
+    exclude_countries: list[str],
+    result_limit: int,
+) -> dict:
+    bool_query: dict[str, Any] = {"filter": [_build_time_filter(time_range)]}
+    exclusion_values = []
+    for country in exclude_countries:
+        exclusion_values.extend(_country_terms_for_field(country, field_name))
+    if exclusion_values:
+        bool_query["must_not"] = [{"terms": {field_name: list(dict.fromkeys(exclusion_values))}}]
+
+    return {
+        "size": 0,
+        "query": {"bool": bool_query},
+        "aggs": {
+            "country_counts": {
+                "terms": {
+                    "field": field_name,
+                    "size": int(result_limit or 10),
+                    "order": {"_count": "desc"},
+                }
+            }
+        },
+    }
+
+
+def _aggregate_country_buckets_from_hits(
+    hits: list[dict],
+    field_name: str,
+    exclude_countries: list[str],
+    result_limit: int,
+) -> list[dict]:
+    excluded_labels = {
+        label.lower()
+        for country in exclude_countries
+        for label in _country_terms_for_field(country, field_name)
+    }
+    counts: dict[str, int] = {}
+    for row in hits:
+        raw_value = _get_nested_value(row, field_name)
+        if raw_value in (None, "", [], {}):
+            continue
+        normalized_raw = str(raw_value).strip()
+        if normalized_raw.lower() in excluded_labels:
+            continue
+        label = _normalize_country_bucket_label(field_name, normalized_raw)
+        if not label:
+            continue
+        counts[label] = counts.get(label, 0) + 1
+
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[: int(result_limit or 10)]
+    return [{"country": country, "count": count} for country, count in ordered]
+
+
+def _execute_country_aggregation_query(
+    db: Any,
+    index: str,
+    field_mappings: dict,
+    time_range: str | dict[str, str],
+    exclude_countries: list[str],
+    result_limit: int,
+) -> dict:
+    country_fields = _rank_country_aggregation_fields(field_mappings)
+    fallback_candidates: list[str] = []
+    for field_name in country_fields:
+        query = _build_country_aggregation_query(field_name, time_range, exclude_countries, result_limit)
+        buckets: list[dict] = []
+        excluded_labels = {
+            label.lower()
+            for country in exclude_countries
+            for label in _country_terms_for_field(country, field_name)
+        }
+
+        if hasattr(db, "_client"):
+            try:
+                raw_response = db._client.search(index=index, body=query, size=0)
+                raw_buckets = (((raw_response or {}).get("aggregations") or {}).get("country_counts") or {}).get("buckets") or []
+                buckets = [
+                    {"country": _normalize_country_bucket_label(field_name, bucket.get("key")), "count": int(bucket.get("doc_count", 0) or 0)}
+                    for bucket in raw_buckets
+                    if bucket.get("key") not in (None, "")
+                ]
+                buckets = [
+                    bucket for bucket in buckets
+                    if bucket["country"] and str(bucket["country"]).lower() not in excluded_labels
+                ]
+            except Exception as exc:
+                logger.warning("[%s] Country aggregation failed on field %s: %s", SKILL_NAME, field_name, exc)
+
+        if buckets:
+            total_count = sum(bucket["count"] for bucket in buckets)
+            return {
+                "status": "ok",
+                "results_count": total_count,
+                "results": [],
+                "country_buckets": buckets,
+                "aggregation_type": "country_terms",
+                "aggregation_field": field_name,
+                "excluded_countries": exclude_countries,
+            }
+
+        fallback_candidates.append(field_name)
+
+    for field_name in fallback_candidates:
+        query = _build_country_aggregation_query(field_name, time_range, exclude_countries, result_limit)
+        if not buckets:
+            try:
+                fallback_hits = db.search(index, {"query": query["query"]}, size=max(int(result_limit or 10) * 100, 500))
+                buckets = _aggregate_country_buckets_from_hits(fallback_hits, field_name, exclude_countries, result_limit)
+            except Exception as exc:
+                logger.warning("[%s] Country aggregation fallback failed on field %s: %s", SKILL_NAME, field_name, exc)
+
+        if buckets:
+            total_count = sum(bucket["count"] for bucket in buckets)
+            return {
+                "status": "ok",
+                "results_count": total_count,
+                "results": [],
+                "country_buckets": buckets,
+                "aggregation_type": "country_terms",
+                "aggregation_field": field_name,
+                "excluded_countries": exclude_countries,
+            }
+
+    return {
+        "status": "ok",
+        "results_count": 0,
+        "results": [],
+        "country_buckets": [],
+        "aggregation_type": "country_terms",
+        "excluded_countries": exclude_countries,
+    }
 
 
 def _score_ip_query_field(field_name: str) -> int:
@@ -668,6 +947,7 @@ def _build_directional_alternative_hint(
     results: list[dict],
     alternative_direction: str,
     time_range_label: str,
+    total_results_count: int | None = None,
 ) -> dict | None:
     """Summarize opposite-direction IP hits when the requested direction has no matches."""
     if not results or alternative_direction not in {"source", "destination"}:
@@ -702,13 +982,43 @@ def _build_directional_alternative_hint(
     timestamps = sorted(timestamps)
     return {
         "direction": alternative_direction,
-        "results_count": len(results),
+        "results_count": int(total_results_count or len(results)),
         "time_range_label": time_range_label,
         "sample_peers": sorted(peers)[:10],
         "earliest": timestamps[0] if timestamps else None,
         "latest": timestamps[-1] if timestamps else None,
         "results": results[:10],
     }
+
+
+def _build_sorted_sample_query(query: dict, *, size: int, order: str, track_total_hits: bool) -> dict:
+    sample_query = copy.deepcopy(query)
+    sample_query["size"] = size
+    sample_query["sort"] = [{"@timestamp": {"order": order, "unmapped_type": "date"}}]
+    sample_query["track_total_hits"] = track_total_hits
+    return sample_query
+
+
+def _dedupe_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[Any, ...]] = set()
+    deduped: list[dict[str, Any]] = []
+
+    for row in rows:
+        source = row.get("source") if isinstance(row.get("source"), dict) else {}
+        destination = row.get("destination") if isinstance(row.get("destination"), dict) else {}
+        key = (
+            row.get("_id"),
+            row.get("@timestamp") or row.get("timestamp"),
+            row.get("src_ip") or row.get("source_ip") or source.get("ip"),
+            row.get("dest_ip") or row.get("destination_ip") or destination.get("ip"),
+            row.get("destination.port") or row.get("destination_port") or row.get("dest_port") or row.get("dport"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+
+    return deduped
 
 
 def _question_asks_for_ip_geolocation(question: str) -> bool:
@@ -868,6 +1178,108 @@ def _execute_search_with_llm_repair(db: Any, llm: Any, index: str, query: dict, 
             logger.error("[%s] Unexpected search error (type: %s): %s", SKILL_NAME, type(exc).__name__, exc)
             return []
 
+
+def _execute_search_with_metadata_repair(db: Any, llm: Any, index: str, query: dict, size: int = None) -> dict[str, Any]:
+    """Execute a search and preserve total-hit metadata when supported by the backend."""
+    if size is None:
+        size = query.get("size", 200)
+
+    try:
+        logger.debug("[%s] Executing metadata search query on index: %s", SKILL_NAME, index)
+        if hasattr(db, "search_with_metadata"):
+            response = db.search_with_metadata(index, query, size=size)
+            results = response.get("results", [])
+            return {
+                "results": results,
+                "total": int(response.get("total", len(results)) or 0),
+            }
+
+        results = db.search(index, query, size=size)
+        return {"results": results, "total": len(results)}
+    except Exception as exc:
+        from core.db_connector import QueryMalformedException
+
+        if isinstance(exc, QueryMalformedException):
+            logger.warning("[%s] Query malformed: %s — attempting intelligent repair", SKILL_NAME, exc.error_message)
+
+            from core.query_repair import IntelligentQueryRepair
+            repair = IntelligentQueryRepair(db, llm)
+            success, results, message = repair.repair_and_retry(index, exc.original_query, size=size)
+
+            if success:
+                logger.info("[%s] Repair successful! Got %d results", SKILL_NAME, len(results or []))
+                repaired_results = results or []
+                return {"results": repaired_results, "total": len(repaired_results)}
+
+            logger.error("[%s] Repair failed: %s", SKILL_NAME, message)
+            return {"results": [], "total": 0}
+
+        logger.error("[%s] Unexpected search error (type: %s): %s", SKILL_NAME, type(exc).__name__, exc)
+        return {"results": [], "total": 0}
+
+
+def _sample_results_across_time_range(
+    db: Any,
+    llm: Any,
+    index: str,
+    query: dict,
+    *,
+    sample_size: int,
+    search_terms: list[str],
+    field_mappings: dict[str, Any],
+    ip_direction: str,
+    resolved_time_range: str,
+) -> dict[str, Any]:
+    """Collect bounded samples from the start and end of the requested time range."""
+    newest_query = _build_sorted_sample_query(query, size=sample_size, order="desc", track_total_hits=True)
+    newest_results = _execute_search_with_llm_repair(db, llm, index, newest_query, size=sample_size)
+    newest_results = _filter_results_for_exact_ip_match(newest_results, search_terms, field_mappings, ip_direction)
+    newest_results = _filter_results_for_time_range(newest_results, resolved_time_range)
+    total_hits = len(newest_results)
+
+    total_query = copy.deepcopy(query)
+    total_query["size"] = 0
+    total_query["track_total_hits"] = True
+    total_response = _execute_search_with_metadata_repair(db, llm, index, total_query, size=0)
+    total_hits = max(total_hits, int(total_response.get("total", 0) or 0))
+
+    if total_hits <= sample_size:
+        ordered_results = sorted(
+            newest_results,
+            key=lambda row: str(row.get("@timestamp") or row.get("timestamp") or ""),
+        )
+        return {
+            "display_results": newest_results,
+            "summary_results": ordered_results,
+            "results_count": total_hits,
+            "page_results_count": len(newest_results),
+            "sampled_results_count": len(ordered_results),
+            "sample_strategy": "page",
+            "oldest_sample_count": len(ordered_results),
+            "newest_sample_count": len(ordered_results),
+        }
+
+    oldest_query = _build_sorted_sample_query(query, size=sample_size, order="asc", track_total_hits=False)
+    oldest_results = _execute_search_with_llm_repair(db, llm, index, oldest_query, size=sample_size)
+    oldest_results = _filter_results_for_exact_ip_match(oldest_results, search_terms, field_mappings, ip_direction)
+    oldest_results = _filter_results_for_time_range(oldest_results, resolved_time_range)
+
+    summary_results = _dedupe_results(oldest_results + list(reversed(newest_results)))
+    summary_results = sorted(
+        summary_results,
+        key=lambda row: str(row.get("@timestamp") or row.get("timestamp") or ""),
+    )
+    return {
+        "display_results": newest_results,
+        "summary_results": summary_results,
+        "results_count": total_hits,
+        "page_results_count": len(newest_results),
+        "sampled_results_count": len(summary_results),
+        "sample_strategy": "edge_windows",
+        "oldest_sample_count": len(oldest_results),
+        "newest_sample_count": len(newest_results),
+    }
+
 SKILL_NAME = "opensearch_querier"
 
 
@@ -964,6 +1376,7 @@ def run(context: dict) -> dict:
         previous_results,
         conversation_history,
     )
+    query_plan = _maybe_attach_country_aggregation_plan(question, query_plan)
     
     if not query_plan or query_plan.get("skip_search"):
         logger.info("[%s] LLM determined no search needed.", SKILL_NAME)
@@ -983,6 +1396,9 @@ def run(context: dict) -> dict:
     resolved_time_range, time_range_label = _resolve_time_range_for_question(question, raw_time_range)
     matching_strategy = query_plan.get("matching_strategy", "token")
     ip_direction = _infer_ip_direction(question, query_plan.get("reasoning", ""))
+    aggregation_type = query_plan.get("aggregation_type")
+    exclude_countries = query_plan.get("exclude_countries", []) if isinstance(query_plan.get("exclude_countries"), list) else []
+    result_limit = int(query_plan.get("result_limit", 10) or 10)
     requested_filters = {
         "countries": countries,
         "ports": ports,
@@ -991,10 +1407,59 @@ def run(context: dict) -> dict:
         "time_range_label": time_range_label,
     }
 
-    has_criteria = bool(search_terms or countries or ports or protocols)
+    has_criteria = bool(search_terms or countries or ports or protocols or aggregation_type)
     if not has_criteria:
         logger.info("[%s] LLM planning: no search criteria extracted.", SKILL_NAME)
         return {"status": "no_action"}
+
+    if aggregation_type == "country_terms":
+        logger.info("[%s] REASONING CHAIN - Step 2: Country Aggregation", SKILL_NAME)
+        logger.info(
+            "[%s]   Executing country aggregation | Time(raw=%s,resolved=%s) | Excluding=%s | Limit=%d",
+            SKILL_NAME,
+            raw_time_range,
+            resolved_time_range,
+            exclude_countries,
+            result_limit,
+        )
+        aggregation_result = _execute_country_aggregation_query(
+            db=db,
+            index=index,
+            field_mappings=field_mappings,
+            time_range=resolved_time_range,
+            exclude_countries=exclude_countries,
+            result_limit=result_limit,
+        )
+        aggregation_result.update(
+            {
+                "search_terms": search_terms,
+                "countries": countries,
+                "ports": ports,
+                "protocols": protocols,
+                "time_range": raw_time_range,
+                "time_range_label": time_range_label,
+                "time_range_resolved": resolved_time_range,
+                "reasoning": query_plan.get("reasoning", ""),
+                "ip_direction": ip_direction,
+                "directional_alternative": None,
+                "validation_failed": False,
+                "validation_issue": "",
+                "validation_reflection": "",
+                "reasoning_chain": {
+                    "planning": query_plan.get("reasoning"),
+                    "strategy_used": matching_strategy,
+                    "validation_issue": "",
+                    "validation_reflection": "",
+                    "recovery_performed": False,
+                },
+            }
+        )
+        logger.info(
+            "[%s]   Aggregated countries found: %d",
+            SKILL_NAME,
+            len(aggregation_result.get("country_buckets") or []),
+        )
+        return aggregation_result
 
     # ── BUILD QUERY using LLM-determined strategy ──────────────────────────────
     # Let LLM decide all aspects including field selection and matching strategy
@@ -1019,14 +1484,39 @@ def run(context: dict) -> dict:
 
     try:
         validation: dict[str, Any] = {"is_valid": True, "issue": "", "reflection": ""}
-        results = _execute_search_with_llm_repair(db, llm, index, query)
-        results = _filter_results_for_exact_ip_match(results, search_terms, field_mappings, ip_direction)
-        results = _filter_results_for_time_range(results, resolved_time_range)
-        logger.info("[%s] Raw results from opensearch: %d items", SKILL_NAME, len(results) if results else 0)
+        sampled_search = _sample_results_across_time_range(
+            db,
+            llm,
+            index,
+            query,
+            sample_size=int(parameters.get("size", 200) or 200),
+            search_terms=search_terms,
+            field_mappings=field_mappings,
+            ip_direction=ip_direction,
+            resolved_time_range=resolved_time_range,
+        )
+        results = sampled_search.get("display_results", [])
+        summary_results = sampled_search.get("summary_results", results)
+        total_results_count = int(sampled_search.get("results_count", len(results)) or 0)
+        page_results_count = int(sampled_search.get("page_results_count", len(results)) or 0)
+        sampled_results_count = int(sampled_search.get("sampled_results_count", len(summary_results)) or 0)
+        logger.info(
+            "[%s] Raw results from opensearch: fetched=%d sampled=%d total_hits=%d",
+            SKILL_NAME,
+            page_results_count,
+            sampled_results_count,
+            total_results_count,
+        )
         
         # ── LOG REASONING STEP 2: Query Execution ──────────────────────────
         logger.info("[%s] REASONING CHAIN - Step 2: Query Execution", SKILL_NAME)
-        logger.info("[%s]   Results Found: %d", SKILL_NAME, len(results) if results else 0)
+        logger.info(
+            "[%s]   Results Found: fetched=%d | total_hits=%d | sampled=%d",
+            SKILL_NAME,
+            page_results_count,
+            total_results_count,
+            sampled_results_count,
+        )
         if not results:
             logger.info("[%s]   Status: ZERO RESULTS - will attempt multi-turn diagnosis", SKILL_NAME)
         
@@ -1104,7 +1594,22 @@ def run(context: dict) -> dict:
                     )
                     if recovery_validation.get("is_valid"):
                         logger.info("[%s] Recovery strategy succeeded after reflection", SKILL_NAME)
-                        results = recovery_results
+                        sampled_search = _sample_results_across_time_range(
+                            db,
+                            llm,
+                            index,
+                            recovery_query,
+                            sample_size=int(parameters.get("size", 200) or 200),
+                            search_terms=search_terms,
+                            field_mappings=field_mappings,
+                            ip_direction=ip_direction,
+                            resolved_time_range=resolved_time_range,
+                        )
+                        results = sampled_search.get("display_results", recovery_results)
+                        summary_results = sampled_search.get("summary_results", recovery_results)
+                        total_results_count = int(sampled_search.get("results_count", len(recovery_results)) or 0)
+                        page_results_count = int(sampled_search.get("page_results_count", len(results)) or 0)
+                        sampled_results_count = int(sampled_search.get("sampled_results_count", len(summary_results)) or 0)
                         validation = recovery_validation
                     else:
                         logger.warning("[%s] Recovery failed, keeping original results", SKILL_NAME)
@@ -1130,24 +1635,29 @@ def run(context: dict) -> dict:
                 ip_direction=alternative_direction,
             )
             alternative_query["size"] = parameters.get("size", 200)
-            alternative_results = _execute_search_with_llm_repair(db, llm, index, alternative_query)
-            alternative_results = _filter_results_for_exact_ip_match(
-                alternative_results,
-                search_terms,
-                field_mappings,
-                alternative_direction,
+            alternative_sample = _sample_results_across_time_range(
+                db,
+                llm,
+                index,
+                alternative_query,
+                sample_size=int(parameters.get("size", 200) or 200),
+                search_terms=search_terms,
+                field_mappings=field_mappings,
+                ip_direction=alternative_direction,
+                resolved_time_range=resolved_time_range,
             )
-            alternative_results = _filter_results_for_time_range(alternative_results, resolved_time_range)
+            alternative_results = alternative_sample.get("summary_results", [])
             if alternative_results:
                 directional_alternative = _build_directional_alternative_hint(
                     alternative_results,
                     alternative_direction,
                     time_range_label,
+                    total_results_count=int(alternative_sample.get("results_count", len(alternative_results)) or 0),
                 )
                 logger.info(
                     "[%s] Found %d opposite-direction IP matches (%s) in %s window",
                     SKILL_NAME,
-                    len(alternative_results),
+                    int(alternative_sample.get("results_count", len(alternative_results)) or 0),
                     alternative_direction,
                     time_range_label,
                 )
@@ -1192,6 +1702,22 @@ def run(context: dict) -> dict:
                     results = _execute_search_with_llm_repair(db, llm, index, recovery_query)
                     results = _filter_results_for_exact_ip_match(results, search_terms, field_mappings, ip_direction)
                     if results:
+                        sampled_search = _sample_results_across_time_range(
+                            db,
+                            llm,
+                            index,
+                            recovery_query,
+                            sample_size=int(parameters.get("size", 200) or 200),
+                            search_terms=search_terms,
+                            field_mappings=field_mappings,
+                            ip_direction=ip_direction,
+                            resolved_time_range=resolved_time_range,
+                        )
+                        results = sampled_search.get("display_results", results)
+                        summary_results = sampled_search.get("summary_results", results)
+                        total_results_count = int(sampled_search.get("results_count", len(results)) or 0)
+                        page_results_count = int(sampled_search.get("page_results_count", len(results)) or 0)
+                        sampled_results_count = int(sampled_search.get("sampled_results_count", len(summary_results)) or 0)
                         logger.info("[%s] Recovery successful: got %d results after strategy switch", 
                                    SKILL_NAME, len(results))
             
@@ -1214,12 +1740,34 @@ def run(context: dict) -> dict:
                     results = _filter_results_for_exact_ip_match(results, search_terms, field_mappings, ip_direction)
                     results = _filter_results_for_time_range(results, resolved_time_range)
                     if results:
+                        sampled_search = _sample_results_across_time_range(
+                            db,
+                            llm,
+                            index,
+                            recovery,
+                            sample_size=int(parameters.get("size", 200) or 200),
+                            search_terms=search_terms,
+                            field_mappings=field_mappings,
+                            ip_direction=ip_direction,
+                            resolved_time_range=resolved_time_range,
+                        )
+                        results = sampled_search.get("display_results", results)
+                        summary_results = sampled_search.get("summary_results", results)
+                        total_results_count = int(sampled_search.get("results_count", len(results)) or 0)
+                        page_results_count = int(sampled_search.get("page_results_count", len(results)) or 0)
+                        sampled_results_count = int(sampled_search.get("sampled_results_count", len(summary_results)) or 0)
                         logger.info("[%s] Relaxed recovery succeeded: got %d results", SKILL_NAME, len(results))
 
         return {
             "status": "ok",
-            "results_count": len(results) if results else 0,
+            "results_count": total_results_count,
+            "page_results_count": page_results_count,
+            "sampled_results_count": sampled_results_count,
+            "sample_strategy": sampled_search.get("sample_strategy", "page"),
+            "oldest_sample_count": int(sampled_search.get("oldest_sample_count", sampled_results_count) or 0),
+            "newest_sample_count": int(sampled_search.get("newest_sample_count", sampled_results_count) or 0),
             "results": results[:25],  # Return top 25 for display
+            "summary_results": summary_results,
             "search_terms": search_terms,
             "countries": countries,
             "ports": ports,
@@ -1935,7 +2483,7 @@ Additional runtime requirements:
             plan.get("reasoning", "")[:60]
         )
 
-        return plan
+        return _maybe_attach_country_aggregation_plan(question, plan)
     except Exception as exc:
         logger.warning("[%s] LLM planning failed: %s. Attempting simplified prompt...", SKILL_NAME, exc)
         
@@ -1950,10 +2498,10 @@ Additional runtime requirements:
             simplified_plan.setdefault("protocols", [])
             simplified_plan.setdefault("time_range", "now-90d")
             simplified_plan.setdefault("field_analysis", "Using simplified LLM planning")
-            return simplified_plan
+            return _maybe_attach_country_aggregation_plan(question, simplified_plan)
         
         # If even simplified LLM fails, fall back to heuristic extraction
         logger.warning("[%s] Simplified LLM also failed. Using fallback heuristic extraction.", SKILL_NAME)
         fallback_plan = _fallback_plan_from_question(question, None)
         logger.info("[%s] Fallback plan: %s", SKILL_NAME, fallback_plan.get("reasoning", "")[:100])
-        return fallback_plan
+        return _maybe_attach_country_aggregation_plan(question, fallback_plan)

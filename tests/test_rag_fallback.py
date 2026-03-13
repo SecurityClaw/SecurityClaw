@@ -161,7 +161,8 @@ class TestThreatAnalystHistoryExtraction:
             assert "virustotal" in queried_apis
 
     def test_enrich_prefers_question_over_history(self):
-        """If IP is in question, don't search history."""
+        """If IP is in question, use it — but private IPs are always filtered since
+        they have no external threat reputation regardless of where they appear."""
         from skills.threat_analyst.logic import _enrich_with_reputation
         
         history = [
@@ -170,16 +171,17 @@ class TestThreatAnalystHistoryExtraction:
         
         with patch("skills.threat_analyst.reputation_intel.get_ip_reputation") as mock_intel:
             mock_intel.return_value = {
-                "ip": "192.168.1.1",
+                "ip": "1.2.3.4",
                 "combined_risk": "LOW",
                 "queries": ["abuseipdb"]
             }
             
-            # Question has IP explicitly
+            # Question has a private IP explicitly — should be filtered (no external reputation for RFC-1918)
             result = _enrich_with_reputation("Check 192.168.1.1", history)
             
-            # Should query the IP from the question, not from history
-            mock_intel.assert_called_with("192.168.1.1")
+            # Private IP in question is filtered; history IP 1.2.3.4 is not in the finding text
+            # so mock should not be called at all
+            mock_intel.assert_not_called()
 
     def test_enrich_no_error_when_no_history(self):
         """_enrich_with_reputation should work fine with None history."""

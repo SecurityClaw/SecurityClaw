@@ -19,6 +19,7 @@ import logging
 import os
 import subprocess
 import sys
+from importlib import import_module
 from pathlib import Path
 from typing import Optional
 
@@ -30,10 +31,11 @@ from rich.prompt import Prompt, Confirm
 from core.config import Config
 from core.db_connector import OpenSearchConnector
 from core.llm_provider import build_llm_provider
-from core.memory import AgentMemory
+from core.memory import CheckpointBackedMemory
 from core.runner import Runner
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _setup_logging(level: str) -> None:
@@ -117,6 +119,7 @@ def onboard():
     # Phase 2: LLM Configuration
     # ──────────────────────────────────────────────────────────────────────────
     console.print("[bold green]Step 2: Ollama Configuration[/]\n")
+    llm_provider = "ollama"
     ollama_url = Prompt.ask("Ollama base URL", default="http://localhost:11434")
     ollama_model = Prompt.ask("Ollama chat model name", default="llama3")
     console.print(
@@ -315,7 +318,11 @@ def dispatch(skill_name):
 @cli.command()
 def status():
     """Print the compact structured agent memory snapshot."""
-    console.print(AgentMemory().read())
+    memory = CheckpointBackedMemory()
+    try:
+        console.print(memory.read())
+    finally:
+        memory.close()
 
 
 @cli.command("list-skills")
@@ -343,11 +350,11 @@ def chat():
     """Interactive chat with the SOC agent—ask questions and route to skills."""
     from pathlib import Path
     from datetime import datetime
-    from skills.chat_router.logic import (
+    from core.chat_router.logic import (
         route_question,
         execute_skill_workflow,
         format_response,
-        orchestrate_with_supervisor,
+        run_graph,
         load_conversation_history,
         add_to_history,
         get_context_summary,
@@ -367,7 +374,7 @@ def chat():
     runner.setup()
 
     # Load chat_router skill instruction
-    instruction_path = Path(__file__).parent / "skills" / "chat_router" / "instruction.md"
+    instruction_path = Path(__file__).parent / "core" / "chat_router" / "instruction.md"
     instruction = instruction_path.read_text(encoding="utf-8")
 
     # Define available skills for routing
@@ -388,8 +395,21 @@ def chat():
     console.print("[bold cyan]═════════════════════════════════════════════════════════[/]")
     console.print("[dim]Type /help for commands, /new for new conversation, /exit to quit[/]\n")
 
-    # Conversation management
+    # Open persistent SQLite checkpointer for the whole chat session
     import uuid
+    import sqlite3
+    _conversations_db = Path(__file__).parent / "data" / "conversations.db"
+    _conversations_db.parent.mkdir(parents=True, exist_ok=True)
+    _sqlite_conn = sqlite3.connect(str(_conversations_db), check_same_thread=False)
+    try:
+        _SqliteSaver = getattr(import_module("langgraph.checkpoint.sqlite"), "SqliteSaver")
+        _checkpointer = _SqliteSaver(_sqlite_conn)
+    except ImportError:
+        _MemorySaver = getattr(import_module("langgraph.checkpoint.memory"), "MemorySaver")
+        _checkpointer = _MemorySaver()
+        logger.warning("langgraph-checkpoint-sqlite not installed; using in-memory checkpointer")
+
+    # Conversation management
     conversation_id = str(uuid.uuid4())[:8]
     console.print(f"[dim]Conv ID: {conversation_id}[/]")
 
@@ -478,7 +498,7 @@ def chat():
                     console.print(f"[dim]└ {icon} {'Satisfied' if satisfied else 'Not satisfied'} ({confidence:.0%}) — {reasoning}[/]")
                     console.print()
 
-            orchestration = orchestrate_with_supervisor(
+            orchestration = run_graph(
                 user_question=user_input,
                 available_skills=available_skills,
                 runner=runner,
@@ -487,6 +507,8 @@ def chat():
                 cfg=cfg,
                 conversation_history=recent_history,
                 step_callback=_supervisor_callback,
+                checkpointer=_checkpointer,
+                thread_id=f"{conversation_id}-{uuid.uuid4().hex[:8]}",
             )
 
             routing = orchestration.get("routing", {"skills": []})
@@ -504,6 +526,12 @@ def chat():
         except Exception as e:
             console.print(f"[red]Error: {e}[/]")
             logging.getLogger(__name__).exception("Chat error")
+
+    # Clean up SQLite connection when chat session ends
+    try:
+        _sqlite_conn.close()
+    except Exception:
+        pass
 
 
 # ──────────────────────────────────────────────────────────────────────────────

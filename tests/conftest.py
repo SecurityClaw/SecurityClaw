@@ -60,9 +60,9 @@ def seeded_db(mock_db) -> MockDBConnector:
 def runner_context(seeded_db, mock_llm, tmp_path):
     """Full context dict as the Runner would provide to each skill."""
     from core.config import Config
-    from core.memory import AgentMemory
+    from core.memory import CheckpointBackedMemory
 
-    memory = AgentMemory(path=tmp_path / "agent_memory.json")
+    memory = CheckpointBackedMemory(path=tmp_path / "runtime_memory.db")
     return {
         "db": seeded_db,
         "llm": mock_llm,
@@ -74,6 +74,6 @@ def runner_context(seeded_db, mock_llm, tmp_path):
 
 @pytest.fixture
 def tmp_memory(tmp_path):
-    from core.memory import AgentMemory
+    from core.memory import StateBackedMemory
 
-    return AgentMemory(path=tmp_path / "agent_memory.json")
+    return StateBackedMemory()
