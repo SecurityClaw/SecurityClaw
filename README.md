@@ -9,9 +9,15 @@ A modular, skill-based autonomous Security Operations Center (SOC) agent that mo
 * **Provider Agnostic** — Swap OpenSearch↔Elasticsearch via config  
 * **RAG-Based Memory** — Vector embeddings stored in OpenSearch; context-aware threat analysis  
 * **LangGraph Orchestration** — Multi-step DECIDE→EXECUTE→EVALUATE supervisor loop implemented as a `StateGraph`; conversation and chat working memory checkpointed to SQLite via `SqliteSaver`  
+* **Manifest-Grounded Planning** — Supervisor planning and retry steps are repaired against the currently loaded skill manifests before execution, so prerequisite chains come from manifest contracts instead of invented tool names  
 * **Working Memory** — Interactive chat working memory stays inside LangGraph state and is checkpointed in `data/conversations.db`; the scheduler/CLI runtime now uses the same checkpoint-backed model via `data/runtime_memory.db`  
-* **Conversation-based Investigations** — Investigate threats through an interactive chat interface with real-time LLM reasoning steps, routing guards, and RAG context retrieval  
+* **Conversation-based Investigations** — Investigate threats through an interactive chat interface with real-time LLM reasoning steps, manifest-declared capability contracts, and RAG context retrieval  
 * **Web Interface** — Modern React-based UI for chat, memory visualization, and skill dispatch  
+
+Context budgeting notes:
+- Chat output budget defaults to `llm.max_tokens: 16384` in [config.yaml](config.yaml).
+- Working memory injected into prompts is compacted by [core/memory.py](core/memory.py) with a default `max_context_chars` budget of 4000 characters.
+- Supervisor result summaries are clipped before prompt injection, so there is some compaction already, but there is not yet live token-usage telemetry in the chat router.
 
 ---
 
@@ -97,33 +103,71 @@ python -c "import main; import core; print('✓ Dependencies OK')"
 ```
 
 The wizard will guide you through:
-- **Database**: Host, port, SSL, auth
+- **Database**: Host, port, SSL, auth  
 - **LLM**: Ollama configuration
 - **Connection testing** for both services
 - **Configuration save** to `config.yaml` and `.env`
+- **External APIs** (optional): AbuseIPDB, AlienVault OTX, VirusTotal, Talos, MaxMind
+- **Skill variables**: Auto-discover and prompt for any missing skill-specific env vars
 
-See [ONBOARDING.md](ONBOARDING.md) for details.
+See [ONBOARDING.md](ONBOARDING.md) for detailed walkthrough.
 
-### 3. Start the Agent
+### 3. Start the Service (Recommended)
 
 ```bash
-.venv/bin/python main.py run
+.venv/bin/python main.py service
 ```
 
-The agent will start a background scheduler and begin polling for anomalies.
+Launches both the background scheduler **and** the web API server:
+- **Web UI**: `http://localhost:5173` (React frontend with hot reload)
+- **API**: `http://localhost:7799` (FastAPI REST service)
+- **Scheduler**: Runs anomaly detection and memory building in background
 
-### 4. View Status
-
-In another terminal:
+For API-only mode (no scheduler):
 ```bash
-.venv/bin/python main.py status          # Print the compact agent memory snapshot
-.venv/bin/python main.py list-skills     # Show loaded skills and intervals
-.venv/bin/python main.py dispatch <skill>  # Fire a skill manually (e.g., anomaly_triage)
+SECURITYCLAW_API_ONLY=1 .venv/bin/python main.py service
 ```
+
+### 3a. Or Run CLI Commands
+
+For pure CLI/background agent operation without the web interface:
+
+```bash
+.venv/bin/python main.py run                    # Start scheduler loop (anomaly watcher + memory builder)
+.venv/bin/python main.py dispatch <skill>      # Fire a skill once (e.g., threat_analyst)
+.venv/bin/python main.py chat                  # Interactive terminal-based chat with routing
+.venv/bin/python main.py status                # Print compact agent memory snapshot
+.venv/bin/python main.py list-skills           # Show loaded skills and intervals
+```
+
+### 3b. Web Development (Frontend Only)
+
+If you want to develop the React frontend locally:
+
+```bash
+.venv/bin/python main.py web-dev               # Start Vite dev server on :5173
+# In a second terminal:
+.venv/bin/python main.py service               # Start backend API on :7799
+```
+
+### 4. Web Interface Features
+
+The React web UI provides:
+- **Chat Interface** — Type questions; see real-time reasoning steps with skill invocations
+- **Skills Dispatch** — Manually trigger skills and view results
+- **Configuration Editor** — Edit `config.yaml` and `.env` through the UI
+- **Cron/Interval Management** — View and modify skill schedules
+- **Conversation History** — Persist and recall previous Q&A sessions
+- **Status Dashboard** — Real-time scheduler status, skill inventory, memory state
 
 ---
 
 ## Architecture
+
+SecurityClaw's chat orchestration is moving toward a capability-first contract model:
+- The supervisor plans against manifest-declared capabilities, prerequisites, required entities, and artifacts.
+- Live routing favors LLM planning plus manifest viability checks instead of manifest keyword guards.
+- Follow-up grounding should be expressed through manifest hooks so the core router stays skill-agnostic.
 
 ### Directory Structure
 
@@ -146,7 +190,7 @@ SecurityClaw/
 │
 ├── skills/
 │   ├── network_baseliner/     # 6h: Aggregate logs → RAG vectors
-│   ├── fields_baseliner/      # 1h: Catalog OpenSearch field schemas
+│   ├── fields_baseliner/      # 1h: Catalog field schemas and aggregate example values into fields RAG
 │   ├── anomaly_triage/        # Manual: Poll AD findings → enrich → escalate
 │   ├── threat_analyst/        # Manual: RAG reasoning → verdict
 │   ├── opensearch_querier/    # Manual: Execute database queries
@@ -159,6 +203,15 @@ SecurityClaw/
 │   ├── conversations.db       # SQLite — LangGraph checkpoint store (conversation + chat memory)
 │   ├── runtime_memory.db      # SQLite — LangGraph checkpoint store (scheduler + CLI runtime memory)
 │   └── geoip/                 # MaxMind GeoLite2 database files
+│
+├── web/
+│   ├── api/
+│   │   ├── server.py          # FastAPI REST service with SSE streaming
+│   │   └── service.py         # SecurityClawService lifecycle (scheduler + cleanup)
+│   ├── src/                   # React frontend source
+│   ├── dist/                  # Built frontend (generated by `web-build`)
+│   ├── package.json           # Frontend dependencies
+│   └── vite.config.js         # Vite bundler config
 │
 ├── tests/
 │   ├── conftest.py            # Shared fixtures
@@ -248,7 +301,7 @@ SecurityClaw/
 |-------|--------|-------|
 | **chat_router** | Stable | Powers web interface and API |
 | **network_baseliner** | Stable | Builds behavioral baselines from logs |
-| **fields_baseliner** | Stable | Catalogs OpenSearch field schemas |
+| **fields_baseliner** | Stable | Catalogs OpenSearch field schemas and aggregated example values |
 | **anomaly_triage** | In-Progress | Manual skill; enable scheduling in instruction.md |
 | **threat_analyst** | In-Progress | Manual skill; enable scheduling in instruction.md |
 | **opensearch_querier** | Stable | Single point of contact for DB queries |
@@ -651,10 +704,8 @@ Respond in JSON format with:
 Contributions welcome! Areas for enhancement:
 - [ ] Elasticsearch compatibility testing
 - [ ] Advanced MITRE ATT&CK mapping
-- [ ] Incident response playbook integrations
+- [ ] Enhanced RAG context (e.g., no hard-coded country codes, instead parse through RAG)
 - [ ] Multi-tenant support
-- [ ] API endpoint for external integrations
-- [ ] Expanded web dashboard for structured memory visualization
 
 ---
 

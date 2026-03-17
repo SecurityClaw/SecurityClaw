@@ -12,6 +12,37 @@ Instead of each skill building its own queries (causing duplication and hardcode
 2. **Intelligent Query Building**: Uses discovered field names instead of hardcoding "source_ip", "message", etc.
 3. **Execution**: Runs the constructed query against OpenSearch
 4. **Results**: Returns both data and metadata about which fields were used
+5. **Response Formatting**: Post-processes raw results to extract and highlight relevant details (IPs, ports, countries, etc.)
+
+## Response Post-Processing
+
+When opensearch_querier returns results, the formatter automatically extracts and highlights:
+- **Ports**: All unique destination ports found in the matching records
+- **IPs**: All source/destination IPs with distinguishing public vs. private
+- **Countries**: All observed geoIP countries
+- **Timestamps**: Earliest and latest records for time context
+
+### Port Extraction Behavior (Important for Follow-ups)
+
+When responding to **"What ports are associated with..."** follow-up questions:
+
+1. opensearch_querier searches for traffic matching the prior IPs (with `ports: []` meaning "all ports")
+2. The formatter examines the raw results for actual destination ports
+3. **All unique ports** found in those results are extracted and displayed
+4. This enables users to see concrete port data without needing an additional fingerprinting step
+
+Example flow:
+```
+User: Find 1.1.1.1
+→ Agent: Found 10 records with source/destination IPs...
+
+User: What ports are associated with this traffic?
+→ opensearch_querier runs with search_terms=[1.1.1.1], ports=[]
+→ Formatter extracts actual ports from 200+ matched records
+→ Returns: "Destination port(s): 443, 80, 22, 1194"
+```
+
+This design ensures opensearch_querier can handle port-related follow-ups directly without requiring external skills.
 
 ## For Direct User Queries
 
@@ -57,5 +88,6 @@ Python code (`_plan_opensearch_query_with_llm`) loads `PLANNING_PROMPT.md` at ru
 | Static JSON examples, error handling, extraction rules | `PLANNING_PROMPT.md` | Reusable, maintainable, auditable |
 | Dynamic context assembly, conversation history, runtime field mapping | `logic.py` | Changes based on actual conversation and available fields |
 | Query execution, result handling | `logic.py` | Implementation detail, not guidance |
+| Response formatting and data extraction | `hooks.py` | Data transformation logic |
 
 This pattern allows the LLM prompt to evolve without code changes while keeping implementation details encapsulated.

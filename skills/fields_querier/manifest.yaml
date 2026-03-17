@@ -1,4 +1,16 @@
 name: fields_querier
+routing_group: schema_discovery
+orchestration_role: direct
+capability_groups:
+  - schema_discovery
+  - direct_lookup
+answer_types:
+  - schema discovery
+  - field mapping lookup
+  - available field inventory
+artifact_outputs:
+  - findings
+  - field_mappings
 description: >
   Reads data/fields_rag.json (built by fields_baseliner) and answers field-schema
   questions. Returns exact OpenSearch field names, types, and examples.
@@ -32,3 +44,36 @@ min_prior_context: 0
 returns:
   - findings (question, answer, field_mappings, confidence)
   - field_mappings (structured dict with ip_fields, port_fields, text_fields, etc.)
+
+conditional_successors:
+  - groups:
+      - evidence_search
+    when_any_question_patterns:
+      - regex: '(?=.*\b(?:check|show|find|list|search|get|pull|display|any|what|which|when|where)\b)(?=.*\b(?:alerts?|events?|signatures?|traffic|flows?|connections?|ports?|protocols?|suricata|snort|et\s+[a-z0-9_\-]+|ips?)\b)'
+    skip_if_result_exists_for_groups:
+      - evidence_search
+
+conditional_recovery:
+  - position: front
+    when_any_question_patterns:
+      - regex: '(?=.*\b(?:show|find|search|check|list|get|what|which|when|who|where|display|pull|visited|visit|seen|look for|from|to)\b)(?=.*\b(?:traffic|flows?|connections?|logs?|events?|ports?|protocols?|countries?|ips?|hosts?)\b)'
+    skip_if_result_exists_for_skills:
+      - fields_querier
+    requires_result_predicates:
+      - skill: opensearch_querier
+        path: validation_failed
+        equals: true
+      - skill: opensearch_querier
+        any_text_paths:
+          - validation_issue
+          - reasoning_chain.validation_issue
+          - reasoning_chain.validation_reflection
+        contains_any:
+          - missing field
+          - required fields
+          - field information
+          - country information
+          - port information
+          - do not contain the required fields
+    add_groups_after:
+      - evidence_search

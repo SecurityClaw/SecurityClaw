@@ -32,6 +32,18 @@ explicit_only: true
   # Only invoke if user explicitly mentions "baseliner", "network_baseliner",
   # "create/generate/build baseline", "refresh baseline", or "force_refresh"
 
+explicit_keywords:
+  - "network_baseliner"
+  - "baseliner"
+  - "create baseline"
+  - "generate baseline"
+  - "build baseline"
+  - "refresh baseline"
+  - "force_refresh"
+
+fallback_on_block: "opensearch_querier"
+  # If user didn't explicitly request network_baseliner, use opensearch_querier instead
+
 min_prior_context: 0
 
 returns:

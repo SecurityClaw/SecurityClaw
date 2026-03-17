@@ -1,4 +1,22 @@
 name: opensearch_querier
+routing_group: evidence_search
+orchestration_role: direct
+capability_groups:
+  - evidence_search
+  - direct_lookup
+answer_types:
+  - evidence-backed log search
+  - traffic and flow retrieval
+  - direct record lookup with known schema
+artifact_inputs:
+  - schema_discovery
+artifact_outputs:
+  - results
+  - results_count
+  - countries
+  - ports
+  - protocols
+  - time_range
 description: >
   Direct OpenSearch query execution for when exact field names are known.
   Searches logs with precise filters when schema is understood.
@@ -38,7 +56,30 @@ returns:
   - protocols
   - time_range
 
+response_formatter: skills.opensearch_querier.hooks:format_response
+
 notes:
   - Use AFTER fields_querier for field schema discovery
   - Use AFTER baseline_querier if RAG results need pagination/precise filters
   - Use directly only if field names are explicitly mentioned
+
+conditional_prerequisites:
+  - groups:
+      - schema_discovery
+    when_any_question_patterns:
+      - regex: '\b(?:alerts?|signals?|events?|traffic|flows?|connections?|logs?|ports?|protocols?|signatures?|suricata|snort|et\s+[a-z0-9_\-]+|country|countries)\b'
+    skip_if_explicit_field_syntax: true
+    skip_if_result_exists_for_groups:
+      - schema_discovery
+
+conditional_recovery:
+  - position: front
+    when_any_question_patterns:
+      - regex: '(?=.*\b(?:show|find|search|check|list|get|what|which|when|who|where|display|pull|visited|visit|seen|look for|from|to)\b)(?=.*\b(?:traffic|flows?|connections?|logs?|events?|ports?|protocols?|countries?|ips?|hosts?)\b)'
+    skip_if_result_exists_for_skills:
+      - opensearch_querier
+    requires_result_predicates:
+      - skill: fields_querier
+        any_paths_truthy:
+          - field_mappings
+          - findings.field_mappings

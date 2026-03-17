@@ -65,6 +65,10 @@ class BaseDBConnector(ABC):
         """Execute a search query and return hits plus metadata such as total hit count."""
 
     @abstractmethod
+    def aggregate(self, index: str, query: dict) -> dict[str, Any]:
+        """Execute an aggregation query and return the raw response."""
+
+    @abstractmethod
     def index_document(self, index: str, doc_id: str, body: dict) -> dict:
         """Index a single document."""
 
@@ -189,6 +193,14 @@ class OpenSearchConnector(BaseDBConnector):
                 # Other errors - log and return empty
                 logger.error("search(%s) failed: %s", index, exc)
                 return {"results": [], "total": 0}
+
+    def aggregate(self, index: str, query: dict) -> dict[str, Any]:
+        """Execute an aggregation query and return the raw provider response."""
+        try:
+            return self._client.search(index=index, body=query, size=0)
+        except Exception as exc:
+            logger.error("aggregate(%s) failed: %s", index, exc)
+            return {"aggregations": {}, "hits": {"total": {"value": 0}}}
 
     def get_document(self, index: str, doc_id: str) -> Optional[dict]:
         try:

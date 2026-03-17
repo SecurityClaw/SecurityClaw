@@ -1,0 +1,95 @@
+name: ip_fingerprinter
+routing_group: host_fingerprinting
+orchestration_role: composite
+requires_explicit_entity: true
+required_entities:
+  - ip
+graph_builder: skills.ip_fingerprinter.graph:build_graph
+evaluation_hook: skills.ip_fingerprinter.hooks:evaluate_satisfaction
+question_enrichment_hook: skills.ip_fingerprinter.hooks:enrich_question_for_followup
+requires_own_result_for_satisfaction: true
+missing_for_satisfaction: passive fingerprint analysis from observed ports
+capability_groups:
+  - deterministic_formatter
+  - direct_entity_lookup
+answer_types:
+  - passive host fingerprinting
+  - port and service profile lookup
+  - role inference from observed ports
+  - OS-family likelihood from observed behavior
+artifact_inputs:
+  - schema_discovery
+  - evidence_search
+artifact_outputs:
+  - ip
+  - ports
+  - likely_role
+  - os_family_likelihoods
+  - registry_status
+description: >
+  Builds a passive port profile for an IP address, classifies observed ports using a
+  cached local registry, separates likely ephemeral from stable service ports, and
+  estimates whether the host behaves more like a client, server, or hybrid endpoint.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Skill Dependencies: Declare what must run before this skill
+# ──────────────────────────────────────────────────────────────────────────────
+prerequisites:
+  - group: "schema_discovery"
+    why: "Must discover port field names and field mappings from schema"
+  - group: "evidence_search"
+    why: "Must retrieve port observations from logs across lookback period"
+
+conditional_prerequisites:
+  - groups:
+      - schema_discovery
+    skip_if_result_exists_for_groups:
+      - schema_discovery
+  - groups:
+      - evidence_search
+    skip_if_result_exists_for_groups:
+      - evidence_search
+
+can_answer:
+  - "IP port fingerprinting"
+  - "what ports are associated with an IP"
+  - "which ports look known or unknown"
+  - "whether an IP behaves like a client or server"
+  - "weak OS-family likelihood from port patterns"
+
+cannot_answer:
+  - "definitive operating system fingerprinting"
+  - "CPU architecture identification"
+  - "service banner grabbing"
+  - "active port scanning"
+  - "maliciousness or reputation"
+
+priority_keywords:
+  - "fingerprint"
+  - "ip fingerprint"
+  - "ports associated"
+  - "ephemeral"
+  - "client or server"
+  - "server or client"
+  - "os likelihood"
+  - "port profile"
+
+user_intent_keywords:
+  - "fingerprint"
+  - "ip fingerprint"
+  - "ports associated"
+  - "ephemeral"
+  - "client or server"
+  - "server or client"
+  - "port profile"
+
+min_prior_context: 0
+
+returns:
+  - ip
+  - ports
+  - likely_role
+  - os_family_likelihoods
+  - registry_status
+
+response_formatter: skills.ip_fingerprinter.hooks:format_response

@@ -33,6 +33,7 @@ RECORDS_THRESHOLD = 10_000          # re-run every 10 k new records
 SAMPLE_SIZE       = 5_000           # logs to sample each run
 MAX_EXAMPLES      = 5               # distinct example values to keep per field
 MAX_FIELDS        = 200             # cap on catalogued fields
+MAX_AGG_VALUES    = 25              # top aggregated values to keep per field
 
 DATA_DIR     = Path(__file__).parents[2] / "data"
 STATE_FILE   = DATA_DIR / "fields_baseliner_state.json"
@@ -239,6 +240,101 @@ def _analyze_fields(logs: list[dict]) -> dict[str, dict]:
     return catalog
 
 
+def _field_supports_value_aggregation(field: str, info: dict[str, Any]) -> bool:
+    """Return whether a field is likely suitable for a terms aggregation."""
+    inferred_type = str(info.get("inferred_type", "")).lower()
+    if "datetime" in inferred_type:
+        return False
+
+    examples = [str(example).strip() for example in info.get("examples") or [] if str(example).strip()]
+    if examples and all(example.startswith("{") or example.startswith("[") for example in examples[:3]):
+        return False
+
+    return "." in field or bool(examples) or any(
+        token in field.lower() for token in ("country", "proto", "port", "event", "alert")
+    )
+
+
+def _aggregation_field_candidates(field: str, info: dict[str, Any]) -> list[str]:
+    """Return candidate field names to try in terms aggregations."""
+    inferred_type = str(info.get("inferred_type", "")).lower()
+    candidates: list[str] = []
+    if any(token in inferred_type for token in ("string", "keyword", "domain", "geo/")) and not field.endswith(".keyword"):
+        candidates.append(f"{field}.keyword")
+    candidates.append(field)
+    return list(dict.fromkeys(candidates))
+
+
+def _normalize_aggregated_value(value: Any) -> str | None:
+    if value in (None, "", [], {}):
+        return None
+    if isinstance(value, (dict, list)):
+        return None
+
+    rendered = str(value).strip()
+    if not rendered or len(rendered) > 120:
+        return None
+    return rendered
+
+
+def _extract_top_values_from_aggregation(raw_response: dict[str, Any], agg_name: str = "field_values") -> list[dict[str, Any]]:
+    buckets = (((raw_response or {}).get("aggregations") or {}).get(agg_name) or {}).get("buckets") or []
+    top_values: list[dict[str, Any]] = []
+    for bucket in buckets:
+        normalized = _normalize_aggregated_value(bucket.get("key"))
+        if normalized is None:
+            continue
+        top_values.append({
+            "value": normalized,
+            "count": int(bucket.get("doc_count", 0) or 0),
+        })
+    return top_values
+
+
+def _aggregate_field_values(db: Any, logs_index: str, field: str, info: dict[str, Any]) -> tuple[str | None, list[dict[str, Any]]]:
+    """Collect observed field values using OpenSearch aggregations."""
+    if not _field_supports_value_aggregation(field, info):
+        return None, []
+
+    for candidate_field in _aggregation_field_candidates(field, info):
+        query = {
+            "size": 0,
+            "query": {"match_all": {}},
+            "aggs": {
+                "field_values": {
+                    "terms": {
+                        "field": candidate_field,
+                        "size": MAX_AGG_VALUES,
+                    }
+                }
+            },
+        }
+        try:
+            raw_response = db.aggregate(logs_index, query)
+        except Exception as exc:
+            logger.debug("[%s] Value aggregation failed for %s via %s: %s", SKILL_NAME, field, candidate_field, exc)
+            continue
+
+        top_values = _extract_top_values_from_aggregation(raw_response)
+        if top_values:
+            return candidate_field, top_values
+
+    return None, []
+
+
+def _enrich_catalog_with_aggregated_values(db: Any, logs_index: str, catalog: dict[str, dict]) -> int:
+    """Populate top aggregated values for each field in the catalog when possible."""
+    profiled_fields = 0
+    for field, info in catalog.items():
+        aggregation_field, top_values = _aggregate_field_values(db, logs_index, field, info)
+        if not top_values:
+            continue
+        info["aggregation_field"] = aggregation_field
+        info["top_values"] = top_values
+        profiled_fields += 1
+    return profiled_fields
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Document builders
 # ──────────────────────────────────────────────────────────────────────────────
@@ -293,12 +389,19 @@ def _build_field_documents(catalog: dict[str, dict], total_logs: int) -> list[di
         "",
     ]
     for field, info in sorted_fields[:100]:
+        aggregated_values = info.get("top_values") or []
+        aggregated_summary = ", ".join(
+            f"{entry['value']} ({entry['count']})"
+            for entry in aggregated_values[:5]
+            if entry.get("value")
+        ) or "(no aggregated values)"
         detail_lines.extend([
             f"FIELD: {field}",
             f"  Type:        {info['inferred_type']}",
             f"  Description: {info['description']}",
             f"  Frequency:   {info['pct']}% ({info['count']:,} of {total_logs:,} records)",
             f"  Examples:    {', '.join(info['examples'][:3]) or '(none captured)'}",
+            f"  Top Values:  {aggregated_summary}",
             "",
         ])
 
@@ -378,9 +481,10 @@ def run(context: dict) -> dict:
 
     # ── Analyse fields ─────────────────────────────────────────────────────────
     catalog = _analyze_fields(logs)
+    profiled_fields = _enrich_catalog_with_aggregated_values(db, logs_index, catalog)
     logger.info(
-        "[%s] Catalogued %d distinct fields from %d sampled records.",
-        SKILL_NAME, len(catalog), len(logs),
+        "[%s] Catalogued %d distinct fields from %d sampled records; profiled %d field value sets.",
+        SKILL_NAME, len(catalog), len(logs), profiled_fields,
     )
 
     # ── Build RAG documents ────────────────────────────────────────────────────
@@ -397,12 +501,14 @@ def run(context: dict) -> dict:
         "last_run": datetime.now(timezone.utc).isoformat(),
         "fields_documented": len(catalog),
         "records_sampled": len(logs),
+        "values_profiled": profiled_fields,
     })
 
     return {
         "status": "ok",
         "fields_documented": len(catalog),
         "records_sampled": len(logs),
+        "values_profiled": profiled_fields,
         "documents_written": len(docs),
         "output_file": str(OUTPUT_FILE),
     }

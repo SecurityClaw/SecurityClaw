@@ -1,4 +1,22 @@
 name: geoip_lookup
+routing_group: geo_enrichment
+orchestration_role: direct
+capability_groups:
+  - geo_enrichment
+  - direct_entity_lookup
+requires_explicit_entity: true
+required_entities:
+  - ip
+answer_types:
+  - IP geolocation lookup
+  - country and city enrichment for an IP
+artifact_outputs:
+  - ip
+  - geo
+  - country
+  - subdivision
+  - city
+  - timezone
 description: >
   Downloads and maintains a local MaxMind GeoLite2-City MMDB file, then resolves
   IP geolocation details such as city, subdivision/state, country, timezone, and coordinates.
@@ -13,6 +31,7 @@ can_answer:
 cannot_answer:
   - "threat reputation"
   - "log searching"
+  - "traffic"
   - "timeline reconstruction"
   - "OpenSearch field discovery"
   - "behavioral baseline analysis"
@@ -32,6 +51,8 @@ priority_keywords:
 
 min_prior_context: 0
 
+response_formatter: skills.geoip_lookup.hooks:format_response
+
 returns:
   - ip
   - geo
@@ -40,6 +61,15 @@ returns:
   - city
   - timezone
   - db maintenance status
+
+conditional_recovery:
+  - position: back
+    when_any_question_patterns:
+      - regex: '\b(?:country|countries|origin|origins|where\s+from|geolocation|geoip)\b'
+    requires_extracted_entities:
+      - ips
+    skip_if_result_exists_for_skills:
+      - geoip_lookup
 
 required_env_vars:
   - name: MAXMIND_LICENSE_KEY

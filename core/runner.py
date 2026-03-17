@@ -100,7 +100,23 @@ class Runner:
 
     def setup(self) -> None:
         """Discover skills and wire up the scheduler."""
-        self._skills = self.loader.discover()
+        discovered_skills = self.loader.discover()
+        disabled_skills = self.cfg.get("agent", "disabled_skills", default=[])
+        disabled_set = {
+            str(skill_name).strip()
+            for skill_name in (disabled_skills if isinstance(disabled_skills, list) else [])
+            if str(skill_name).strip()
+        }
+
+        if disabled_set:
+            logger.info("Disabled skills from config: %s", ", ".join(sorted(disabled_set)))
+
+        self._skills = {
+            name: skill
+            for name, skill in discovered_skills.items()
+            if name not in disabled_set
+        }
+
         if not self._skills:
             logger.warning("No skills found — check your skills/ directory.")
 

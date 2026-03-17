@@ -42,6 +42,73 @@ load_dotenv(ENV_PATH)
 SECRET_NAME_RE = re.compile(r"(password|secret|token|api[_-]?key|client[_-]?secret|license[_-]?key)", re.IGNORECASE)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Input Validation
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _validate_conversation_id(conversation_id: str) -> None:
+    """Validate conversation_id contains only safe characters; raise HTTPException if invalid."""
+    if not conversation_id or not all(c.isalnum() or c in '-_' for c in conversation_id):
+        raise HTTPException(status_code=400, detail="Invalid conversation ID format")
+
+
+def _validate_skill_name(skill_name: str) -> None:
+    """Validate skill_name contains only safe characters; raise HTTPException if invalid."""
+    if not skill_name or not all(c.isalnum() or c == '_' for c in skill_name):
+        raise HTTPException(status_code=400, detail="Invalid skill name format")
+
+
+def _mask_value(name: str, value: str | None) -> str:
+    if not value:
+        return ""
+    if SECRET_NAME_RE.search(name):
+        return "••••••••"
+    return value
+
+
+def _read_text(path: Path, default: str = "") -> str:
+    return path.read_text(encoding="utf-8") if path.exists() else default
+
+
+def _short_json(payload: dict, limit: int = 1200) -> str:
+    rendered = json.dumps(payload, indent=2, default=str)
+    if len(rendered) <= limit:
+        return rendered
+    return rendered[:limit].rstrip() + " ..."
+
+
+def _disabled_skill_names() -> set[str]:
+    disabled = Config().get("agent", "disabled_skills", default=[])
+    if not isinstance(disabled, list):
+        return set()
+    return {str(skill_name).strip() for skill_name in disabled if str(skill_name).strip()}
+
+
+def _is_skill_enabled(skill_name: str) -> bool:
+    return skill_name not in _disabled_skill_names()
+
+
+def _update_skill_enabled_state(skill_name: str, enabled: bool) -> None:
+    current = yaml.safe_load(_read_text(CONFIG_PATH, "")) or {}
+    if not isinstance(current, dict):
+        current = {}
+
+    agent_cfg = current.setdefault("agent", {})
+    disabled = agent_cfg.get("disabled_skills", [])
+    if not isinstance(disabled, list):
+        disabled = []
+
+    normalized = [str(name).strip() for name in disabled if str(name).strip()]
+    if enabled:
+        normalized = [name for name in normalized if name != skill_name]
+    elif skill_name not in normalized:
+        normalized.append(skill_name)
+
+    agent_cfg["disabled_skills"] = sorted(dict.fromkeys(normalized))
+    CONFIG_PATH.write_text(yaml.safe_dump(current, sort_keys=False), encoding="utf-8")
+    Config.reset()
+
+
 class ChatRequest(BaseModel):
     message: str
     conversation_id: str | None = None
@@ -61,6 +128,10 @@ class SaveEnvRequest(BaseModel):
 
 class RestartRequest(BaseModel):
     reason: str | None = None
+
+
+class SkillToggleRequest(BaseModel):
+    enabled: bool
 
 
 class ChatStreamParser:
@@ -107,18 +178,6 @@ class ChatStreamParser:
         }
 
 
-def _mask_value(name: str, value: str | None) -> str:
-    if not value:
-        return ""
-    if SECRET_NAME_RE.search(name):
-        return "••••••••"
-    return value
-
-
-def _read_text(path: Path, default: str = "") -> str:
-    return path.read_text(encoding="utf-8") if path.exists() else default
-
-
 def _skill_dirs() -> list[Path]:
     if not SKILLS_DIR.exists():
         return []
@@ -152,6 +211,8 @@ def _build_available_skills() -> list[dict[str, Any]]:
     for skill_dir in _skill_dirs():
         if skill_dir.name == "chat_router":
             continue
+        if not _is_skill_enabled(skill_dir.name):
+            continue
         skills.append({
             "name": skill_dir.name,
             "description": _get_skill_description(skill_dir.name),
@@ -169,6 +230,7 @@ def _skill_payload(skill_dir: Path) -> dict[str, Any]:
     frontmatter, _ = _parse_instruction_frontmatter(instruction_raw)
     return {
         "name": skill_dir.name,
+        "enabled": _is_skill_enabled(skill_dir.name),
         "manifest": manifest,
         "manifest_raw": manifest_raw,
         "instruction_raw": instruction_raw,
@@ -293,6 +355,9 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
 
     @app.get("/api/conversations/{conversation_id}")
     async def conversation(conversation_id: str) -> dict[str, Any]:
+        # Security: Validate conversation_id contains only safe characters
+        _validate_conversation_id(conversation_id)
+        
         return {
             "id": conversation_id,
             "messages": load_conversation_history(conversation_id),
@@ -302,8 +367,7 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
     @app.delete("/api/conversations/{conversation_id}")
     async def delete_conversation(conversation_id: str) -> dict[str, str]:
         # Security: Validate conversation_id contains only safe characters
-        if not all(c.isalnum() or c in '-_' for c in conversation_id):
-            raise HTTPException(status_code=400, detail="Invalid conversation ID format")
+        _validate_conversation_id(conversation_id)
         
         conv_path = (ROOT / "conversations" / f"{conversation_id}.json").resolve()
         safe_dir = (ROOT / "conversations").resolve()
@@ -322,16 +386,27 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
 
     @app.get("/api/skills/{skill_name}")
     async def skill_detail(skill_name: str) -> dict[str, Any]:
+        _validate_skill_name(skill_name)
         skill_dir = SKILLS_DIR / skill_name
         if not skill_dir.exists():
             raise HTTPException(status_code=404, detail="Skill not found")
         return _skill_payload(skill_dir)
 
+    @app.put("/api/skills/{skill_name}/enabled")
+    async def set_skill_enabled(skill_name: str, body: SkillToggleRequest) -> dict[str, Any]:
+        _validate_skill_name(skill_name)
+        skill_dir = SKILLS_DIR / skill_name
+        if not skill_dir.exists():
+            raise HTTPException(status_code=404, detail="Skill not found")
+
+        _update_skill_enabled_state(skill_name, body.enabled)
+        app.state.service.restart()
+        return {"status": "ok", "skill": skill_name, "enabled": body.enabled}
+
     @app.put("/api/skills/{skill_name}/manifest")
     async def save_skill_manifest(skill_name: str, body: SaveTextRequest) -> dict[str, str]:
         # Security: Validate skill_name contains only safe characters
-        if not all(c.isalnum() or c == '_' for c in skill_name):
-            raise HTTPException(status_code=400, detail="Invalid skill name format")
+        _validate_skill_name(skill_name)
         
         skill_dir = SKILLS_DIR / skill_name
         safe_dir = SKILLS_DIR.resolve()
@@ -350,8 +425,7 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
     @app.put("/api/skills/{skill_name}/instruction")
     async def save_skill_instruction(skill_name: str, body: SaveTextRequest) -> dict[str, str]:
         # Security: Validate skill_name contains only safe characters
-        if not all(c.isalnum() or c == '_' for c in skill_name):
-            raise HTTPException(status_code=400, detail="Invalid skill name format")
+        _validate_skill_name(skill_name)
         
         skill_dir = SKILLS_DIR / skill_name
         safe_dir = SKILLS_DIR.resolve()
@@ -373,6 +447,7 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
             "env": _env_payload(),
             "required_env_vars": discover_skill_requirements(),
             "missing_skill_vars": get_missing_skill_variables(),
+            "disabled_skills": sorted(_disabled_skill_names()),
         }
 
     @app.put("/api/config")
@@ -401,6 +476,7 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
             items.append({
                 "name": skill["name"],
                 "description": skill["description"],
+                "enabled": skill.get("enabled", True),
                 "type": schedule_type,
                 "interval_seconds": skill.get("schedule_interval_seconds"),
                 "cron_expr": skill.get("schedule_cron_expr"),

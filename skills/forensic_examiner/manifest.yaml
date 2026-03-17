@@ -1,4 +1,9 @@
 name: forensic_examiner
+orchestration_role: composite
+graph_builder: skills.forensic_examiner.graph:build_graph
+evaluation_hook: skills.forensic_examiner.hooks:evaluate_satisfaction
+requires_own_result_for_satisfaction: true
+missing_for_satisfaction: forensic timeline analysis and incident reconstruction
 description: >
   Reconstructs incident timelines by linking DNS queries, network flows, and alerts.
   Analyzes behavior patterns and identifies key entities and risk implications.
@@ -16,7 +21,19 @@ cannot_answer:
   - "baseline pattern comparison"
   - "real-time monitoring"
 
-priority_keywords:
+# ──────────────────────────────────────────────────────────────────────────
+# Skill Dependencies: Declare what must run before this composite skill
+# ──────────────────────────────────────────────────────────────────────────
+prerequisites:
+  - group: "schema_discovery"
+    why: "Must have field documentation to understand log structure and field names"
+  - group: "evidence_search"
+    why: "Will search logs during iterative investigation to build incident timeline"
+
+capability_groups:
+  - forensic_analysis
+  - timeline_reconstruction
+
   - "timeline"
   - "incident"
   - "what happened"
@@ -24,9 +41,41 @@ priority_keywords:
   - "reconstruct"
   - "relationship"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Routing Guard: Priority Override Keywords
+# ──────────────────────────────────────────────────────────────────────────────
+# forensic_examiner gets priority when user explicitly asks for forensic/timeline analysis.
+# These keywords trigger an intent override that makes forensic_examiner the primary skill.
+priority_override_keywords:
+  - "forensic"
+  - "timeline"
+  - "incident reconstruction"
+  - "reconstruct"
+  - "investigate incident"
+  - "forensic analysis"
+  - regex: "investigat(e|ion)"
+
+# If question contains forensic intent AND search filters (traffic, IPs, etc.),
+# co-route with opensearch_querier for initial log search before forensic analysis.
+co_route_skills_if_filters_present:
+  - "opensearch_querier"
+
+search_filter_patterns:
+  - regex: "\\b(traffic|flow|connection|log|logs|port|protocol|from|to|country|ip|domain)\\b"
+  - regex: "\\b\\d{1,3}(?:\\.\\d{1,3}){3}\\b"  # IPv4 addresses
+
 min_prior_context: 0
   # Can work standalone to reconstruct incident
   # Beneficial to have context about what to focus on
+
+auto_chain_successor: threat_analyst
+  # After forensic_examiner succeeds, automatically execute threat_analyst
+  # to analyze reputation and maliciousness of discovered entities
+
+successor_question_builder_hook: skills.forensic_examiner.hooks:build_threat_followup_question
+  # Function that builds the question for the auto-chained threat_analyst skill
+
+response_formatter: skills.forensic_examiner.hooks:format_response
 
 returns:
   - forensic_report

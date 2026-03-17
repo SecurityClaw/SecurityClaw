@@ -3,7 +3,7 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short --cov=core --cov=skills --cov-report=term-missing --cov-report=xml:coverage.xml"
+addopts = "-v --tb=short --cov=core --cov=skills --cov-report=term-missing --cov-report=xml:coverage.xml --ignore=tests/local_tests"
 log_cli = true
 log_cli_level = "WARNING"
 

@@ -77,6 +77,41 @@ body {
 .badge-danger { @apply border-danger/30 bg-danger/10 text-danger; }
 .badge-dim { @apply border-border bg-panel2 text-dim; }
 
+.activity-ellipsis {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 0.18rem;
+}
+
+.activity-ellipsis span {
+  width: 0.28rem;
+  height: 0.28rem;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.35;
+  animation: activity-bounce 1s ease-in-out infinite;
+}
+
+.activity-ellipsis span:nth-child(2) {
+  animation-delay: 0.12s;
+}
+
+.activity-ellipsis span:nth-child(3) {
+  animation-delay: 0.24s;
+}
+
+@keyframes activity-bounce {
+  0%, 80%, 100% {
+    opacity: 0.28;
+    transform: translateY(0);
+  }
+
+  40% {
+    opacity: 1;
+    transform: translateY(-0.18rem);
+  }
+}
+
 .markdown {
   color: #d6e7ef;
 }

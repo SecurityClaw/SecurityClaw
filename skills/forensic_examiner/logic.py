@@ -18,11 +18,12 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-INSTRUCTION_PATH = __import__("pathlib").Path(__file__).parent / "instruction.md"
+INSTRUCTION_PATH = Path(__file__).parent / "instruction.md"
 SKILL_NAME = "forensic_examiner"
 
 

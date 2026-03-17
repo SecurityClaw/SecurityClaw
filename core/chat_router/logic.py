@@ -8,6 +8,13 @@ and maintains conversation context using LangGraph orchestration.
 This is the core orchestration module—not a periodic skill.
 LangGraph is a required dependency for the agent loop orchestration.
 """
+
+# ARCHITECTURE GUARDRAIL:
+# Do not add new hardcoded skill names or skill-specific routing branches in this file.
+# The chat router must remain capability- and manifest-driven. Resolve concrete skills
+# through manifest routing groups, capability metadata, and manifest contracts instead
+# of embedding skill identifiers here.
+
 from __future__ import annotations
 
 import ipaddress
@@ -22,13 +29,30 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables.config import RunnableConfig
 
+from core.capability_graph import expand_skill_dependencies
 from core.memory import StateBackedMemory
+from core.skill_manifest import (
+    SkillManifestLoader,
+    apply_manifest_recovery_policies,
+    apply_manifest_plan_policies,
+    apply_question_enrichment,
+    check_and_apply_auto_chain,
+    first_skill_in_group,
+    manifest_answer_types,
+    manifest_artifact_inputs,
+    manifest_artifact_outputs,
+    manifest_non_goals,
+    manifest_required_entities,
+)
 
 logger = logging.getLogger(__name__)
 
 INSTRUCTION_PATH = Path(__file__).parent / "instruction.md"
 ROUTING_PROMPT_PATH = Path(__file__).parent / "ROUTING_PROMPT.md"
 SUPERVISOR_NEXT_ACTION_PROMPT_PATH = Path(__file__).parent / "SUPERVISOR_NEXT_ACTION_PROMPT.md"
+SUPERVISOR_PLAN_REVIEW_PROMPT_PATH = Path(__file__).parent / "SUPERVISOR_PLAN_REVIEW_PROMPT.md"
+SUPERVISOR_PLAN_REPAIR_PROMPT_PATH = Path(__file__).parent / "SUPERVISOR_PLAN_REPAIR_PROMPT.md"
+SUPERVISOR_REFLECTION_PROMPT_PATH = Path(__file__).parent / "SUPERVISOR_REFLECTION_PROMPT.md"
 SUPERVISOR_EVALUATION_PROMPT_PATH = Path(__file__).parent / "SUPERVISOR_EVALUATION_PROMPT.md"
 RESPONSE_THINK_PROMPT_PATH = Path(__file__).parent / "RESPONSE_THINK_PROMPT.md"
 RESPONSE_REFLECTION_PROMPT_PATH = Path(__file__).parent / "RESPONSE_REFLECTION_PROMPT.md"
@@ -53,6 +77,7 @@ class AgentState(TypedDict, total=False):
     step_count: int
     max_steps: int
     previously_run_skills: list  # list of plan signatures for previously executed steps
+    plan_exhausted: bool
 
     # Evaluation
     evaluation: dict        # {satisfied, confidence, reasoning, missing}
@@ -71,6 +96,10 @@ class AgentState(TypedDict, total=False):
 
 
 def _load_prompt_template(path: Path, fallback: str) -> str:
+    """Load prompt template from file, or fall back to embedded template."""
+    if not path.exists():
+        # File doesn't exist—silently use fallback (expected for deleted template files)
+        return fallback.strip()
     try:
         return path.read_text(encoding="utf-8").strip()
     except Exception as exc:
@@ -85,36 +114,940 @@ def _render_prompt(template: str, values: dict[str, Any]) -> str:
     return rendered
 
 
+
+
+
+def _normalize_plan_question(question: str) -> str:
+    return " ".join(str(question or "").lower().split())
+
+
+def _ground_supervisor_question_with_llm(
+    user_question: str,
+    llm: Any,
+    instruction: str,
+) -> dict[str, Any]:
+    deterministic_grounding = _deterministic_supervisor_question_grounding(user_question)
+    if deterministic_grounding:
+        return deterministic_grounding
+
+    prompt = f"""Analyze ONLY the current user question below.
+
+CURRENT USER QUESTION:
+{user_question}
+
+TASK:
+- State what the user is explicitly asking for right now.
+- Identify the immediate answer shape or capability needed first.
+- State which common reframings would be incorrect if they would answer a different question.
+- Passive fingerprinting means behavior or service-profile inference from observed evidence. It is not geolocation.
+- Use routing groups when they fit, such as schema_discovery, evidence_search, host_fingerprinting, geo_enrichment, threat_analysis, or baseline_analysis.
+- Do not use prior conversation or assumptions.
+
+Examples:
+Question: fingerprint 192.168.0.16
+Answer:
+{{
+    "summary": "Passive fingerprint the IP using observed behavior and port evidence.",
+    "requested_capability": "composite workflow",
+    "immediate_need": "gather evidence for host fingerprinting",
+    "preferred_routing_groups": ["schema_discovery", "evidence_search", "host_fingerprinting"],
+    "disallowed_routing_groups": ["geo_enrichment"],
+    "must_preserve": ["192.168.0.16", "fingerprinting"],
+    "must_not_reframe_as": ["geolocation lookup"],
+    "confidence": 0.99
+}}
+
+Question: where is 8.8.8.8 located
+Answer:
+{{
+    "summary": "Find the geographic location of the IP.",
+    "requested_capability": "direct lookup",
+    "immediate_need": "geolocate the IP",
+    "preferred_routing_groups": ["geo_enrichment"],
+    "disallowed_routing_groups": ["host_fingerprinting"],
+    "must_preserve": ["8.8.8.8", "location"],
+    "must_not_reframe_as": ["behavioral fingerprinting"],
+    "confidence": 0.99
+}}
+
+Question: i want to fingerprit thee ip like ports and servivrd
+Answer:
+{{
+    "summary": "The user wants a host fingerprint focused on ports and services.",
+    "requested_capability": "composite workflow",
+    "immediate_need": "recover the referenced target entity and gather host-fingerprinting evidence",
+    "preferred_routing_groups": ["host_fingerprinting", "schema_discovery", "evidence_search"],
+    "disallowed_routing_groups": ["geo_enrichment"],
+    "must_preserve": ["ports", "services", "host fingerprinting"],
+    "must_not_reframe_as": ["geolocation lookup"],
+    "confidence": 0.97
+}}
+
+Return strict JSON:
+{{
+  "summary": "what the user is asking now",
+  "requested_capability": "direct lookup|schema discovery|evidence search|enrichment|investigation|composite workflow",
+  "immediate_need": "best immediate next step category",
+    "preferred_routing_groups": ["manifest routing groups that fit the immediate need"],
+    "disallowed_routing_groups": ["manifest routing groups that would answer a different question"],
+  "must_preserve": ["explicit entities or requested answer shape"],
+  "must_not_reframe_as": ["incorrect alternative tasks"],
+  "confidence": 0.0
+}}
+"""
+    try:
+        response = llm.chat([
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": prompt},
+        ])
+        parsed = _parse_json_object(response) or {}
+        return {
+            "summary": str(parsed.get("summary") or ""),
+            "requested_capability": str(parsed.get("requested_capability") or ""),
+            "immediate_need": str(parsed.get("immediate_need") or ""),
+            "preferred_routing_groups": list(parsed.get("preferred_routing_groups") or []),
+            "disallowed_routing_groups": list(parsed.get("disallowed_routing_groups") or []),
+            "must_preserve": list(parsed.get("must_preserve") or []),
+            "must_not_reframe_as": list(parsed.get("must_not_reframe_as") or []),
+            "confidence": float(parsed.get("confidence", 0.0) or 0.0),
+        }
+    except Exception as exc:
+        logger.warning("[%s] Supervisor question grounding failed: %s", SKILL_NAME, exc)
+        return {
+            "summary": user_question,
+            "requested_capability": "",
+            "immediate_need": "",
+            "preferred_routing_groups": [],
+            "disallowed_routing_groups": [],
+            "must_preserve": [],
+            "must_not_reframe_as": [],
+            "confidence": 0.0,
+        }
+
+
+def _build_skill_catalog(
+    available_skills: list[dict],
+    manifests: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    manifests = manifests or {}
+    catalog: list[dict[str, Any]] = []
+    for skill in available_skills or []:
+        skill_name = str(skill.get("name") or "").strip()
+        if not skill_name:
+            continue
+        manifest = manifests.get(skill_name, {})
+        prerequisites = []
+        for prereq in manifest.get("prerequisites") or []:
+            if not isinstance(prereq, dict):
+                continue
+            prerequisites.append(
+                {
+                    "group": str(prereq.get("group") or "").strip(),
+                    "why": str(prereq.get("why") or "").strip(),
+                }
+            )
+        catalog.append(
+            {
+                "name": skill_name,
+                "description": str(skill.get("description") or manifest.get("description") or "").strip(),
+                "routing_group": str(manifest.get("routing_group") or "").strip(),
+                "capability_groups": list(manifest.get("capability_groups") or []),
+                "orchestration_role": str(manifest.get("orchestration_role") or "single_step").strip(),
+                "min_prior_context": int(manifest.get("min_prior_context", 0) or 0),
+                "prerequisites": prerequisites,
+                "answer_types": manifest_answer_types(manifest),
+                "non_goals": manifest_non_goals(manifest),
+                "required_entities": manifest_required_entities(manifest),
+                "artifact_inputs": manifest_artifact_inputs(manifest),
+                "artifact_outputs": manifest_artifact_outputs(manifest),
+            }
+        )
+    return catalog
+
+
+def _question_has_explicit_ip(user_question: str) -> bool:
+    return bool(re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", str(user_question or "")))
+
+
+def _question_has_explicit_domain(user_question: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b",
+            str(user_question or "").lower(),
+        )
+    )
+
+
 def _question_asks_for_reputation(user_question: str) -> bool:
-    question_lower = user_question.lower()
+    question_lower = str(user_question or "").lower()
     return any(
         term in question_lower
         for term in ["reputation", "threat intel", "threat intelligence", "risk", "malicious", "verdict", "score"]
     )
 
 
-def _question_asks_for_baseline(user_question: str) -> bool:
-    question_lower = user_question.lower()
-    return any(
-        term in question_lower
-        for term in [
-            "baseline",
-            "normal behavior",
-            "is this normal",
-            "is it normal",
-            "what's normal",
-            "usual behavior",
-            "expected behavior",
-            "common behavior",
-            "frequent",
-            "frequency",
-            "how often",
-        ]
+def _extract_explicit_ips(user_question: str) -> list[str]:
+    return list(dict.fromkeys(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", str(user_question or ""))))
+
+
+def _extract_explicit_domains(user_question: str) -> list[str]:
+    return list(
+        dict.fromkeys(
+            re.findall(
+                r"\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b",
+                str(user_question or "").lower(),
+            )
+        )
     )
 
 
-def _normalize_plan_question(question: str) -> str:
-    return " ".join(str(question or "").lower().split())
+def _build_direct_threat_intel_plan(
+    user_question: str,
+    available_skills: list[dict],
+    manifests: dict[str, dict[str, Any]] | None = None,
+    conversation_history: list[dict] | None = None,
+) -> dict[str, Any] | None:
+    if not _question_asks_for_reputation(user_question):
+        return None
+
+    manifests = manifests or {}
+    resolved_skill = first_skill_in_group(manifests, "threat_enrichment") if manifests else None
+    available_skill_names = {str(s.get("name") or "").strip() for s in available_skills or [] if s.get("name")}
+    if not resolved_skill or resolved_skill not in available_skill_names:
+        return None
+
+    explicit_ips = _extract_explicit_ips(user_question)
+    explicit_domains = _extract_explicit_domains(user_question)
+    if not explicit_ips and not explicit_domains:
+        return None
+
+    private_only = bool(explicit_ips) and all(_is_private_ip(ip) for ip in explicit_ips) and not explicit_domains
+    if private_only:
+        reasoning = "Threat-intel request targets an explicit private/internal IP, so route directly to the manifest-declared threat-analysis capability for a grounded no-public-reputation answer."
+    else:
+        reasoning = "Threat-intel request names explicit IPs/domains, so route directly to the manifest-declared threat-analysis capability instead of log search, GeoIP, or fingerprinting."
+
+    parameters = {"question": user_question}
+    if conversation_history:
+        parameters["conversation_history"] = conversation_history
+
+    return {
+        "reasoning": reasoning,
+        "skills": [resolved_skill],
+        "parameters": parameters,
+    }
+
+
+def _extract_country_traffic_filter(user_question: str) -> str | None:
+    text = str(user_question or "")
+    if not text or _question_has_explicit_ip(text):
+        return None
+    if not re.search(r"\b(?:traffic|connections?|activity|flows?|network\s+traffic)\b", text, flags=re.IGNORECASE):
+        return None
+
+    patterns = [
+        r"\b(?:traffic|connections?|activity|flows?|network\s+traffic)\s+from\s+([A-Za-z][A-Za-z\s'.-]{1,50}?)(?=\s+(?:today|yesterday|this|past|last|during|on|in|for)\b|[?.!,]|$)",
+        r"\b(?:originating\s+from|from)\s+([A-Za-z][A-Za-z\s'.-]{1,50}?)(?=\s+(?:today|yesterday|this|past|last|during|on|in|for)\b|[?.!,]|$)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = re.sub(r"\s+", " ", match.group(1)).strip(" ,.?;:!\n\t")
+        if not candidate or re.search(r"\d", candidate):
+            continue
+        lower_candidate = candidate.lower()
+        if lower_candidate in {"traffic", "connections", "connection", "activity", "flow", "flows", "ip", "address"}:
+            continue
+        return " ".join(part.capitalize() for part in candidate.split())
+    return None
+
+
+def _extract_requested_window_text(user_question: str) -> str:
+    text = str(user_question or "")
+    for pattern in (
+        r"\btoday\b",
+        r"\byesterday\b",
+        r"\bthis\s+(?:day|week|month|year)\b",
+        r"\bpast\s+\d+\s*(?:minute|minutes|hour|hours|day|days|week|weeks|month|months)\b",
+        r"\blast\s+\d+\s*(?:minute|minutes|hour|hours|day|days|week|weeks|month|months)\b",
+        r"\bpast\s+(?:day|week|month|year)\b",
+        r"\blast\s+(?:day|week|month|year)\b",
+    ):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(0)
+    return ""
+
+
+def _deterministic_supervisor_question_grounding(user_question: str) -> dict[str, Any] | None:
+    if _question_asks_for_reputation(user_question):
+        explicit_ips = _extract_explicit_ips(user_question)
+        explicit_domains = _extract_explicit_domains(user_question)
+        if explicit_ips or explicit_domains:
+            must_preserve = list(explicit_ips) + list(explicit_domains) + ["threat intelligence"]
+            private_only = bool(explicit_ips) and all(_is_private_ip(ip) for ip in explicit_ips) and not explicit_domains
+            if private_only:
+                return {
+                    "summary": "Assess threat relevance for the explicit private/internal IP without reframing into GeoIP or fingerprinting.",
+                    "requested_capability": "enrichment",
+                    "immediate_need": "perform direct threat assessment for the explicit private/internal IP and explain external reputation limits",
+                    "preferred_routing_groups": ["threat_enrichment"],
+                    "disallowed_routing_groups": ["geo_enrichment", "host_fingerprinting", "schema_discovery", "evidence_search", "baseline_analysis"],
+                    "must_preserve": must_preserve,
+                    "must_not_reframe_as": ["geolocation lookup", "passive fingerprinting", "country traffic search"],
+                    "confidence": 1.0,
+                }
+            return {
+                "summary": "Assess threat intelligence for the explicit IP or domain.",
+                "requested_capability": "enrichment",
+                "immediate_need": "perform direct threat assessment for the explicit IP or domain",
+                "preferred_routing_groups": ["threat_enrichment"],
+                "disallowed_routing_groups": ["geo_enrichment", "host_fingerprinting", "schema_discovery", "evidence_search", "baseline_analysis"],
+                "must_preserve": must_preserve,
+                "must_not_reframe_as": ["geolocation lookup", "passive fingerprinting", "country traffic search"],
+                "confidence": 1.0,
+            }
+
+    country_filter = _extract_country_traffic_filter(user_question)
+    if not country_filter:
+        return None
+
+    must_preserve = [country_filter, "traffic"]
+    requested_window = _extract_requested_window_text(user_question)
+    if requested_window:
+        must_preserve.append(requested_window)
+
+    return {
+        "summary": f"Find traffic involving source country {country_filter}.",
+        "requested_capability": "evidence search",
+        "immediate_need": f"gather traffic evidence filtered to source country {country_filter}",
+        "preferred_routing_groups": ["schema_discovery", "evidence_search"],
+        "disallowed_routing_groups": ["geo_enrichment", "host_fingerprinting"],
+        "must_preserve": must_preserve,
+        "must_not_reframe_as": ["geolocation lookup", "country distribution", "passive fingerprinting"],
+        "confidence": 1.0,
+    }
+
+
+def _skill_has_required_entity_context(
+    manifest: dict[str, Any],
+    user_question: str,
+    current_results: dict[str, Any] | None = None,
+) -> bool:
+    required_entities = manifest_required_entities(manifest)
+    if not required_entities:
+        return True
+
+    extracted = _extract_entities_from_previous_results(current_results or {}) if current_results else {}
+    available_entities = {
+        "entity": _question_has_explicit_entities(user_question)
+        or bool(extracted.get("ips") or extracted.get("domains") or extracted.get("countries") or extracted.get("ports")),
+        "ip": _question_has_explicit_ip(user_question) or bool(extracted.get("ips")),
+        "ipv4": _question_has_explicit_ip(user_question) or bool(extracted.get("ips")),
+        "ipv6": _question_has_explicit_ip(user_question) or bool(extracted.get("ips")),
+        "domain": _question_has_explicit_domain(user_question) or bool(extracted.get("domains")),
+        "hostname": _question_has_explicit_domain(user_question) or bool(extracted.get("domains")),
+        "country": bool(extracted.get("countries")),
+        "port": bool(extracted.get("ports")),
+    }
+    if any(available_entities.get(entity_type, False) for entity_type in required_entities):
+        return True
+
+    return bool(manifest.get("question_enrichment_hook")) and bool(current_results)
+
+
+def _extract_skill_errors(skill_results: dict | None) -> list[dict[str, str]]:
+    errors: list[dict[str, str]] = []
+    for skill_name, result in (skill_results or {}).items():
+        if not isinstance(result, dict):
+            continue
+        if result.get("status") != "error":
+            continue
+        errors.append(
+            {
+                "skill": str(skill_name),
+                "error": str(result.get("error") or "unknown error"),
+            }
+        )
+    return errors
+
+
+def _ground_selected_skills(
+    selected_skills: list[str],
+    user_question: str,
+    available_skills: list[dict],
+    manifests: dict[str, dict[str, Any]] | None = None,
+    current_results: dict[str, Any] | None = None,
+) -> tuple[list[str], list[str]]:
+    manifests = manifests or {}
+    available_names = {s.get("name") for s in available_skills if s.get("name")}
+    grounded: list[str] = []
+    dropped: list[str] = []
+    for skill in (selected_skills or []):
+        resolved_skill = None
+        if skill in available_names:
+            resolved_skill = skill
+        elif manifests:
+            resolved_skill = first_skill_in_group(manifests, str(skill or "").strip())
+
+        if resolved_skill and resolved_skill in available_names:
+            manifest = manifests.get(resolved_skill, {}) if manifests else {}
+            if manifest and not _skill_has_required_entity_context(manifest, user_question, current_results):
+                dropped.append(skill)
+                continue
+            grounded.append(resolved_skill)
+            continue
+
+        dropped.append(skill)
+    if manifests and grounded:
+        grounded = apply_manifest_plan_policies(
+            selected_skills=grounded,
+            user_question=user_question,
+            available_skills=available_skills,
+            all_manifests=manifests,
+            current_results=current_results or {},
+        )
+        grounded = expand_skill_dependencies(grounded, manifests)
+
+    deduped: list[str] = []
+    for skill in grounded:
+        if skill and skill in available_names and skill not in deduped:
+            deduped.append(skill)
+    return deduped, dropped
+
+
+def _repair_plan_with_llm(
+    *,
+    user_question: str,
+    available_skills: list[dict],
+    manifests: dict[str, dict[str, Any]],
+    llm: Any,
+    instruction: str,
+    current_results: dict | None,
+    previous_eval: dict | None,
+    previous_trace: list[dict] | None,
+    question_grounding: dict[str, Any] | None = None,
+    invalid_skills: list[str] | None,
+    proposed_skills: list[str] | None,
+    proposed_parameters: dict | None,
+    mode: str,
+    failure_reason: str = "",
+) -> dict:
+    catalog_json = json.dumps(_build_skill_catalog(available_skills, manifests), indent=2, default=str)
+    template_path = (
+        SUPERVISOR_REFLECTION_PROMPT_PATH if mode == "reflection" else SUPERVISOR_PLAN_REPAIR_PROMPT_PATH
+    )
+    template = _load_prompt_template(
+        template_path,
+        """
+You must repair the supervisor plan using only the allowed skills.
+
+QUESTION:
+{{USER_QUESTION}}
+
+ALLOWED SKILLS:
+{{SKILL_CATALOG_JSON}}
+
+CURRENT RESULTS:
+{{CURRENT_RESULTS}}
+
+QUESTION GROUNDING:
+{{QUESTION_GROUNDING}}
+
+PREVIOUS EVALUATION:
+{{PREVIOUS_EVALUATION}}
+
+PREVIOUS TRACE:
+{{PREVIOUS_TRACE}}
+
+INVALID OR UNAVAILABLE SKILLS:
+{{INVALID_SKILLS}}
+
+PROPOSED SKILLS:
+{{PROPOSED_SKILLS}}
+
+PROPOSED PARAMETERS:
+{{PROPOSED_PARAMETERS}}
+
+FAILURE REASON:
+{{FAILURE_REASON}}
+
+Return strict JSON with reasoning, skills, and parameters. Every skill must be chosen from ALLOWED SKILLS.
+""",
+    )
+    prompt = _render_prompt(
+        template,
+        {
+            "USER_QUESTION": user_question,
+            "SKILL_CATALOG_JSON": catalog_json,
+            "CURRENT_RESULTS": json.dumps(current_results or {}, indent=2, default=str)[:6000],
+            "QUESTION_GROUNDING": json.dumps(question_grounding or {}, indent=2, default=str),
+            "PREVIOUS_EVALUATION": json.dumps(previous_eval or {}, indent=2, default=str),
+            "PREVIOUS_TRACE": json.dumps(previous_trace or [], indent=2, default=str)[:5000],
+            "INVALID_SKILLS": json.dumps(invalid_skills or [], default=str),
+            "PROPOSED_SKILLS": json.dumps(proposed_skills or [], default=str),
+            "PROPOSED_PARAMETERS": json.dumps(proposed_parameters or {}, default=str),
+            "FAILURE_REASON": failure_reason,
+        },
+    )
+
+    response = llm.chat([
+        {"role": "system", "content": instruction},
+        {"role": "user", "content": prompt},
+    ])
+    parsed = _parse_json_object(response) or {}
+    if not isinstance(parsed.get("skills"), list):
+        parsed["skills"] = []
+    if not isinstance(parsed.get("parameters"), dict):
+        parsed["parameters"] = {}
+    if not isinstance(parsed.get("reasoning"), str):
+        parsed["reasoning"] = "Supervisor repaired the plan against the loaded skill inventory"
+    if not parsed["parameters"].get("question"):
+        parsed["parameters"]["question"] = user_question
+    return parsed
+
+
+def _review_supervisor_plan_with_llm(
+    *,
+    user_question: str,
+    available_skills: list[dict],
+    manifests: dict[str, dict[str, Any]],
+    llm: Any,
+    instruction: str,
+    current_results: dict | None,
+    previous_eval: dict | None,
+    previous_trace: list[dict] | None,
+    question_grounding: dict[str, Any] | None,
+    proposed_skills: list[str] | None,
+    proposed_parameters: dict | None,
+    proposed_reasoning: str,
+) -> dict:
+    catalog_json = json.dumps(_build_skill_catalog(available_skills, manifests), indent=2, default=str)
+    template = _load_prompt_template(
+        SUPERVISOR_PLAN_REVIEW_PROMPT_PATH,
+        """
+Review whether this proposed next supervisor step is the best grounded immediate action.
+
+QUESTION:
+{{USER_QUESTION}}
+
+ALLOWED SKILLS:
+{{SKILL_CATALOG_JSON}}
+
+CURRENT RESULTS:
+{{CURRENT_RESULTS}}
+
+QUESTION GROUNDING:
+{{QUESTION_GROUNDING}}
+
+PREVIOUS EVALUATION:
+{{PREVIOUS_EVALUATION}}
+
+PREVIOUS TRACE:
+{{PREVIOUS_TRACE}}
+
+PROPOSED REASONING:
+{{PROPOSED_REASONING}}
+
+PROPOSED SKILLS:
+{{PROPOSED_SKILLS}}
+
+PROPOSED PARAMETERS:
+{{PROPOSED_PARAMETERS}}
+
+Return strict JSON:
+{
+  "is_valid": true,
+  "should_execute": true,
+  "confidence": 0.0,
+  "reasoning": "why this immediate next step is or is not grounded",
+  "issue": "specific problem if invalid",
+  "suggestion": "how the immediate next step should change"
+}
+""",
+    )
+    prompt = _render_prompt(
+        template,
+        {
+            "USER_QUESTION": user_question,
+            "SKILL_CATALOG_JSON": catalog_json,
+            "CURRENT_RESULTS": json.dumps(current_results or {}, indent=2, default=str)[:6000],
+            "QUESTION_GROUNDING": json.dumps(question_grounding or {}, indent=2, default=str),
+            "PREVIOUS_EVALUATION": json.dumps(previous_eval or {}, indent=2, default=str),
+            "PREVIOUS_TRACE": json.dumps(previous_trace or [], indent=2, default=str)[:5000],
+            "PROPOSED_REASONING": proposed_reasoning,
+            "PROPOSED_SKILLS": json.dumps(proposed_skills or [], default=str),
+            "PROPOSED_PARAMETERS": json.dumps(proposed_parameters or {}, default=str),
+        },
+    )
+
+    response = llm.chat([
+        {"role": "system", "content": instruction},
+        {"role": "user", "content": prompt},
+    ])
+    parsed = _parse_json_object(response) or {}
+    return {
+        "is_valid": bool(parsed.get("is_valid", True)),
+        "should_execute": bool(parsed.get("should_execute", parsed.get("is_valid", True))),
+        "confidence": float(parsed.get("confidence", 0.0) or 0.0),
+        "has_confidence": "confidence" in parsed,
+        "reasoning": str(parsed.get("reasoning") or ""),
+        "issue": str(parsed.get("issue") or ""),
+        "suggestion": str(parsed.get("suggestion") or ""),
+    }
+
+
+def _review_and_refine_supervisor_plan(
+    *,
+    decision: dict,
+    user_question: str,
+    available_skills: list[dict],
+    manifests: dict[str, dict[str, Any]],
+    llm: Any,
+    instruction: str,
+    current_results: dict | None,
+    previous_eval: dict | None,
+    previous_trace: list[dict] | None,
+    max_rounds: int = 2,
+    min_execute_confidence: float = 0.6,
+) -> dict:
+    reviewed = dict(decision or {})
+    question_grounding = _ground_supervisor_question_with_llm(user_question, llm, instruction)
+    planner_trace = {
+        "question_grounding": question_grounding,
+        "initial_candidate": {
+            "skills": list(reviewed.get("skills") or []),
+            "parameters": dict(reviewed.get("parameters") or {}),
+            "reasoning": str(reviewed.get("reasoning") or ""),
+        },
+        "reviews": [],
+    }
+    for review_round in range(max_rounds):
+        proposed_skill_names = list(reviewed.get("skills") or [])
+        disallowed_groups = {
+            str(group).strip()
+            for group in (question_grounding.get("disallowed_routing_groups") or [])
+            if str(group).strip()
+        }
+        if disallowed_groups:
+            conflicting_skills = [
+                skill_name
+                for skill_name in proposed_skill_names
+                if str((manifests.get(skill_name) or {}).get("routing_group") or "").strip() in disallowed_groups
+            ]
+            if conflicting_skills:
+                planner_trace["reviews"].append(
+                    {
+                        "round": review_round + 1,
+                        "stage": "grounding_group_rejection",
+                        "proposed_skills": proposed_skill_names,
+                        "issue": (
+                            "The proposed skill plan selects routing groups explicitly disallowed by question grounding: "
+                            + ", ".join(disallowed_groups)
+                        ),
+                    }
+                )
+                repaired = _repair_plan_with_llm(
+                    user_question=user_question,
+                    available_skills=available_skills,
+                    manifests=manifests,
+                    llm=llm,
+                    instruction=instruction,
+                    current_results=current_results,
+                    previous_eval=previous_eval,
+                    previous_trace=previous_trace,
+                    question_grounding=question_grounding,
+                    invalid_skills=conflicting_skills,
+                    proposed_skills=proposed_skill_names,
+                    proposed_parameters=dict(reviewed.get("parameters") or {}),
+                    mode="next_action",
+                    failure_reason=(
+                        "The proposed skill plan selects routing groups explicitly disallowed by question grounding: "
+                        + ", ".join(disallowed_groups)
+                    ),
+                )
+                reviewed = _ensure_viable_plan(
+                    decision={
+                        "reasoning": str(repaired.get("reasoning") or reviewed.get("reasoning") or ""),
+                        "skills": list(repaired.get("skills") or []),
+                        "parameters": dict(repaired.get("parameters") or {"question": user_question}),
+                    },
+                    user_question=user_question,
+                    available_skills=available_skills,
+                    manifests=manifests,
+                    llm=llm,
+                    instruction=instruction,
+                    current_results=current_results,
+                    previous_eval=previous_eval,
+                    previous_trace=previous_trace,
+                    mode="next_action",
+                    failure_reason="Question grounding rejected the proposed routing group.",
+                )
+                continue
+
+        review = _review_supervisor_plan_with_llm(
+            user_question=user_question,
+            available_skills=available_skills,
+            manifests=manifests,
+            llm=llm,
+            instruction=instruction,
+            current_results=current_results,
+            previous_eval=previous_eval,
+            previous_trace=previous_trace,
+            question_grounding=question_grounding,
+            proposed_skills=list(reviewed.get("skills") or []),
+            proposed_parameters=dict(reviewed.get("parameters") or {}),
+            proposed_reasoning=str(reviewed.get("reasoning") or ""),
+        )
+        logger.info(
+            "[%s] Supervisor plan review round %d: valid=%s execute=%s confidence=%.1f%% issue=%s reasoning=%s",
+            SKILL_NAME,
+            review_round + 1,
+            review["is_valid"],
+            review["should_execute"],
+            review["confidence"] * 100,
+            str(review.get("issue") or "")[:160],
+            str(review.get("reasoning") or "")[:220],
+        )
+        planner_trace["reviews"].append(
+            {
+                "round": review_round + 1,
+                "stage": "plan_review",
+                "proposed_skills": proposed_skill_names,
+                "valid": bool(review["is_valid"]),
+                "should_execute": bool(review["should_execute"]),
+                "confidence": float(review.get("confidence", 0.0) or 0.0),
+                "reasoning": str(review.get("reasoning") or ""),
+                "issue": str(review.get("issue") or ""),
+                "suggestion": str(review.get("suggestion") or ""),
+            }
+        )
+        should_execute = bool(review["should_execute"])
+        review_confidence = float(review.get("confidence", 0.0) or 0.0)
+        confidence_provided = bool(review.get("has_confidence", False))
+        confidence_sufficient = (review_confidence >= min_execute_confidence) if confidence_provided else True
+        if review["is_valid"] and should_execute and confidence_sufficient:
+            reviewed["planner_trace"] = planner_trace | {
+                "final_plan": {
+                    "skills": list(reviewed.get("skills") or []),
+                    "parameters": dict(reviewed.get("parameters") or {}),
+                    "reasoning": str(reviewed.get("reasoning") or ""),
+                }
+            }
+            return reviewed
+
+        repaired = _repair_plan_with_llm(
+            user_question=user_question,
+            available_skills=available_skills,
+            manifests=manifests,
+            llm=llm,
+            instruction=instruction,
+            current_results=current_results,
+            previous_eval=previous_eval,
+            previous_trace=previous_trace,
+            question_grounding=question_grounding,
+            invalid_skills=[],
+            proposed_skills=list(reviewed.get("skills") or []),
+            proposed_parameters=dict(reviewed.get("parameters") or {}),
+            mode="next_action",
+            failure_reason=(
+                review.get("issue")
+                or review.get("suggestion")
+                or (
+                    "Plan review confidence was too low to execute safely. "
+                    + (review.get("reasoning") or "")
+                    if confidence_provided and review_confidence < min_execute_confidence
+                    else review.get("reasoning")
+                )
+                or "Plan review rejected the immediate next step."
+            ),
+        )
+        reviewed = _ensure_viable_plan(
+            decision={
+                "reasoning": str(repaired.get("reasoning") or reviewed.get("reasoning") or ""),
+                "skills": list(repaired.get("skills") or []),
+                "parameters": dict(repaired.get("parameters") or {"question": user_question}),
+            },
+            user_question=user_question,
+            available_skills=available_skills,
+            manifests=manifests,
+            llm=llm,
+            instruction=instruction,
+            current_results=current_results,
+            previous_eval=previous_eval,
+            previous_trace=previous_trace,
+            mode="next_action",
+            failure_reason=review.get("issue") or "Plan review requested a more grounded next step.",
+        )
+    reviewed["planner_trace"] = planner_trace | {
+        "final_plan": {
+            "skills": list(reviewed.get("skills") or []),
+            "parameters": dict(reviewed.get("parameters") or {}),
+            "reasoning": str(reviewed.get("reasoning") or ""),
+        }
+    }
+    return reviewed
+
+
+def _ensure_viable_plan(
+    *,
+    decision: dict,
+    user_question: str,
+    available_skills: list[dict],
+    manifests: dict[str, dict[str, Any]],
+    llm: Any,
+    instruction: str,
+    current_results: dict | None,
+    previous_eval: dict | None,
+    previous_trace: list[dict] | None,
+    mode: str,
+    failure_reason: str = "",
+) -> dict:
+    proposed_skills = list(decision.get("skills") or [])
+    proposed_parameters = dict(decision.get("parameters") or {})
+    plan_question = str(proposed_parameters.get("question") or user_question)
+    grounded_skills, dropped_skills = _ground_selected_skills(
+        proposed_skills,
+        plan_question,
+        available_skills,
+        manifests,
+        current_results,
+    )
+
+    if grounded_skills:
+        if dropped_skills:
+            logger.info(
+                "[%s] Dropped unavailable skills from %s plan: %s",
+                SKILL_NAME,
+                mode,
+                dropped_skills,
+            )
+        decision["skills"] = grounded_skills
+        decision["parameters"] = proposed_parameters or {"question": user_question}
+        if not decision["parameters"].get("question"):
+            decision["parameters"]["question"] = user_question
+        return decision
+
+    if not proposed_skills and mode == "next_action":
+        decision["skills"] = []
+        decision["parameters"] = proposed_parameters or {"question": user_question}
+        return decision
+
+    repaired = _repair_plan_with_llm(
+        user_question=plan_question,
+        available_skills=available_skills,
+        manifests=manifests,
+        llm=llm,
+        instruction=instruction,
+        current_results=current_results,
+        previous_eval=previous_eval,
+        previous_trace=previous_trace,
+        invalid_skills=dropped_skills,
+        proposed_skills=proposed_skills,
+        proposed_parameters=proposed_parameters,
+        mode=mode,
+        failure_reason=failure_reason,
+    )
+    repaired_skills, repaired_dropped = _ground_selected_skills(
+        repaired.get("skills", []),
+        str((repaired.get("parameters") or {}).get("question") or plan_question),
+        available_skills,
+        manifests,
+        current_results,
+    )
+
+    if repaired_dropped:
+        logger.warning(
+            "[%s] Repaired %s plan still referenced unavailable skills: %s",
+            SKILL_NAME,
+            mode,
+            repaired_dropped,
+        )
+
+    decision["skills"] = repaired_skills
+    decision["parameters"] = dict(repaired.get("parameters") or {"question": user_question})
+    if not decision["parameters"].get("question"):
+        decision["parameters"]["question"] = user_question
+    decision["reasoning"] = str(repaired.get("reasoning") or decision.get("reasoning") or "")
+    return decision
+
+
+def _reflect_on_failure_and_correct(
+    user_question: str,
+    last_eval: dict,
+    previous_results: dict,
+    last_plan: list[str],
+    last_parameters: dict,
+    available_skills: list[dict],
+    manifests: dict[str, dict[str, Any]],
+    llm: Any,
+    instruction: str,
+    previous_trace: list[dict] | None = None,
+) -> tuple[list[str], dict, str]:
+    """
+    When a skill fails (returns not_satisfied), reflect deeply on what went wrong
+    and ask the LLM to suggest corrected approaches with ALTERNATIVE strategies.
+    
+    Following LangGraph best practices: enable iterative refinement, not early termination.
+    The LLM should think through multiple approaches and try different combinations.
+    
+    Returns: (corrected_skills, new_parameters, reflection_reasoning)
+    """
+    if not last_plan or not last_eval or last_eval.get("satisfied"):
+        return last_plan, last_parameters, ""
+    
+    try:
+        correction = _repair_plan_with_llm(
+            user_question=user_question,
+            available_skills=available_skills,
+            manifests=manifests,
+            llm=llm,
+            instruction=instruction,
+            current_results=previous_results,
+            previous_eval=last_eval,
+            previous_trace=previous_trace,
+            invalid_skills=[],
+            proposed_skills=last_plan,
+            proposed_parameters=last_parameters,
+            mode="reflection",
+            failure_reason=str(last_eval.get("reasoning") or "previous execution did not satisfy the question"),
+        )
+        corrected_skills, dropped_skills = _ground_selected_skills(
+            correction.get("skills", []),
+            user_question,
+            available_skills,
+            manifests,
+            previous_results,
+        )
+        corrected_params = dict(correction.get("parameters") or last_parameters or {})
+        reasoning = str(correction.get("reasoning") or "Deep failure reflection and course correction")
+
+        if corrected_skills:
+            if corrected_skills == last_plan and corrected_params == last_parameters:
+                corrected_params = dict(corrected_params)
+                corrected_params["question"] = corrected_params.get("question") or user_question
+                corrected_params["reflection_retry"] = True
+
+            if dropped_skills:
+                logger.warning(
+                    "[%s] Reflection proposed unavailable skills and they were dropped: %s",
+                    SKILL_NAME,
+                    dropped_skills,
+                )
+
+            logger.info(
+                "[%s] Iterative correction: %s → %s",
+                SKILL_NAME,
+                last_plan,
+                corrected_skills,
+            )
+            return corrected_skills, corrected_params, reasoning
+    except Exception as e:
+        logger.warning("[%s] Failure reflection failed: %s", SKILL_NAME, e)
+    
+    return last_plan, last_parameters, ""
 
 
 def _plan_signature(skills: list[str], parameters: dict | None) -> str:
@@ -125,43 +1058,7 @@ def _plan_signature(skills: list[str], parameters: dict | None) -> str:
     return json.dumps(payload, sort_keys=True)
 
 
-def _strip_unrequested_threat_intel(
-    user_question: str,
-    selected_skills: list[str],
-    available_skills: list[dict],
-) -> list[str]:
-    """Remove threat_analyst unless the user explicitly asked for threat or reputation analysis."""
-    available = {s.get("name") for s in available_skills}
-    if "threat_analyst" not in available or "threat_analyst" not in selected_skills:
-        return selected_skills
-    if _question_asks_for_reputation(user_question):
-        return selected_skills
-    filtered = [skill for skill in selected_skills if skill != "threat_analyst"]
-    if filtered != selected_skills:
-        logger.info(
-            "[%s] Removed threat_analyst because the question did not ask for reputation or threat analysis",
-            SKILL_NAME,
-        )
-    return filtered
 
-
-def _question_excludes_private_ips(user_question: str) -> bool:
-    question_lower = user_question.lower()
-    return any(
-        term in question_lower
-        for term in [
-            "aside from the private ip",
-            "aside from private ip",
-            "excluding private ip",
-            "exclude private ip",
-            "except private ip",
-            "other than private ip",
-            "non-private ip",
-            "public ip",
-            "private ips",
-            "internal ips",
-        ]
-    )
 
 
 def _question_has_explicit_entities(user_question: str) -> bool:
@@ -199,6 +1096,22 @@ def route_question(
       - skills: List of skill names to invoke (can be multiple for workflows)
       - parameters: Parameters to pass to skills (includes the question)
     """
+    all_manifests: dict[str, dict[str, Any]] = {}
+    try:
+        loader = SkillManifestLoader()
+        all_manifests = loader.load_all_manifests()
+    except Exception as e:
+        logger.warning("[%s] Manifest loading failed during initial routing: %s", SKILL_NAME, e)
+
+    direct_threat_plan = _build_direct_threat_intel_plan(
+        user_question,
+        available_skills,
+        all_manifests,
+        conversation_history,
+    )
+    if direct_threat_plan:
+        return direct_threat_plan
+
     skills_description = "\n".join([
         f"- {s['name']}: {s['description']}"
         for s in available_skills
@@ -246,8 +1159,16 @@ Return a strict JSON object with reasoning, skills, and parameters.question.
 
     response = llm.chat(messages)
     
+    # Try to clean up the response by removing markdown code block markers
+    cleaned_response = response
+    if response.strip().startswith("```"):
+        # Remove markdown code block markers
+        cleaned_response = re.sub(r"^```(?:json)?\s*", "", response, flags=re.MULTILINE)
+        cleaned_response = re.sub(r"\s*```$", "", cleaned_response, flags=re.MULTILINE)
+        cleaned_response = cleaned_response.strip()
+    
     try:
-        result = json.loads(response)
+        result = json.loads(cleaned_response)
         # Ensure parameters has the question
         if "parameters" not in result:
             result["parameters"] = {}
@@ -271,74 +1192,75 @@ Return a strict JSON object with reasoning, skills, and parameters.question.
                 result["parameters"]["conversation_history"] = conversation_history
             return result
 
-        # PREVENTION: Remove geoip_lookup if it's the first/only skill and no specific IPs are in the question
-        skills = result.get("skills", [])
-        if skills and skills[0] == "geoip_lookup" and not _contains_specific_ip(user_question):
-            logger.warning(
-                "[%s] Removing geoip_lookup as first skill because question doesn't mention specific IPs: %s",
-                SKILL_NAME,
-                user_question,
-            )
-            skills = [s for s in skills if s != "geoip_lookup"]
-            result["skills"] = skills
-        result["skills"] = skills
+        result["skills"] = result.get("skills", [])
 
-        # Enforce explicit forensic intent routing before generic filtering.
-        result["skills"] = _apply_forensic_intent_override(
-            user_question=user_question,
-            selected_skills=result.get("skills", []),
-            available_skills=available_skills,
-        )
-        
-        # Prepend field discovery when asking about specific data types (alerts, signatures, etc.)
-        result["skills"] = _prepend_field_discovery_for_data_types(
+        result["skills"] = _postprocess_selected_skills(
             user_question=user_question,
             selected_skills=result.get("skills", []),
             available_skills=available_skills,
             current_results={},
+            manifests=all_manifests,
         )
-        result["skills"] = _prefer_field_discovery_for_natural_language_search(
-            user_question=user_question,
-            selected_skills=result.get("skills", []),
-            available_skills=available_skills,
-            current_results={},
-        )
-        result["skills"] = _enforce_evidence_then_threat_intel(
-            user_question=user_question,
-            selected_skills=result.get("skills", []),
-            available_skills=available_skills,
-        )
-        result["skills"] = _strip_unrequested_threat_intel(
-            user_question=user_question,
-            selected_skills=result.get("skills", []),
-            available_skills=available_skills,
-        )
-        
-        # Include conversation history in parameters for skills that need context
+
+        selected_skills = list(result.get("skills", []))
+        if "fields_querier" in selected_skills and "opensearch_querier" in selected_skills:
+            result["parameters"]["question"] = user_question
+        elif "opensearch_querier" in selected_skills:
+            result["parameters"]["question"] = result["parameters"].get("question") or user_question
+
+        # Include conversation history in parameters if provided
         if conversation_history:
             result["parameters"]["conversation_history"] = conversation_history
-        
-        # Filter out network_baseliner if not explicitly requested
-        result["skills"] = _filter_explicit_only_skills(
-            result.get("skills", []),
-            user_question,
-        )
 
-        if "opensearch_querier" in result.get("skills", []):
-            result["parameters"]["question"] = user_question
+        result = _ensure_viable_plan(
+            decision=result,
+            user_question=user_question,
+            available_skills=available_skills,
+            manifests=all_manifests,
+            llm=llm,
+            instruction=instruction,
+            current_results={},
+            previous_eval={},
+            previous_trace=[],
+            mode="next_action",
+            failure_reason="Initial routing must choose only loaded skills and manifest-declared prerequisites.",
+        )
 
         return result
     except json.JSONDecodeError:
-        logger.warning("[%s] Failed to parse LLM routing response: %s", SKILL_NAME, response)
+        logger.warning("[%s] Failed to parse LLM routing response: %s", SKILL_NAME, cleaned_response[:200])
         # Fallback: try to extract JSON from response
         try:
-            match = re.search(r"\{.*\}", response, re.DOTALL)
+            match = re.search(r"\{.*\}", cleaned_response, re.DOTALL)
             if match:
                 result = json.loads(match.group(0))
                 if "parameters" not in result:
                     result["parameters"] = {}
                 if not result["parameters"].get("question"):
                     result["parameters"]["question"] = user_question
+                
+                result["skills"] = _postprocess_selected_skills(
+                    user_question=user_question,
+                    selected_skills=result.get("skills", []),
+                    available_skills=available_skills,
+                    current_results={},
+                    manifests=all_manifests,
+                )
+
+                result = _ensure_viable_plan(
+                    decision=result,
+                    user_question=user_question,
+                    available_skills=available_skills,
+                    manifests=all_manifests,
+                    llm=llm,
+                    instruction=instruction,
+                    current_results={},
+                    previous_eval={},
+                    previous_trace=[],
+                    mode="next_action",
+                    failure_reason="Fallback routing must still stay within the loaded skill inventory.",
+                )
+                
                 return result
         except:
             pass
@@ -351,338 +1273,25 @@ Return a strict JSON object with reasoning, skills, and parameters.question.
         }
 
 
-def _prepend_field_discovery_for_data_types(
+def _postprocess_selected_skills(
     user_question: str,
     selected_skills: list[str],
     available_skills: list[dict],
     current_results: dict | None = None,
+    manifests: dict[str, dict[str, Any]] | None = None,
 ) -> list[str]:
-    """Prepend fields_querier when asking about specific data types (alerts, events, signatures, etc.).
-
-    Behavior:
-    - Question mentions "alerts", "signatures", "events" → prepend fields_querier
-    - This ensures we discover which fields hold that data before querying
-    - Avoids malformed queries like searching "ET EXPLOIT" across wrong field types
-    """
-    available = {s.get("name") for s in available_skills}
-    if "fields_querier" not in available:
-        return selected_skills
-
-    question_lower = user_question.lower().strip()
+    """Apply shared routing post-processing across initial and supervisor flows."""
     current_results = current_results or {}
-    
-    # Keywords indicating query is about a specific data type
-    data_type_keywords = [
-        "alerts", "alert", "signature", "signatures", "et rules", "et exploit",
-        "suricata", "snort", "rule", "rules", "events", "event type",
-        "protocol mismatch", "dns queries", "tls certificates", "http requests",
-    ]
-    search_intent_keywords = [
-        "show me", "show", "find", "list", "any", "how many", "search",
-        "check", "check for", "look for", "get", "pull", "display",
-        "which ip", "what ip", "their ip", "their ips", "source ip", "destination ip",
-    ]
-    field_schema_only_keywords = [
-        "what fields", "which field", "field name", "field names", "schema",
-        "available fields", "what field holds", "which field stores",
-    ]
-    
-    asks_about_data_type = any(kw in question_lower for kw in data_type_keywords)
-    asks_for_search = any(kw in question_lower for kw in search_intent_keywords)
-    asks_only_for_schema = any(kw in question_lower for kw in field_schema_only_keywords)
-    fields_result = current_results.get("fields_querier") or {}
-    field_discovery_already_done = bool(
-        isinstance(fields_result, dict)
-        and (
-            fields_result.get("field_mappings")
-            or (fields_result.get("findings") or {}).get("field_mappings")
-        )
+    selected_skills = _apply_result_aware_recovery(
+        user_question=user_question,
+        selected_skills=selected_skills,
+        available_skills=available_skills,
+        current_results=current_results,
+        manifests=manifests,
     )
-
-    if asks_about_data_type:
-        if asks_only_for_schema:
-            return ["fields_querier"] + [s for s in selected_skills if s != "fields_querier"]
-
-        if field_discovery_already_done and "opensearch_querier" in available:
-            logger.info(
-                "[%s] Field discovery already available for data-type question — promoting opensearch_querier",
-                SKILL_NAME,
-            )
-            ordered = [s for s in selected_skills if s not in {"fields_querier", "opensearch_querier"}]
-            return ["opensearch_querier"] + ordered
-
-        # First discover what fields hold this data, then search
-        logger.info(
-            "[%s] Question asks about specific data type — prepending fields_querier for field discovery",
-            SKILL_NAME,
-        )
-        # Remove opensearch_querier if it was auto-selected, we'll add it after fields_querier
-        filtered = [s for s in selected_skills if s != "opensearch_querier"]
-        # Prepend fields_querier only once
-        ordered = ["fields_querier"] + [s for s in filtered if s != "fields_querier"]
-        # If we removed opensearch_querier, add it back after fields_querier
-        if "opensearch_querier" in available and "opensearch_querier" not in ordered and asks_for_search:
-            ordered.append("opensearch_querier")
-        return ordered
-
     return selected_skills
 
 
-def _prefer_field_discovery_for_natural_language_search(
-    user_question: str,
-    selected_skills: list[str],
-    available_skills: list[dict],
-    current_results: dict | None = None,
-) -> list[str]:
-    """Prepend fields_querier for natural-language searches unless explicit fields are named."""
-    available = {s.get("name") for s in available_skills}
-    if "fields_querier" not in available or "opensearch_querier" not in available:
-        return selected_skills
-
-    question_lower = user_question.lower().strip()
-    current_results = current_results or {}
-
-    asks_for_log_search = bool(
-        re.search(r"\b(traffic|flow|flows|connection|connections|log|logs|event|events|port|ports|protocol|country|countries|ip|ips|host|hosts)\b", question_lower)
-        and re.search(r"\b(show|find|search|check|list|get|what|which|when|who|where|display|pull|visited|visit|seen|look for)\b", question_lower)
-    )
-    explicit_field_reference = bool(
-        re.search(r"(?:^|\s)(@timestamp|[a-z_][a-z0-9_]*\.[a-z0-9_.]+)(?:\s|$|=|:)", user_question)
-        or re.search(
-            r"\b(src_ip|dest_ip|source_ip|destination_ip|src_port|dst_port|dest_port|destination_port|source\.ip|destination\.ip|destination\.port|geoip\.[a-z0-9_.]+|alert\.[a-z0-9_.]+)\b",
-            question_lower,
-        )
-    )
-
-    fields_result = current_results.get("fields_querier") or {}
-    field_discovery_already_done = bool(
-        isinstance(fields_result, dict)
-        and (
-            fields_result.get("field_mappings")
-            or (fields_result.get("findings") or {}).get("field_mappings")
-        )
-    )
-
-    if not asks_for_log_search or explicit_field_reference:
-        return selected_skills
-
-    if field_discovery_already_done:
-        ordered = [s for s in selected_skills if s != "fields_querier"]
-        if "opensearch_querier" not in ordered:
-            ordered.insert(0, "opensearch_querier")
-        return ordered
-
-    logger.info(
-        "[%s] Natural-language log search detected — prepending fields_querier before opensearch_querier",
-        SKILL_NAME,
-    )
-    ordered = ["fields_querier"] + [s for s in selected_skills if s not in {"fields_querier", "opensearch_querier"}]
-    ordered.insert(1, "opensearch_querier")
-    return ordered
-
-
-def _enforce_evidence_then_threat_intel(
-    user_question: str,
-    selected_skills: list[str],
-    available_skills: list[dict],
-    current_results: dict | None = None,
-) -> list[str]:
-    """Force evidence gathering before threat intel for concrete alert-detail questions."""
-    available = {s.get("name") for s in available_skills}
-    if "opensearch_querier" not in available:
-        return selected_skills
-
-    question_lower = user_question.lower().strip()
-    current_results = current_results or {}
-
-    asks_for_threat = any(
-        term in question_lower
-        for term in ["threat intel", "threat intelligence", "reputation", "risk", "malicious"]
-    )
-    asks_for_concrete_alert_details = any(
-        term in question_lower
-        for term in [
-            "what ip", "which ip", "source ip", "destination ip", "src ip", "dst ip",
-            "when did", "timestamp", "time did", "what time", "when was",
-            "this alert", "that alert", "alert happen", "alert occurred",
-        ]
-    )
-    mentions_alert_entity = any(
-        term in question_lower
-        for term in ["alert", "signature", "et ", "suricata", "snort", "rule"]
-    )
-
-    if not ((asks_for_concrete_alert_details and mentions_alert_entity) or (asks_for_threat and asks_for_concrete_alert_details)):
-        return selected_skills
-
-    ordered: list[str] = []
-    if "fields_querier" in selected_skills:
-        ordered.append("fields_querier")
-
-    opensearch_already_has_results = bool(
-        isinstance(current_results.get("opensearch_querier"), dict)
-        and (
-            current_results["opensearch_querier"].get("results_count")
-            or current_results["opensearch_querier"].get("results")
-        )
-    )
-    if not opensearch_already_has_results:
-        ordered.append("opensearch_querier")
-
-    for skill in selected_skills:
-        if skill not in ordered and skill != "opensearch_querier":
-            ordered.append(skill)
-
-    if asks_for_threat and "threat_analyst" in available and "threat_analyst" not in ordered:
-        ordered.append("threat_analyst")
-
-    if ordered != selected_skills:
-        logger.info(
-            "[%s] Enforced evidence-first routing for detailed alert/threat follow-up: %s -> %s",
-            SKILL_NAME,
-            selected_skills,
-            ordered,
-        )
-
-    return ordered
-
-
-def _apply_forensic_intent_override(
-    user_question: str,
-    selected_skills: list[str],
-    available_skills: list[dict],
-) -> list[str]:
-    """Prioritize forensic_examiner for explicit forensic/timeline intent.
-
-    Behavior:
-    - Explicit forensic wording + no concrete search filters -> forensic_examiner only
-    - Explicit forensic wording + concrete traffic/log filters -> opensearch_querier then forensic_examiner
-    - Otherwise keep model-selected skills unchanged
-    """
-    available = {s.get("name") for s in available_skills}
-    if "forensic_examiner" not in available:
-        return selected_skills
-
-    question_lower = user_question.lower().strip()
-    forensic_intent = any(
-        phrase in question_lower
-        for phrase in [
-            "forensic",
-            "timeline",
-            "incident reconstruction",
-            "reconstruct",
-            "investigate incident",
-            "forensic analysis",
-        ]
-    ) or bool(re.search(r"\binvestigat(?:e|ion)\b", question_lower))
-
-    if not forensic_intent:
-        return selected_skills
-
-    has_search_filters = bool(
-        re.search(r"\b(traffic|flow|connection|log|logs|port|protocol|from|to|country|ip|domain)\b", question_lower)
-        or re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", question_lower)
-    )
-
-    if has_search_filters:
-        # Direct log search with filters → opensearch_querier (not baseline_querier)
-        ordered = ["opensearch_querier", "forensic_examiner"]
-        return [s for s in ordered if s in available]
-
-    return ["forensic_examiner"]
-
-
-def _contains_specific_ip(user_question: str) -> bool:
-    """
-    Check if the question mentions a specific IP address or hostname.
-    
-    Returns True if the question contains:
-    - IPv4 addresses (e.g., 8.8.8.8, 192.168.1.1)
-    - IPv6 addresses
-    - Domain names/hostnames
-    
-    Returns False for general location queries like "traffic from Russia".
-    """
-    question_lower = user_question.lower()
-    
-    # IP address patterns
-    ipv4_pattern = r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'
-    ipv6_pattern = r'(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}'
-    
-    # Check for IP addresses
-    if re.search(ipv4_pattern, question_lower):
-        return True
-    if re.search(ipv6_pattern, question_lower):
-        return True
-    
-    # Check for explicit hostname/domain mentions with context words
-    # (e.g., "hostname xxx.com" or "domain google.com")
-    if re.search(r'\b(?:hostname|domain|fqdn|host)\s+[\w\-\.]+', question_lower):
-        return True
-    
-    # Check for IP-related keywords suggesting specific IPs are being discussed
-    if re.search(r'\bgeolocate\s+\S+', question_lower) or re.search(r'\bwhere\s+is\s+\S+', question_lower):
-        return True
-    
-    return False
-
-
-def _filter_explicit_only_skills(skills: list[str], user_question: str) -> list[str]:
-    """
-    Filter out skills that are explicit-only or reserved for follow-up usage.
-
-    network_baseliner is explicit-only: user must say:
-      - "network_baseliner" / "baseliner" / "create baseline"
-
-    fields_baseliner is explicit-only: user must say:
-      - "fields_baseliner" / "scan fields" / "catalog fields"
-
-    baseline_querier is reserved for FOLLOW-UP ONLY: only route if:
-      - User explicitly asks "compare to baseline", "analyze baseline", "baseline analysis"
-      - Or supervisor explicitly requests it for follow-up research
-      For initial answering, use opensearch_querier instead.
-    """
-    filtered = []
-    question_lower = user_question.lower()
-
-    # Keywords that explicitly invoke network_baseliner
-    baseliner_keywords = [
-        "network_baseliner", "baseliner", "create baseline", "generate baseline",
-        "build baseline", "refresh baseline", "force_refresh", "create a baseline",
-        "generate a baseline", "build a baseline", "create new baseline", "generate new baseline",
-    ]
-    baseliner_requested = any(kw in question_lower for kw in baseliner_keywords)
-
-    # Keywords that explicitly invoke fields_baseliner
-    fields_baseliner_keywords = [
-        "fields_baseliner", "scan fields", "catalog fields", "index fields",
-        "refresh field schema", "update field schema", "rebuild field catalog",
-    ]
-    fields_baseliner_requested = any(kw in question_lower for kw in fields_baseliner_keywords)
-
-    # Keywords for baseline_querier follow-up research
-    baseline_research_keywords = [
-        "compare to baseline", "baseline comparison", "baseline analysis", "analyze baseline",
-        "research baseline", "baseline investigation", "what's normal", "normal behavior",
-    ]
-    baseline_research_requested = any(kw in question_lower for kw in baseline_research_keywords)
-
-    for skill in skills:
-        if skill == "network_baseliner" and not baseliner_requested:
-            logger.info("[%s] Blocked auto-routing to network_baseliner.", SKILL_NAME)
-            if "opensearch_querier" not in filtered:
-                filtered.append("opensearch_querier")
-        elif skill == "fields_baseliner" and not fields_baseliner_requested:
-            logger.info("[%s] Blocked auto-routing to fields_baseliner.", SKILL_NAME)
-        elif skill == "baseline_querier" and not baseline_research_requested:
-            # baseline_querier is for follow-up research only, not initial questions
-            logger.info("[%s] Blocked auto-routing to baseline_querier (follow-up only).", SKILL_NAME)
-            if "opensearch_querier" not in filtered:
-                filtered.append("opensearch_querier")
-        else:
-            filtered.append(skill)
-
-    return filtered
 
 
 def execute_skill_workflow(
@@ -711,6 +1320,14 @@ def execute_skill_workflow(
     params = routing_decision.get("parameters", {})
     aggregated_results = aggregated_results or {}
     
+    # Load skill manifests for enrichment and auto-chain dispatching
+    try:
+        loader = SkillManifestLoader()
+        all_manifests = loader.load_all_manifests()
+    except Exception as e:
+        logger.warning("[%s] Could not load manifests for enrichment: %s", SKILL_NAME, e)
+        all_manifests = {}
+    
     for skill_name in skills:
         logger.info("[%s] Executing skill: %s", SKILL_NAME, skill_name)
         
@@ -731,43 +1348,20 @@ def execute_skill_workflow(
             if combined_previous_results:
                 skill_context["previous_results"] = combined_previous_results
             
-            # ── SPECIAL HANDLING: Enrich threat_analyst question with discovered entities ──
-            if skill_name == "threat_analyst" and combined_previous_results:
-                original_q = skill_context["parameters"].get("question", "")
-                entities = _recover_threat_followup_entities(
-                    original_q,
-                    conversation_history,
-                    combined_previous_results,
-                )
-                if entities and (entities.get("ips") or entities.get("domains") or entities.get("countries")):
-                    enriched_q = _build_context_aware_threat_question(original_q, entities)
-                    skill_context["parameters"]["question"] = enriched_q
-                    logger.info("[%s] Enriched threat_analyst question with discovered entities", SKILL_NAME)
-            elif skill_name == "baseline_querier":
-                original_q = skill_context["parameters"].get("question", "")
-                entities = _recover_baseline_followup_entities(
-                    original_q,
-                    conversation_history,
-                    combined_previous_results,
-                )
-                enriched_q = _build_context_aware_baseline_question(
-                    original_q,
-                    entities,
-                    conversation_history,
-                )
-                if enriched_q != original_q:
-                    skill_context["parameters"]["question"] = enriched_q
-                    logger.info("[%s] Enriched baseline_querier question with follow-up context", SKILL_NAME)
-            elif skill_name == "threat_analyst" and conversation_history:
-                original_q = skill_context["parameters"].get("question", "")
-                entities = _recover_threat_followup_entities(
-                    original_q,
-                    conversation_history,
-                )
-                if entities:
-                    enriched_q = _build_context_aware_threat_question(original_q, entities)
-                    skill_context["parameters"]["question"] = enriched_q
-                    logger.info("[%s] Anchored threat_analyst to conversation-history entities", SKILL_NAME)
+            # ── MANIFEST-DRIVEN ENRICHMENT: Apply question enrichment hooks ──
+            manifest = all_manifests.get(skill_name, {})
+            if manifest.get("question_enrichment_hook"):
+                try:
+                    skill_context["parameters"] = apply_question_enrichment(
+                        skill_name=skill_name,
+                        manifest=manifest,
+                        parameters=skill_context["parameters"],
+                        conversation_history=conversation_history,
+                        previous_results=combined_previous_results,
+                    )
+                except Exception as enrich_exc:
+                    logger.warning("[%s] Question enrichment failed for %s: %s", SKILL_NAME, skill_name, enrich_exc)
+                    # Continue with original parameters if enrichment fails
             
             # Dispatch skill with context
             result = runner.dispatch(skill_name, context=skill_context)
@@ -775,39 +1369,34 @@ def execute_skill_workflow(
             logger.info("[%s] Skill %s completed with status: %s", 
                        SKILL_NAME, skill_name, result.get("status"))
 
-            # Auto-chain threat_analyst after forensic results to include reputation context.
-            if (
-                skill_name == "forensic_examiner"
-                and "threat_analyst" not in skills
-                and "threat_analyst" not in results
-                and result.get("status") == "ok"
-            ):
-                threat_question = _build_threat_followup_question(result)
-                if threat_question:
-                    try:
-                        logger.info("[%s] Auto-chaining skill: threat_analyst", SKILL_NAME)
-                        threat_context = runner._build_context()
-                        if memory is not None:
-                            threat_context["memory"] = memory
-                        threat_params = dict(params)
-                        threat_params["question"] = threat_question
-                        threat_context["parameters"] = threat_params
-                        if conversation_history:
-                            threat_context["conversation_history"] = conversation_history
-
-                        threat_result = runner.dispatch("threat_analyst", context=threat_context)
-                        results["threat_analyst"] = threat_result
-                        logger.info(
-                            "[%s] Skill threat_analyst completed with status: %s",
-                            SKILL_NAME,
-                            threat_result.get("status"),
-                        )
-                    except Exception as threat_exc:
-                        logger.error("[%s] Auto-chained threat_analyst failed: %s", SKILL_NAME, threat_exc)
-                        results["threat_analyst"] = {
-                            "status": "error",
-                            "error": str(threat_exc),
-                        }
+            # ── AUTO-CHAIN: Check if skill should auto-chain to successor ──
+            if result.get("status") == "ok":
+                try:
+                    auto_chain_skill, auto_chain_result = check_and_apply_auto_chain(
+                        last_skill_name=skill_name,
+                        last_skill_result=result,
+                        all_manifests=all_manifests,
+                        runner=runner,
+                        context=context,
+                        parameters=params,
+                        conversation_history=conversation_history,
+                        memory=memory,
+                    )
+                    
+                    if auto_chain_skill and auto_chain_result:
+                        # Check if auto-chained skill should not execute
+                        if (
+                            auto_chain_skill in skills
+                            or auto_chain_skill in results
+                        ):
+                            logger.info("[%s] Skipped auto-chain %s (already in execution plan)", SKILL_NAME, auto_chain_skill)
+                        else:
+                            results[auto_chain_skill] = auto_chain_result
+                            logger.info("[%s] Auto-chained %s completed successfully", SKILL_NAME, auto_chain_skill)
+                except Exception as auto_chain_exc:
+                    logger.warning("[%s] Auto-chain check failed: %s", SKILL_NAME, auto_chain_exc)
+                    # Continue even if auto-chain fails
+        
         except Exception as e:
             logger.error("[%s] Skill %s failed: %s", SKILL_NAME, skill_name, e)
             results[skill_name] = {
@@ -823,102 +1412,26 @@ def _apply_result_aware_recovery(
     selected_skills: list[str],
     available_skills: list[dict],
     current_results: dict | None = None,
+    manifests: dict[str, dict[str, Any]] | None = None,
 ) -> list[str]:
     """Promote recovery skills when prior results show unmet needs."""
     current_results = current_results or {}
-    available = {s.get("name") for s in available_skills}
-    ordered = list(selected_skills)
-    question_lower = user_question.lower()
-
-    os_result = current_results.get("opensearch_querier") or {}
-    os_issue = " ".join(
-        part for part in [
-            str(os_result.get("validation_issue", "")),
-            str((os_result.get("reasoning_chain") or {}).get("validation_issue", "")),
-            str((os_result.get("reasoning_chain") or {}).get("validation_reflection", "")),
-        ] if part
-    ).lower()
-    os_validation_failed = bool(os_result.get("validation_failed"))
-
-    asks_for_country = any(
-        token in question_lower
-        for token in ["country", "countries", "origin", "origins", "where from", "geolocation", "geoip"]
-    )
-    asks_for_reputation = any(
-        token in question_lower
-        for token in ["reputation", "threat intel", "threat intelligence", "risk", "malicious", "verdict", "score"]
-    )
-    missing_fields_or_schema = any(
-        token in os_issue
-        for token in [
-            "missing field",
-            "required fields",
-            "field information",
-            "country information",
-            "port information",
-            "do not contain the required fields",
-        ]
-    )
+    if manifests is None:
+        try:
+            manifests = SkillManifestLoader().load_all_manifests()
+        except Exception as exc:
+            logger.warning("[%s] Failed to load manifests for recovery policies: %s", SKILL_NAME, exc)
+            manifests = {}
 
     entities = _extract_entities_from_previous_results(current_results) if current_results else {}
-    has_ips = bool((entities or {}).get("ips"))
-    fields_result = current_results.get("fields_querier") or {}
-    fields_has_results = bool(
-        fields_result.get("field_mappings")
-        or (fields_result.get("findings") or {}).get("field_mappings")
+    return apply_manifest_recovery_policies(
+        selected_skills=selected_skills,
+        user_question=user_question,
+        available_skills=available_skills,
+        all_manifests=manifests,
+        current_results=current_results,
+        extracted_entities=entities,
     )
-    asks_for_log_search = bool(
-        _question_has_explicit_entities(user_question)
-        or (
-            re.search(r"\b(traffic|flow|flows|connection|connections|log|logs|event|events|port|ports|protocol|country|countries|ip|ips|host|hosts)\b", question_lower)
-            and re.search(r"\b(show|find|search|check|list|get|what|which|when|who|where|display|pull|visited|visit|seen|look for|from|to)\b", question_lower)
-        )
-    )
-
-    if os_validation_failed and missing_fields_or_schema:
-        if "fields_querier" in available and "fields_querier" not in current_results:
-            ordered = ["fields_querier"] + [s for s in ordered if s != "fields_querier"]
-            if "opensearch_querier" in available and "opensearch_querier" not in ordered:
-                ordered.append("opensearch_querier")
-            logger.info(
-                "[%s] Added fields_querier recovery after opensearch validation reported missing fields/schema",
-                SKILL_NAME,
-            )
-
-    if fields_has_results and asks_for_log_search and "opensearch_querier" in available and "opensearch_querier" not in current_results:
-        ordered = ["opensearch_querier"] + [s for s in ordered if s not in {"opensearch_querier", "fields_querier"}]
-        logger.info(
-            "[%s] Promoted opensearch_querier after field discovery so the supervisor advances from schema to evidence",
-            SKILL_NAME,
-        )
-
-    if asks_for_country and has_ips:
-        if "geoip_lookup" in available and "geoip_lookup" not in ordered and "geoip_lookup" not in current_results:
-            ordered.append("geoip_lookup")
-            logger.info(
-                "[%s] Added geoip_lookup recovery because countries were requested and IPs are available",
-                SKILL_NAME,
-            )
-
-    if asks_for_reputation:
-        threat_result = current_results.get("threat_analyst") or {}
-        has_threat_intel = threat_result.get("status") == "ok"
-        # Only auto-add threat_analyst as a recovery action when opensearch has already
-        # found records to enrich.  If opensearch hasn't run yet (or returned nothing),
-        # the supervisor's own plan should decide whether to run threat_analyst — we
-        # must not pre-emptively inject it into step 1 and collapse a two-step flow.
-        opensearch_has_results = bool(
-            isinstance(current_results.get("opensearch_querier"), dict)
-            and current_results["opensearch_querier"].get("results_count", 0)
-        )
-        if "threat_analyst" in available and not has_threat_intel and "threat_analyst" not in ordered and opensearch_has_results:
-            ordered.append("threat_analyst")
-
-    deduped: list[str] = []
-    for skill in ordered:
-        if skill and skill not in deduped:
-            deduped.append(skill)
-    return deduped
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -931,7 +1444,17 @@ def _graph_runtime(config: dict) -> dict:
 
 
 def decide_node(state: AgentState, config: RunnableConfig) -> dict:
-    """DECIDE: ask the supervisor which skill(s) to run next, apply guards."""
+    """
+    DECIDE: ask the supervisor which skill(s) to run next, apply guards, MANDATORY ITERATIVE REFINEMENT.
+    
+    Following LangGraph best practices: When a previous execution didn't satisfy the user,
+    we MUST force the LLM to think deeper and try different approaches.
+    The system should NOT give up on duplicates - it should iterate until either:
+    - The question is satisfied, OR
+    - Max steps are reached
+    
+    This prevents premature termination and enables proper agentic behavior.
+    """
     rt = _graph_runtime(config)
     available_skills = rt["available_skills"]
     llm = rt["llm"]
@@ -945,6 +1468,16 @@ def decide_node(state: AgentState, config: RunnableConfig) -> dict:
     last_eval: dict = state.get("evaluation") or {}
     trace: list = list(state.get("trace") or [])
 
+    # Check if previous execution left us not satisfied
+    was_not_satisfied = not last_eval.get("satisfied", False) and step_count > 1
+    loader = SkillManifestLoader()
+    try:
+        all_manifests = loader.load_all_manifests()
+    except Exception as e:
+        logger.warning("[%s] Failed to load manifests in decide_node: %s", SKILL_NAME, e)
+        all_manifests = {}
+    
+    # STEP 1: Get initial next action from supervisor
     decision = _supervisor_next_action(
         user_question=state["user_question"],
         available_skills=available_skills,
@@ -955,59 +1488,157 @@ def decide_node(state: AgentState, config: RunnableConfig) -> dict:
         current_results=aggregated_results,
         previous_eval=last_eval,
     )
+    effective_question = str(
+        (decision.get("parameters") or {}).get("question") or state["user_question"]
+    )
 
-    # Apply routing guards (same as in the original loop)
-    selected: list[str] = _apply_forensic_intent_override(
-        user_question=state["user_question"],
-        selected_skills=decision.get("skills", []),
-        available_skills=available_skills,
-    )
-    selected = _filter_explicit_only_skills(selected, state["user_question"])
-    selected = _enforce_evidence_then_threat_intel(
-        user_question=state["user_question"],
+    selected: list[str] = list(decision.get("skills", []))
+    selected = _postprocess_selected_skills(
+        user_question=effective_question,
         selected_skills=selected,
         available_skills=available_skills,
         current_results=aggregated_results,
-    )
-    selected = _apply_result_aware_recovery(
-        user_question=state["user_question"],
-        selected_skills=selected,
-        available_skills=available_skills,
-        current_results=aggregated_results,
+        manifests=all_manifests,
     )
     decision["skills"] = selected
+    decision = _ensure_viable_plan(
+        decision=decision,
+        user_question=state["user_question"],
+        available_skills=available_skills,
+        manifests=all_manifests,
+        llm=llm,
+        instruction=instruction,
+        current_results=aggregated_results,
+        previous_eval=last_eval,
+        previous_trace=trace,
+        mode="next_action",
+        failure_reason="Supervisor must choose a viable next step from the loaded manifests before execution.",
+    )
+    decision = _review_and_refine_supervisor_plan(
+        decision=decision,
+        user_question=state["user_question"],
+        available_skills=available_skills,
+        manifests=all_manifests,
+        llm=llm,
+        instruction=instruction,
+        current_results=aggregated_results,
+        previous_eval=last_eval,
+        previous_trace=trace,
+    )
+    if any(skill == "ip_fingerprinter" for skill in (decision.get("skills") or [])):
+        final_question = str((decision.get("parameters") or {}).get("question") or state["user_question"])
+        if not _question_has_explicit_entities(final_question):
+            fingerprint_entities = _recover_fingerprint_followup_entities(
+                state["user_question"],
+                list(state.get("messages") or []),
+                aggregated_results,
+            )
+            if fingerprint_entities.get("ips"):
+                anchored_question = _build_context_aware_fingerprint_question(
+                    state["user_question"],
+                    fingerprint_entities,
+                    list(state.get("messages") or []),
+                )
+                decision.setdefault("parameters", {})["question"] = anchored_question
+                decision["parameters"]["ip"] = fingerprint_entities["ips"][0]
+    selected = list(decision.get("skills") or [])
     current_parameters = dict(decision.get("parameters") or {"question": state["user_question"]})
     current_signature = _plan_signature(selected, current_parameters)
+    plan_exhausted = False
 
-    # Anti-repeat guard compares the full plan, not just the skill names.
+    # ─────────────────────────────────────────────────────────────────────────────
+    # STEP 2: MANDATORY ITERATIVE REFINEMENT when not satisfied
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Key insight: If the user's question is NOT yet answered, we MUST force the LLM
+    # to think deeper and try different approaches. No early termination allowed.
+    
+    if was_not_satisfied:
+        logger.info(
+            "[%s] ═══ MANDATORY ITERATION #%d ═══",
+            SKILL_NAME, step_count,
+        )
+        logger.info(
+            "[%s] Previous attempt not satisfied (confidence=%.0f%%) — forcing LLM DEEP REFLECTION",
+            SKILL_NAME,
+            float(last_eval.get("confidence", 0.0) or 0.0) * 100,
+        )
+        
+        # MANDATORY: Use LLM deep reflection to course-correct AND force iteration
+        corrected_skills, corrected_params, correction_reasoning = _reflect_on_failure_and_correct(
+            user_question=state["user_question"],
+            last_eval=last_eval,
+            previous_results=aggregated_results,
+            last_plan=selected,
+            last_parameters=current_parameters,
+            available_skills=available_skills,
+            manifests=all_manifests,
+            llm=llm,
+            instruction=instruction,
+            previous_trace=trace,
+        )
+        
+        # Apply the correction
+        if corrected_skills:
+            selected = corrected_skills
+            current_parameters = corrected_params
+            current_signature = _plan_signature(selected, current_parameters)
+            decision["skills"] = selected
+            decision["parameters"] = corrected_params
+            decision["reasoning"] = correction_reasoning or decision.get("reasoning", "")
+            
+            logger.info(
+                "[%s] ✓ Applied MANDATORY LLM reflection: %s → %s",
+                SKILL_NAME,
+                decision.get("skills", []),
+                selected,
+            )
+            logger.info(
+                "[%s] Iteration strategy: %s",
+                SKILL_NAME,
+                correction_reasoning[:150] if correction_reasoning else "Deep refinement",
+            )
+        else:
+            logger.warning(
+                "[%s] LLM reflection returned empty plan. Keeping current decision: %s",
+                SKILL_NAME, selected,
+            )
+    
+    # ─────────────────────────────────────────────────────────────────────────────
+    # STEP 3: Anti-infinite-loop protection (different from anti-duplicate blocking)
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Only block if:
+    # 1. The plan is identical to last time AND
+    # 2. The previous result WAS satisfied (meaning we're purposely re-running?)
+    # Otherwise, allow the iteration to continue - the LLM might legitimately
+    # need to try the same skill with different parameters.
+    
     if selected and current_signature in previously_run_skills and aggregated_results:
-        improved = _enforce_evidence_then_threat_intel(
+        # Exact same plan was already executed. Try to upgrade it once; otherwise
+        # finalize instead of burning steps on an identical retry.
+        improved = _postprocess_selected_skills(
             user_question=state["user_question"],
             selected_skills=selected,
             available_skills=available_skills,
             current_results=aggregated_results,
-        )
-        improved = _apply_result_aware_recovery(
-            user_question=state["user_question"],
-            selected_skills=improved,
-            available_skills=available_skills,
-            current_results=aggregated_results,
+            manifests=all_manifests,
         )
         improved_signature = _plan_signature(improved, current_parameters)
         if improved != selected and improved_signature not in previously_run_skills:
             logger.info(
-                "[%s] Supervisor repeated bad plan %s on step %d — upgrading to %s",
-                SKILL_NAME, selected, step_count, improved,
+                "[%s] Upgraded duplicate satisfied plan: %s → %s",
+                SKILL_NAME, selected, improved,
             )
             selected = improved
             decision["skills"] = selected
         else:
+            # No new viable plan emerged after reflection/postprocessing.
             logger.info(
-                "[%s] Supervisor repeated identical plan %s on step %d — blocking",
-                SKILL_NAME, current_signature, step_count,
+                "[%s] Skipping: identical plan was already executed and no new viable alternative emerged",
+                SKILL_NAME,
             )
-            decision["skills"] = []
             selected = []
+            decision["skills"] = []
+            plan_exhausted = True
 
     if step_callback:
         step_callback("deciding", decision, step_count, max_steps)
@@ -1017,6 +1648,7 @@ def decide_node(state: AgentState, config: RunnableConfig) -> dict:
         "step_count": step_count,
         "pending_parameters": dict(decision.get("parameters") or {"question": state["user_question"]}),
         "pending_reasoning": str(decision.get("reasoning", "")),
+        "plan_exhausted": plan_exhausted,
     }
 
 
@@ -1071,7 +1703,13 @@ def execute_node(state: AgentState, config: RunnableConfig) -> dict:
 
 
 def evaluate_node(state: AgentState, config: RunnableConfig) -> dict:
-    """EVALUATE: ask the supervisor whether current results satisfy the question."""
+    """
+    EVALUATE: ask the supervisor whether current results satisfy the question.
+    
+    Following LangGraph best practices: Always evaluate based on actual results,
+    even if the next plan is empty. Let the LLM decide satisfaction based on what we have.
+    Never force hardcoded "not satisfied" - that prevents proper agentic iteration.
+    """
     rt = _graph_runtime(config)
     llm = rt["llm"]
     instruction = rt["instruction"]
@@ -1083,24 +1721,20 @@ def evaluate_node(state: AgentState, config: RunnableConfig) -> dict:
     aggregated_results: dict = state.get("skill_results") or {}
     trace: list = list(state.get("trace") or [])
 
-    # If the decide_node blocked execution (empty plan after anti-repeat), short-circuit
-    if not skill_plan and step_count > 1:
-        last_eval = {
-            "satisfied": False,
-            "confidence": 0.4,
-            "reasoning": "Supervisor proposed the same unsuccessful plan again; duplicate execution was blocked.",
-            "missing": [],
-        }
-    else:
-        last_eval = _supervisor_evaluate_satisfaction(
-            user_question=state["user_question"],
-            llm=llm,
-            instruction=instruction,
-            conversation_history=list(state.get("messages") or []),
-            skill_results=aggregated_results,
-            step=step_count,
-            max_steps=max_steps,
-        )
+    # IMPORTANT: Always ask the LLM to evaluate based on actual results
+    # Do NOT hardcode "not satisfied" based on empty skill_plan
+    # The plan being empty might mean we've exhausted alternative approaches,
+    # but the LLM should still evaluate what we have and decide if it's sufficient
+    
+    last_eval = _supervisor_evaluate_satisfaction(
+        user_question=state["user_question"],
+        llm=llm,
+        instruction=instruction,
+        conversation_history=list(state.get("messages") or []),
+        skill_results=aggregated_results,
+        step=step_count,
+        max_steps=max_steps,
+    )
 
     trace.append({
         "step": step_count,
@@ -1145,6 +1779,7 @@ def format_response_node(state: AgentState, config: RunnableConfig) -> dict:
     final_routing = {
         "reasoning": last_eval.get("reasoning", "Graph orchestration complete."),
         "skills": list(aggregated_results.keys()),
+        "preferred_skills": list((trace[-1] or {}).get("selected_skills") or []) if trace else [],
         "parameters": {"question": user_question},
     }
 
@@ -1190,20 +1825,53 @@ def format_response_node(state: AgentState, config: RunnableConfig) -> dict:
 
 
 def should_loop(state: AgentState) -> str:
-    """Conditional edge after evaluate_node: loop back to decide or move to memory_write."""
+    """
+    Conditional edge after evaluate_node: loop back to decide or move to memory_write.
+    
+    Following LangGraph best practices: enable iterative refinement until either:
+    1. Question is satisfied, OR
+    2. Max steps reached, OR
+    3. We've truly exhausted all meaningful options
+    
+    Do NOT give up just because a duplicate plan was proposed - the system should
+    keep trying different approaches and parameters.
+    """
     evaluation: dict = state.get("evaluation") or {}
     satisfied: bool = bool(evaluation.get("satisfied", False))
     step_count: int = state.get("step_count") or 0
     max_steps: int = state.get("max_steps") or 4
-    skill_plan: list = state.get("skill_plan") or []
-
+    
+    # STOP CONDITION #1: Question is satisfied
     if satisfied:
+        logger.info(
+            "[%s] ✓ SATISFIED at step %d/%d — moving to response formatting",
+            SKILL_NAME, step_count, max_steps,
+        )
         return "memory_write"
+
+    # STOP CONDITION #1.5: no further viable plan remains
+    if bool(state.get("plan_exhausted", False)):
+        logger.info(
+            "[%s] No further viable skill plan at step %d/%d — moving to response formatting",
+            SKILL_NAME, step_count, max_steps,
+        )
+        return "memory_write"
+    
+    # STOP CONDITION #2: Max steps reached
     if step_count >= max_steps:
+        logger.info(
+            "[%s] Max steps (%d) reached at step %d — moving to response formatting",
+            SKILL_NAME, max_steps, step_count,
+        )
         return "memory_write"
-    # No actionable plan after the first attempt → give up
-    if not skill_plan and step_count >= 1:
-        return "memory_write"
+    
+    # OTHERWISE: CONTINUE ITERATING
+    # We should keep going and let the LLM think deeper and try different approaches
+    logger.info(
+        "[%s] ✓ CONTINUE ITERATION: Step %d/%d | Satisfaction confidence: %.0f%% | Will retry",
+        SKILL_NAME, step_count, max_steps,
+        float(evaluation.get("confidence", 0.0) or 0.0) * 100,
+    )
     return "decide"
 
 
@@ -1360,17 +2028,55 @@ def _supervisor_next_action(
     Uses skill manifests for intelligent routing when available,
     enabling modular skill discovery and auto-adaptation.
     """
+    question_lower = user_question.lower()
+    available_skill_names = {s.get("name") for s in available_skills}
+    attempted_skills = set()
+    
+    # Track what skills have been tried (extract from trace entries)
+    for trace_entry in previous_trace:
+        if isinstance(trace_entry, dict):
+            # Trace entries use "decision" key with "skills" nested inside
+            decision = trace_entry.get("decision") or {}
+            attempted_skills.update(decision.get("skills", []))
+            # Also check for direct "skills" or "selected_skills" keys for compatibility
+            attempted_skills.update(trace_entry.get("selected_skills", []))
+            attempted_skills.update(trace_entry.get("skills", []))
+    
     # Try to load skill manifests for structured capability awareness
+    manifests: dict[str, dict[str, Any]] = {}
     manifest_context = ""
+    skill_catalog_json = "[]"
     try:
         from core.skill_manifest import SkillManifestLoader
         loader = SkillManifestLoader()
         manifests = loader.load_all_manifests()
         if manifests:
             manifest_context = "\n" + loader.build_supervisor_context(manifests)
+            skill_catalog_json = json.dumps(_build_skill_catalog(available_skills, manifests), indent=2, default=str)
             logger.debug("[%s] Loaded %d skill manifests for intelligent routing", SKILL_NAME, len(manifests))
     except Exception as e:
-        logger.debug("[%s] Manifest loading failed, falling back to skill descriptions: %s", SKILL_NAME, e)
+        logger.debug("[%s] Manifest loading failed: %s", SKILL_NAME, e)
+
+    direct_threat_plan = _build_direct_threat_intel_plan(user_question, available_skills, manifests, conversation_history)
+    direct_plan_skill_names = set(direct_threat_plan.get("skills") or []) if direct_threat_plan else set()
+    direct_plan_already_ran = any(current_results.get(skill_name) for skill_name in direct_plan_skill_names)
+    if direct_threat_plan and not direct_plan_already_ran:
+        question_grounding = _ground_supervisor_question_with_llm(user_question, llm, instruction)
+        direct_threat_plan["planner_trace"] = {
+            "question_grounding": question_grounding,
+            "initial_candidate": {
+                "skills": list(direct_threat_plan.get("skills") or []),
+                "parameters": dict(direct_threat_plan.get("parameters") or {}),
+                "reasoning": str(direct_threat_plan.get("reasoning") or ""),
+            },
+            "reviews": [],
+            "final_plan": {
+                "skills": list(direct_threat_plan.get("skills") or []),
+                "parameters": dict(direct_threat_plan.get("parameters") or {}),
+                "reasoning": str(direct_threat_plan.get("reasoning") or ""),
+            },
+        }
+        return direct_threat_plan
     
     skills_description = "\n".join(
         f"- {s.get('name')}: {s.get('description', '')}"
@@ -1382,6 +2088,7 @@ def _supervisor_next_action(
     )
     prior_steps = json.dumps(previous_trace[-3:], indent=2, default=str) if previous_trace else "[]"
     result_keys = list(current_results.keys())
+    question_grounding = _ground_supervisor_question_with_llm(user_question, llm, instruction)
 
     # Summarize what each result returned so the supervisor can make intelligent choices.
     result_summary_lines = []
@@ -1410,6 +2117,9 @@ PRIOR EXECUTION TRACE:
 RESULTS ALREADY GATHERED:
 {{RESULT_SUMMARY}}
 
+QUESTION GROUNDING FROM CURRENT QUESTION ONLY:
+{{QUESTION_GROUNDING}}
+
 PREVIOUS EVALUATION:
 {{PREVIOUS_EVALUATION}}
 
@@ -1423,8 +2133,10 @@ Return strict JSON with reasoning, skills, and parameters.question.
             "HISTORY_TEXT": history_text or "- none",
             "SKILLS_DESCRIPTION": skills_description,
             "MANIFEST_CONTEXT": manifest_context,
+            "SKILL_CATALOG_JSON": skill_catalog_json,
             "PRIOR_STEPS": prior_steps,
             "RESULT_SUMMARY": result_summary,
+            "QUESTION_GROUNDING": json.dumps(question_grounding, indent=2, default=str),
             "PREVIOUS_EVALUATION": json.dumps(previous_eval, indent=2, default=str),
         },
     )
@@ -1446,6 +2158,43 @@ Return strict JSON with reasoning, skills, and parameters.question.
         if not isinstance(parsed.get("reasoning"), str):
             parsed["reasoning"] = "Supervisor selected next action"
 
+        fingerprint_preferred_groups = {
+            str(group).strip()
+            for group in (question_grounding.get("preferred_routing_groups") or [])
+            if str(group).strip()
+        }
+        wants_fingerprint = (
+            "host_fingerprinting" in fingerprint_preferred_groups
+            or "ip_fingerprinter" in parsed.get("skills", [])
+        )
+        routing_question = user_question
+
+        if wants_fingerprint:
+            fingerprint_entities = _recover_fingerprint_followup_entities(
+                user_question,
+                conversation_history,
+                current_results,
+            )
+            if fingerprint_entities.get("ips"):
+                anchored_fingerprint_question = _build_context_aware_fingerprint_question(
+                    user_question,
+                    fingerprint_entities,
+                    conversation_history,
+                )
+                parsed["parameters"]["question"] = anchored_fingerprint_question
+                if not _question_has_explicit_entities(user_question):
+                    routing_question = anchored_fingerprint_question
+
+            fingerprint_skill = None
+            if manifests:
+                fingerprint_skill = first_skill_in_group(manifests, "host_fingerprinting")
+            if not fingerprint_skill and any(
+                s.get("name") == "ip_fingerprinter" for s in available_skills
+            ):
+                fingerprint_skill = "ip_fingerprinter"
+            if fingerprint_skill and fingerprint_skill not in parsed.get("skills", []):
+                parsed["skills"] = list(parsed.get("skills", [])) + [fingerprint_skill]
+
         contextual_reputation_entities = _recover_threat_followup_entities(
             user_question,
             conversation_history,
@@ -1464,7 +2213,7 @@ Return strict JSON with reasoning, skills, and parameters.question.
                 parsed["parameters"]["conversation_history"] = conversation_history
             return parsed
 
-        if "baseline_querier" in parsed.get("skills", []) and _question_asks_for_baseline(user_question):
+        if "baseline_querier" in parsed.get("skills", []):
             baseline_entities = _recover_baseline_followup_entities(
                 user_question,
                 conversation_history,
@@ -1476,44 +2225,25 @@ Return strict JSON with reasoning, skills, and parameters.question.
                 conversation_history,
             )
         
-        # Apply field discovery prepending for data type queries (same as route_question)
-        parsed["skills"] = _prepend_field_discovery_for_data_types(
-            user_question=user_question,
+        parsed["skills"] = _postprocess_selected_skills(
+            user_question=routing_question,
             selected_skills=parsed.get("skills", []),
             available_skills=available_skills,
             current_results=current_results,
+            manifests=manifests,
         )
-        parsed["skills"] = _prefer_field_discovery_for_natural_language_search(
-            user_question=user_question,
-            selected_skills=parsed.get("skills", []),
-            available_skills=available_skills,
-            current_results=current_results,
-        )
-        parsed["skills"] = _enforce_evidence_then_threat_intel(
-            user_question=user_question,
-            selected_skills=parsed.get("skills", []),
-            available_skills=available_skills,
-            current_results=current_results,
-        )
-        parsed["skills"] = _apply_result_aware_recovery(
-            user_question=user_question,
-            selected_skills=parsed.get("skills", []),
-            available_skills=available_skills,
-            current_results=current_results,
-        )
-        parsed["skills"] = _strip_unrequested_threat_intel(
-            user_question=user_question,
-            selected_skills=parsed.get("skills", []),
-            available_skills=available_skills,
-        )
+        parsed["planner_trace"] = {
+            "question_grounding": question_grounding,
+            "initial_candidate": {
+                "skills": list(parsed.get("skills") or []),
+                "parameters": dict(parsed.get("parameters") or {}),
+                "reasoning": str(parsed.get("reasoning") or ""),
+            },
+            "reviews": [],
+        }
         
-        # Additional rule: If opensearch_querier found results and question asks for reputation,
-        # auto-queue threat_analyst for next step
-        question_lower = user_question.lower()
-        asks_for_reputation = any(
-            term in question_lower
-            for term in ["reputation", "threat intel", "threat intelligence", "malicious", "risk", "dangerous", "score", "verdict"]
-        )
+        # ── AUTO-QUEUE threat_analyst AFTER opensearch_querier ──────────────────────
+        # If LLM plan includes threat_analyst and opensearch found results, ensure it runs next
         opensearch_has_results = bool(
             current_results.get("opensearch_querier") and
             current_results["opensearch_querier"].get("results_count", 0) > 0
@@ -1523,19 +2253,35 @@ Return strict JSON with reasoning, skills, and parameters.question.
             current_results["threat_analyst"].get("status") == "ok"
         )
         
-        if asks_for_reputation and opensearch_has_results and not has_threat_intel:
-            if "threat_analyst" in {s.get("name") for s in available_skills}:
+        if "threat_analyst" in parsed.get("skills", []) and opensearch_has_results and not has_threat_intel:
+            if "threat_analyst" not in parsed.get("skills", []):
+                parsed["skills"].append("threat_analyst")
+                logger.info(
+                    "[%s] Auto-queueing threat_analyst: LLM plan includes it and opensearch found results",
+                    SKILL_NAME
+                )
+        
+        # ── SHORTCUT: If threat_analyst is in plan and IPs are known, skip log search ──
+        if "threat_analyst" in parsed.get("skills", []) and not has_threat_intel:
+            extracted_entities = _extract_entities_from_previous_results(current_results)
+            has_known_entities = bool(extracted_entities.get("ips") or extracted_entities.get("domains"))
+            
+            threat_analyst_available = "threat_analyst" in {s.get("name") for s in available_skills}
+            skills_requesting_log_search = {"fields_querier", "opensearch_querier"}
+            llm_wants_log_search = bool(skills_requesting_log_search & set(parsed.get("skills", [])))
+            
+            if has_known_entities and threat_analyst_available and llm_wants_log_search:
+                # Skip log search, go directly to threat_analyst
+                parsed["skills"] = [s for s in parsed.get("skills", []) if s not in skills_requesting_log_search]
                 if "threat_analyst" not in parsed.get("skills", []):
                     parsed["skills"].append("threat_analyst")
                     logger.info(
-                        "[%s] Auto-queueing threat_analyst: question asks for reputation and opensearch found results",
+                        "[%s] Shortcutting to threat_analyst: LLM plan includes it + known IPs/domains detected",
                         SKILL_NAME
                     )
         
         # ── AUTO-QUEUE opensearch_querier AFTER fields_querier ──────────────────────
-        # CRITICAL: If fields_querier just returned field_mappings and the supervisor
-        # tries to run fields_querier AGAIN (duplicate), automatically queue opensearch_querier
-        # to actually USE those discovered fields instead of re-discovering them.
+        # If LLM plan includes opensearch_querier and fields_querier just ran, execute the querier
         fields_just_ran = "fields_querier" in parsed.get("skills", [])
         fields_has_results = bool(
             current_results.get("fields_querier") and (
@@ -1543,28 +2289,34 @@ Return strict JSON with reasoning, skills, and parameters.question.
                 (current_results["fields_querier"].get("findings") or {}).get("field_mappings")
             )
         )
-        # Pattern: "about traffic from Russia" or "logs from Iran" or "show connections on port 443"
-        asks_for_log_search = bool(
-            re.search(
-                r"\b(traffic|flow|flows|connection|connections|log|logs|event|events|port|ports|protocol|country|countries).*(from|in|on|for|to|at|during|between)\b",
-                question_lower
-            )
-        )
         
-        if fields_just_ran and fields_has_results and asks_for_log_search:
-            if "opensearch_querier" in {s.get("name") for s in available_skills}:
-                if "opensearch_querier" not in parsed.get("skills", []):
-                    parsed["skills"].append("opensearch_querier")
-                    logger.info(
-                        "[%s] Auto-queueing opensearch_querier: fields_querier discovered fields, now search logs with them",
-                        SKILL_NAME
-                    )
+        if "opensearch_querier" in parsed.get("skills", []) and fields_just_ran and fields_has_results:
+            if "opensearch_querier" not in parsed.get("skills", []):
+                parsed["skills"].append("opensearch_querier")
+                logger.info(
+                    "[%s] Auto-queueing opensearch_querier: LLM plan includes it, fields discovered",
+                    SKILL_NAME
+                )
 
         # When schema discovery and log search are linked, make sure opensearch_querier
         # receives the original user request instead of a meta-level field-discovery
         # paraphrase from the supervisor.
         if "opensearch_querier" in parsed.get("skills", []):
-            parsed["parameters"]["question"] = user_question
+            parsed["parameters"]["question"] = routing_question
+
+        parsed = _ensure_viable_plan(
+            decision=parsed,
+            user_question=user_question,
+            available_skills=available_skills,
+            manifests=manifests,
+            llm=llm,
+            instruction=instruction,
+            current_results=current_results,
+            previous_eval=previous_eval,
+            previous_trace=previous_trace,
+            mode="next_action",
+            failure_reason="Supervisor next action must remain grounded in the loaded skill manifests.",
+        )
         
         return parsed
     except Exception as exc:
@@ -1592,6 +2344,8 @@ def _supervisor_evaluate_satisfaction(
     for skill_name, result in skill_results.items():
         if result.get("validation_failed"):
             continue
+        if skill_name == "opensearch_querier" and result.get("aggregation_type") == "country_terms":
+            continue
         count = result.get("results_count") or result.get("log_records") or (
             len(result.get("results", [])) if isinstance(result.get("results"), list) else 0
         )
@@ -1600,13 +2354,10 @@ def _supervisor_evaluate_satisfaction(
     os_result = skill_results.get("opensearch_querier") or {}
     country_buckets = os_result.get("country_buckets") or []
 
-    # Check if question asks for reputation/threat intelligence
-    question_lower = user_question.lower()
-    asks_for_reputation = any(
-        term in question_lower
-        for term in ["reputation", "threat", "malicious", "risk", "dangerous", "score", "verdict"]
-    )
-    asks_for_baseline = _question_asks_for_baseline(user_question)
+    # Check which skills were actually executed
+    threat_analyst_executed = bool(skill_results.get("threat_analyst"))
+    baseline_querier_executed = bool(skill_results.get("baseline_querier"))
+    
     has_threat_intel = bool(
         skill_results.get("threat_analyst") and 
         skill_results["threat_analyst"].get("status") == "ok"
@@ -1614,12 +2365,8 @@ def _supervisor_evaluate_satisfaction(
     threat_verdicts = skill_results.get("threat_analyst", {}).get("verdicts") or []
     baseline_result = skill_results.get("baseline_querier") or {}
     baseline_findings = baseline_result.get("findings") or {}
-    asks_for_additional_evidence = any(
-        term in question_lower
-        for term in ["traffic", "country", "countries", "log", "logs", "when", "where", "port", "protocol", "connection", "connections", "flow", "flows"]
-    )
 
-    if asks_for_baseline and baseline_result.get("status") == "ok" and baseline_findings.get("answer"):
+    if baseline_querier_executed and baseline_result.get("status") == "ok" and baseline_findings.get("answer"):
         baseline_log_records = int(baseline_findings.get("log_records", 0) or 0)
         baseline_sources = int(baseline_findings.get("rag_sources", 0) or 0)
         if baseline_log_records > 0 or baseline_sources > 0:
@@ -1637,13 +2384,9 @@ def _supervisor_evaluate_satisfaction(
                 "missing": [],
             }
 
-    # Satisfy if threat intel produced verdicts.
-    # Only keep looping for "additional evidence" terms (countries, traffic, etc.) when
-    # opensearch actually returned records — if there's nothing in the DB, looping won't help.
+    # Satisfy if threat intel produced verdicts (when threat_analyst was executed)
     has_opensearch_records = total_records_found > 0
-    if asks_for_reputation and has_threat_intel and threat_verdicts and (
-        not asks_for_additional_evidence or not has_opensearch_records
-    ):
+    if threat_analyst_executed and has_threat_intel and threat_verdicts:
         # Validate that verdict IPs match question IPs when possible
         # Extract IPs from question to ensure response is about the right entities
         ip_pattern = r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
@@ -1701,9 +2444,71 @@ def _supervisor_evaluate_satisfaction(
             "missing": [],
         }
     
+    # Check if ip_fingerprinter was executed
+    fingerprint_result = skill_results.get("ip_fingerprinter") or {}
+    fingerprint_status = fingerprint_result.get("status")
+    has_fingerprint = fingerprint_status == "ok"
+
+    if has_fingerprint:
+        fingerprint_ports = len(fingerprint_result.get("ports") or [])
+        logger.info(
+            "[%s] Evaluation: ip_fingerprinter produced fingerprint with %d port(s) — marking satisfied",
+            SKILL_NAME,
+            fingerprint_ports,
+        )
+        return {
+            "satisfied": True,
+            "confidence": 0.95,
+            "reasoning": f"Fingerprint analysis completed using {fingerprint_ports} observed port(s).",
+            "missing": [],
+        }
+
+    # If fingerprinter was queued but returned no_data, check if we have records
+    # If we have records but fingerprint returned no_data, that's incomplete
+    if fingerprint_status == "no_data":
+        if total_records_found > 0:
+            # We found log evidence but fingerprinter couldn't extract ports
+            logger.info(
+                "[%s] Found %d records but ip_fingerprinter returned no_data (no ports detected) — marking not satisfied",
+                SKILL_NAME,
+                total_records_found,
+            )
+            return {
+                "satisfied": False,
+                "confidence": 0.45,
+                "reasoning": "Traffic evidence exists but passive fingerprint analysis found no distinguishing ports.",
+                "missing": ["passive fingerprint analysis from observed ports"],
+            }
+        
+        # No records AND no_data → truly no evidence
+        logger.info(
+            "[%s] Evaluation: no traffic records AND ip_fingerprinter returned no_data — marking satisfied",
+            SKILL_NAME,
+        )
+        return {
+            "satisfied": True,
+            "confidence": 0.75,
+            "reasoning": fingerprint_result.get("reason") or "No matching port observations were found for the requested IP.",
+            "missing": [],
+        }
+
+    # If fingerprinter was queued but not yet complete, and we have records, indicate progress
+    if "ip_fingerprinter" in skill_results and total_records_found > 0 and not has_fingerprint:
+        logger.info(
+            "[%s] Found %d records but fingerprint result is missing or incomplete — continuing",
+            SKILL_NAME,
+            total_records_found,
+        )
+        return {
+            "satisfied": False,
+            "confidence": 0.45,
+            "reasoning": "Traffic evidence exists but passive fingerprint analysis has not completed yet.",
+            "missing": ["passive fingerprint analysis from observed ports"],
+        }
+
     if total_records_found > 0:
-        # If reputation was asked but we don't have threat intel yet, don't finalize
-        if asks_for_reputation and not has_threat_intel:
+        # If threat_analyst was queued but not complete, wait for it before finaizing
+        if threat_analyst_executed and not has_threat_intel:
             logger.info(
                 "[%s] Found %d records but reputation/threat was requested and threat_analyst not yet run — continuing",
                 SKILL_NAME, total_records_found
@@ -1729,7 +2534,7 @@ def _supervisor_evaluate_satisfaction(
 
     fields_result = skill_results.get("fields_querier") or {}
     directional_alternative = os_result.get("directional_alternative") or {}
-    if country_buckets:
+    if country_buckets and not os_result.get("validation_failed"):
         logger.info(
             "[%s] Evaluation: opensearch_querier returned %d aggregated country bucket(s) — marking satisfied",
             SKILL_NAME,
@@ -1740,6 +2545,20 @@ def _supervisor_evaluate_satisfaction(
             "confidence": 0.9,
             "reasoning": f"OpenSearch returned {len(country_buckets)} aggregated country bucket(s).",
             "missing": [],
+        }
+
+    if country_buckets and os_result.get("validation_failed"):
+        logger.info(
+            "[%s] Evaluation: aggregated country buckets were rejected by validation — continuing | issue=%s | reasoning=%s",
+            SKILL_NAME,
+            os_result.get("validation_issue", ""),
+            os_result.get("validation_reasoning", ""),
+        )
+        return {
+            "satisfied": False,
+            "confidence": 0.2,
+            "reasoning": os_result.get("validation_reasoning") or os_result.get("validation_issue") or "Aggregated answer shape did not match the user question.",
+            "missing": ["grounded search or aggregation aligned to the user question"],
         }
 
     if int(directional_alternative.get("results_count", 0) or 0) > 0:
@@ -2016,6 +2835,36 @@ def _extract_entities_from_previous_results(aggregated_results: dict) -> dict:
             entities["ips"].update(result.get("ips", []))
             entities["ports"].update(result.get("ports", []))
     
+    # Extract from geoip_lookup results
+    if "geoip_lookup" in aggregated_results:
+        result = aggregated_results["geoip_lookup"]
+        entities["sources"].append("geoip_lookup")
+        
+        # Extract IPs that were looked up
+        if result.get("status") == "ok":
+            # Single IP result
+            if "ip" in result:
+                entities["ips"].add(result["ip"])
+            # Multiple IPs from lookups
+            if "lookups" in result and isinstance(result["lookups"], list):
+                for lookup in result["lookups"]:
+                    if isinstance(lookup, dict) and "ip" in lookup:
+                        entities["ips"].add(lookup["ip"])
+            # Explicit ips list
+            if "ips" in result and isinstance(result["ips"], list):
+                entities["ips"].update(result["ips"])
+            
+            # Extract countries from geo data
+            if "lookups" in result and isinstance(result["lookups"], list):
+                for lookup in result["lookups"]:
+                    if isinstance(lookup, dict) and "geo" in lookup:
+                        geo = lookup.get("geo", {})
+                        if isinstance(geo, dict):
+                            if "country" in geo:
+                                entities["countries"].add(geo["country"])
+                            elif "country_name" in geo:
+                                entities["countries"].add(geo["country_name"])
+    
     # Convert sets to lists
     return {
         "ips": list(entities["ips"]),
@@ -2053,6 +2902,7 @@ def _extract_entities_from_conversation_history(conversation_history: list[dict]
             "Source/destination IPs:",
             "Remote peers:",
             "Reputation analysis for ",
+            "Passive fingerprint for ",
         ]
         return any(marker in text for marker in grounded_markers)
 
@@ -2098,15 +2948,13 @@ def _filter_entities_for_question(entities: dict, user_question: str) -> dict:
         "ports": list(entities.get("ports", [])),
         "sources": list(entities.get("sources", [])),
     }
-    if _question_excludes_private_ips(user_question):
-        filtered["ips"] = [ip for ip in filtered["ips"] if not _is_private_ip(ip)]
+    # Router already made filtering decisions; return entities as-is
     return filtered
 
 
 def _followup_reputation_entities(user_question: str, conversation_history: list[dict] | None) -> dict:
     """Recover prior entities for follow-up reputation questions like 'what about the others?'"""
-    if not _question_asks_for_reputation(user_question):
-        return {}
+    # NOTE: Caller should only invoke this if threat_analyst was executed (LLM plan driven)
     if _question_has_explicit_entities(user_question):
         return {}
 
@@ -2155,13 +3003,10 @@ def _followup_reputation_entities(user_question: str, conversation_history: list
         "that host",
         "this host",
     ]
-    asks_for_new_evidence = bool(
-        re.search(
-            r"\b(?:traffic|country|countries|log|logs|port|protocol|connection|connections|flow|flows|when|where|search|show|find|list)\b",
-            question_lower,
-        )
-    )
-    if asks_for_new_evidence and not _question_excludes_private_ips(user_question):
+    # Router already decided if this follow-up should recover prior entities
+    # No keyword-based filtering; return what was found
+    if re.search(r"\b(?:public|internet-facing|external)\b", user_question.lower()):
+        # Only if explicitly asking for public-only entities
         return {}
 
     history_entities = _extract_entities_from_conversation_history(conversation_history)
@@ -2184,6 +3029,40 @@ def _followup_reputation_entities(user_question: str, conversation_history: list
     if history_entities.get("ips") or history_entities.get("domains"):
         return history_entities
     return {}
+
+
+def _latest_user_explicit_entities(conversation_history: list[dict] | None) -> dict:
+    empty = {
+        "ips": [],
+        "domains": [],
+        "countries": [],
+        "ports": [],
+        "sources": [],
+    }
+    if not conversation_history:
+        return empty
+
+    ip_pattern = r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
+    domain_pattern = r"\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b"
+
+    for msg in reversed(conversation_history[-8:]):
+        if msg.get("role") != "user":
+            continue
+        text = str(msg.get("content", "") or "")
+        if not text:
+            continue
+        ips = list(dict.fromkeys(re.findall(ip_pattern, text)))
+        domains = list(dict.fromkeys(re.findall(domain_pattern, text.lower())))
+        if ips or domains:
+            return {
+                "ips": ips,
+                "domains": domains,
+                "countries": [],
+                "ports": [],
+                "sources": ["user_history"],
+            }
+
+    return empty
 
 
 def _recover_threat_followup_entities(
@@ -2210,8 +3089,7 @@ def _recover_baseline_followup_entities(
     conversation_history: list[dict] | None,
     aggregated_results: dict | None = None,
 ) -> dict:
-    if not _question_asks_for_baseline(user_question):
-        return {}
+    # NOTE: Caller should only invoke this if baseline_querier was executed (LLM plan driven)
 
     explicit_ips = list(dict.fromkeys(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", user_question or "")))
     entities = {
@@ -2230,6 +3108,87 @@ def _recover_baseline_followup_entities(
         entities[key] = list(dict.fromkeys(combined))
 
     return _filter_entities_for_question(entities, user_question)
+
+
+def _recover_fingerprint_followup_entities(
+    user_question: str,
+    conversation_history: list[dict] | None,
+    aggregated_results: dict | None = None,
+) -> dict:
+    explicit_ips = list(dict.fromkeys(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", user_question or "")))
+    if explicit_ips:
+        return {
+            "ips": explicit_ips,
+            "domains": [],
+            "countries": [],
+            "ports": [],
+            "sources": ["current_question"],
+        }
+
+    latest_user_entities = _latest_user_explicit_entities(conversation_history)
+    if latest_user_entities.get("ips") or latest_user_entities.get("domains"):
+        return latest_user_entities
+
+    history_entities = _extract_entities_from_conversation_history(conversation_history)
+    if history_entities.get("ips") or history_entities.get("domains"):
+        return {
+            "ips": list(history_entities.get("ips") or []),
+            "domains": list(history_entities.get("domains") or []),
+            "countries": [],
+            "ports": [],
+            "sources": list(history_entities.get("sources") or ["history"]),
+        }
+
+    if aggregated_results:
+        fingerprint_result = aggregated_results.get("ip_fingerprinter") or {}
+        fingerprint_ip = str(fingerprint_result.get("ip") or "").strip()
+        if fingerprint_ip:
+            return {
+                "ips": [fingerprint_ip],
+                "domains": [],
+                "countries": [],
+                "ports": [],
+                "sources": ["previous_fingerprint"],
+            }
+
+        opensearch_result = aggregated_results.get("opensearch_querier") or {}
+        opensearch_terms = [
+            str(term).strip()
+            for term in (opensearch_result.get("search_terms") or [])
+            if str(term).strip()
+        ]
+        opensearch_ips = [term for term in opensearch_terms if re.fullmatch(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", term)]
+        if opensearch_ips:
+            return {
+                "ips": opensearch_ips[:1],
+                "domains": [],
+                "countries": [],
+                "ports": [],
+                "sources": ["previous_opensearch"],
+            }
+
+    return {}
+
+
+def _build_context_aware_fingerprint_question(
+    original_question: str,
+    entities: dict,
+    conversation_history: list[dict] | None = None,
+) -> str:
+    ips = list(entities.get("ips") or [])
+    target_ip = ips[0] if ips else ""
+    history_summary = _latest_assistant_observation(conversation_history)
+    if not target_ip:
+        return original_question
+
+    parts = [
+        f"fingerprint {target_ip} for ports, services, likely host role, and OS-family likelihood"
+    ]
+    if original_question:
+        parts.append(f"Follow-up request: {original_question}")
+    if history_summary:
+        parts.append(f"Recent observed traffic: {history_summary}")
+    return ". ".join(parts)
 
 
 def _latest_assistant_observation(conversation_history: list[dict] | None) -> str:
@@ -2259,8 +3218,7 @@ def _build_context_aware_baseline_question(
     entities: dict,
     conversation_history: list[dict] | None = None,
 ) -> str:
-    if not _question_asks_for_baseline(original_question):
-        return original_question
+    # NOTE: Caller should only invoke this if baseline_querier is in plan
 
     entities = _filter_entities_for_question(entities or {}, original_question)
     ips = entities.get("ips", [])
@@ -2348,6 +3306,9 @@ def format_response(
       2. ACTION: Execute skills (already done)
       3. REFLECTION: Check if results answer the question
       4. ANTI-HALLUCINATION: Recheck before presenting
+      
+    Uses manifest-declared response_formatter hooks when available.
+    Falls back to hardcoded logic for backward compatibility.
     """
     if not routing_decision.get("skills"):
         # Generate dynamic list of available skills instead of hardcoded fallback
@@ -2358,10 +3319,93 @@ def format_response(
             skills_str = "network_baseliner, anomaly_triage, threat_analyst"
         return f"I couldn't determine which skills would help with that question. Available skills are: {skills_str}."
     
-    # ── FORENSIC-FIRST RENDERING ────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════════
+    # PHASE 0: TRY MANIFEST-DECLARED FORMATTERS (NEW ARCHITECTURE)
+    # ══════════════════════════════════════════════════════════════════════════════
+    # Load manifests and try each skill's declared response_formatter
+    # Try in priority order: forensic_examiner > geoip_lookup > baseline_querier > opensearch_querier
+    try:
+        from core.skill_manifest import SkillManifestLoader, invoke_response_formatter
+        loader = SkillManifestLoader()
+        manifests = loader.load_all_manifests()
+        
+        # Hard-coded priority for backward compatibility during transition
+        # TODO: Once all skills use manifest-driven formatters, use manifest-declared priority field
+        priority_order = [
+            "forensic_examiner",
+            "geoip_lookup",
+            "ip_fingerprinter",
+            "baseline_querier",
+            "opensearch_querier",
+            "threat_analyst"
+        ]
+
+        if _question_asks_for_reputation(user_question) and "threat_analyst" in skill_results:
+            priority_order = [
+                "threat_analyst",
+                "forensic_examiner",
+                "geoip_lookup",
+                "ip_fingerprinter",
+                "baseline_querier",
+                "opensearch_querier",
+            ]
+
+        formatter_order: list[str] = []
+        for skill_name in reversed(list(routing_decision.get("preferred_skills") or [])):
+            if skill_name in skill_results and skill_name not in formatter_order:
+                formatter_order.append(skill_name)
+        for skill_name in priority_order:
+            if skill_name in skill_results and skill_name not in formatter_order:
+                formatter_order.append(skill_name)
+        for skill_name in routing_decision.get("skills") or []:
+            if skill_name in skill_results and skill_name not in formatter_order:
+                formatter_order.append(skill_name)
+        for skill_name in skill_results:
+            if skill_name not in formatter_order:
+                formatter_order.append(skill_name)
+        
+        for skill_name in formatter_order:
+            result = skill_results[skill_name]
+            
+            # Skip only hard failures. Some skills intentionally return no_data/not_found
+            # and still provide the best user-facing response.
+            if result.get("status") in {"error", "failed"}:
+                logger.debug("[%s] Skipping failed skill %s (status: %s)", SKILL_NAME, skill_name, result.get("status"))
+                continue
+            
+            manifest = manifests.get(skill_name)
+            
+            if not manifest:
+                continue
+            
+            # Try to invoke the skill's declared formatter
+            formatted = invoke_response_formatter(
+                skill_name=skill_name,
+                manifest=manifest,
+                user_question=user_question,
+                result=result,
+                skill_results=skill_results,
+            )
+            
+            if formatted:
+                logger.info("[%s] Used manifest-declared formatter for %s", SKILL_NAME, skill_name)
+                return formatted
+    except Exception as e:
+        # If manifest loading or invocation fails, fall through to hardcoded logic
+        logger.debug("[%s] Manifest formatter loading failed (expected if manifests incomplete): %s", SKILL_NAME, e)
+
+    
+    # ══════════════════════════════════════════════════════════════════════════════
+    # PHASE 1: TRY HARDCODED PRIORITY FORMATTERS (BACKWARD COMPATIBILITY)
+    # ══════════════════════════════════════════════════════════════════════════════
+    # FORENSIC-FIRST RENDERING
     forensic_result = skill_results.get("forensic_examiner", {})
     if forensic_result and forensic_result.get("status") == "ok":
         return _format_forensic_response(user_question, forensic_result, skill_results.get("threat_analyst", {}))
+
+    threat_only_result = skill_results.get("threat_analyst", {})
+    if _question_asks_for_reputation(user_question) and threat_only_result and threat_only_result.get("status") == "ok" and threat_only_result.get("verdicts"):
+        return _format_threat_only_response(user_question, threat_only_result)
 
     geoip_result = skill_results.get("geoip_lookup", {})
     geoip_has_lookup = bool(geoip_result.get("ip") or geoip_result.get("status") == "not_found")
@@ -2385,7 +3429,7 @@ def format_response(
     baseline_result = skill_results.get("baseline_querier", {})
     if baseline_result and baseline_result.get("status") in {"ok", "no_data"}:
         findings = baseline_result.get("findings") or {}
-        if findings.get("answer") and _question_asks_for_baseline(user_question):
+        if findings.get("answer"):
             return _format_baseline_response(user_question, baseline_result)
 
     # If opensearch has records, prioritize it for non-baseline questions.
@@ -2404,7 +3448,6 @@ def format_response(
     if os_result and os_result.get("status") in {"ok", "no_action"} and not os_result.get("validation_failed"):
         return _format_opensearch_response(user_question, os_result)
 
-    threat_only_result = skill_results.get("threat_analyst", {})
     if threat_only_result and threat_only_result.get("status") == "ok" and threat_only_result.get("verdicts"):
         return _format_threat_only_response(user_question, threat_only_result)
 
@@ -2618,11 +3661,17 @@ def _format_threat_only_response(user_question: str, threat_result: dict) -> str
     reasoning = _shorten_naturally(" ".join(str(primary.get("reasoning", "") or "").split()), 320)
     subject = ", ".join(requested_ips) if requested_ips else "the requested IPs"
 
+    all_apis = sorted({api for verdict in verdicts for api in verdict.get("_queried_apis", [])})
+    if requested_ips and all(_is_private_ip(ip) for ip in requested_ips) and not all_apis:
+        return (
+            f"{subject} is a private/internal IP address, so public GeoIP and external threat-intelligence feeds do not apply directly. "
+            "Use internal log evidence, asset ownership, and local detections to assess whether it is suspicious."
+        )
+
     response = f"Reputation analysis for {subject}: {verdict_label} ({confidence}% confidence)."
     if reasoning:
         response += f" {reasoning}"
 
-    all_apis = sorted({api for verdict in verdicts for api in verdict.get("_queried_apis", [])})
     if all_apis:
         response += f"\n\n_[Threat Intelligence Sources Queried: {', '.join(all_apis)}]_"
     return response
@@ -2631,7 +3680,7 @@ def _format_threat_only_response(user_question: str, threat_result: dict) -> str
 def _format_baseline_response(user_question: str, baseline_result: dict) -> str:
     findings = baseline_result.get("findings") or {}
     grounded_assessment = " ".join(str(findings.get("grounded_assessment", "") or "").split())
-    if grounded_assessment and _question_asks_for_baseline(user_question):
+    if grounded_assessment:
         return grounded_assessment
 
     answer = " ".join(str(findings.get("answer", "") or "").split())

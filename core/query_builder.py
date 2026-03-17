@@ -12,9 +12,109 @@ from __future__ import annotations
 
 import logging
 import re
+import json
+from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+_FIELDS_RAG_PATH = Path(__file__).parents[1] / "data" / "fields_rag.json"
+
+
+def _append_unique(mappings: dict, key: str, value: str) -> None:
+    if value and value not in mappings[key]:
+        mappings[key].append(value)
+
+
+def _normalize_rag_field_type(inferred_type: str) -> str:
+    normalized = str(inferred_type or "").strip().lower()
+    if "ipv4" in normalized or normalized == "ip":
+        return "ip"
+    if "port" in normalized:
+        return "port"
+    if normalized == "datetime":
+        return "date"
+    if "keyword" in normalized:
+        return "keyword"
+    if "domain" in normalized or "fqdn" in normalized:
+        return "domain"
+    return normalized
+
+
+def _merge_fields_rag_metadata(mappings: dict) -> None:
+    """Enrich mappings with schema semantics from fields_rag.json.
+
+    This keeps directional IP/port understanding grounded in the field
+    documentation instead of re-deriving it from field-name keyword guesses.
+    """
+    try:
+        if not _FIELDS_RAG_PATH.exists():
+            return
+        rag_docs = json.loads(_FIELDS_RAG_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.debug("fields_rag.json field enrichment failed: %s", exc)
+        return
+
+    for doc in rag_docs:
+        if doc.get("category") != "field_documentation" or not isinstance(doc.get("fields"), dict):
+            continue
+
+        for field_name, field_info in doc["fields"].items():
+            if not isinstance(field_info, dict):
+                continue
+
+            inferred_type = _normalize_rag_field_type(field_info.get("inferred_type", "text"))
+            description = str(field_info.get("description", "") or "").strip().lower()
+            top_values = field_info.get("top_values") or []
+            observed_values = [
+                str(entry.get("value")).strip()
+                for entry in top_values
+                if isinstance(entry, dict) and str(entry.get("value", "")).strip()
+            ] or [
+                str(example).strip()
+                for example in field_info.get("examples") or []
+                if str(example).strip()
+            ]
+
+            _append_unique(mappings, "all_fields", field_name)
+            if inferred_type and field_name not in mappings["field_types"]:
+                mappings["field_types"][field_name] = inferred_type
+            if observed_values and field_name not in mappings["field_value_examples"]:
+                mappings["field_value_examples"][field_name] = observed_values
+
+            if inferred_type == "ip":
+                _append_unique(mappings, "ip_fields", field_name)
+                if "source" in description:
+                    _append_unique(mappings, "source_ip_fields", field_name)
+                if "destination" in description:
+                    _append_unique(mappings, "destination_ip_fields", field_name)
+
+            if inferred_type == "port":
+                _append_unique(mappings, "port_fields", field_name)
+                if "source" in description:
+                    _append_unique(mappings, "source_port_fields", field_name)
+                if "destination" in description:
+                    _append_unique(mappings, "destination_port_fields", field_name)
+
+            if "protocol" in description or inferred_type == "keyword":
+                if "protocol" in description:
+                    _append_unique(mappings, "protocol_fields", field_name)
+                for value in observed_values:
+                    if value and value not in mappings["protocol_values"]:
+                        mappings["protocol_values"].append(value)
+
+            if "country" in description:
+                _append_unique(mappings, "country_fields", field_name)
+                for value in observed_values:
+                    if value and value not in mappings["country_values"]:
+                        mappings["country_values"].append(value)
+
+            if inferred_type == "domain":
+                _append_unique(mappings, "domain_fields", field_name)
+            elif inferred_type == "date":
+                _append_unique(mappings, "timestamp_fields", field_name)
+            elif inferred_type in ("keyword", "text", "string"):
+                _append_unique(mappings, "text_fields", field_name)
 
 
 def _classify_directional_ip_field(field_name: str, mappings: dict) -> None:
@@ -53,10 +153,17 @@ def discover_field_mappings(db: Any, llm: Any) -> dict:
         "country_fields": [],
         "text_fields": [],
         "port_fields": [],
+        "source_port_fields": [],
+        "destination_port_fields": [],
+        "protocol_fields": [],
         "domain_fields": [],
         "geo_fields": [],
         "timestamp_fields": [],
         "all_fields": [],  # Fallback for multi_match
+        "field_types": {},
+        "field_value_examples": {},
+        "country_values": [],
+        "protocol_values": [],
     }
 
     # Try to get field mappings from OpenSearch first
@@ -77,6 +184,8 @@ def discover_field_mappings(db: Any, llm: Any) -> dict:
                     
                     field_type = field_info.get("type", "")
                     mappings["all_fields"].append(field_name)
+                    if field_type:
+                        mappings["field_types"][field_name] = field_type
                     
                     # Classify by type
                     if field_type == "ip":
@@ -105,6 +214,9 @@ def discover_field_mappings(db: Any, llm: Any) -> dict:
                     elif field_type == "date":
                         if field_name not in mappings["timestamp_fields"]:
                             mappings["timestamp_fields"].append(field_name)
+                    elif field_type in ("integer", "long", "short", "byte"):
+                        if "port" in field_name.lower() and field_name not in mappings["port_fields"]:
+                            mappings["port_fields"].append(field_name)
                     
                     # Handle nested/object fields (e.g., geoip with geoip.country_code2)
                     if field_type == "object" or "properties" in field_info:
@@ -115,6 +227,8 @@ def discover_field_mappings(db: Any, llm: Any) -> dict:
                                 seen_fields.add(full_field_name)
                                 mappings["all_fields"].append(full_field_name)
                                 nested_type = nested_info.get("type", "")
+                                if nested_type:
+                                    mappings["field_types"][full_field_name] = nested_type
                                 
                                 # Classify nested fields
                                 if nested_type == "keyword":
@@ -139,8 +253,12 @@ def discover_field_mappings(db: Any, llm: Any) -> dict:
                                 elif nested_type == "geo_point":
                                     if full_field_name not in mappings["geo_fields"]:
                                         mappings["geo_fields"].append(full_field_name)
+                                elif nested_type in ("integer", "long", "short", "byte"):
+                                    if "port" in full_field_name.lower() and full_field_name not in mappings["port_fields"]:
+                                        mappings["port_fields"].append(full_field_name)
             
             if mappings["all_fields"]:
+                _merge_fields_rag_metadata(mappings)
                 logger.debug(
                     "Discovered fields from OpenSearch: %d IP, %d text, %d total",
                     len(mappings["ip_fields"]),
@@ -163,10 +281,28 @@ def discover_field_mappings(db: Any, llm: Any) -> dict:
                     if _doc.get("category") == "field_documentation" and "fields" in _doc:
                         for _fname, _finfo in _doc["fields"].items():
                             _ftype = _finfo.get("inferred_type", "text")
+                            _top_values = _finfo.get("top_values") or []
+                            _observed_values = [
+                                str(entry.get("value")).strip()
+                                for entry in _top_values
+                                if isinstance(entry, dict) and str(entry.get("value", "")).strip()
+                            ] or [
+                                str(example).strip()
+                                for example in _finfo.get("examples") or []
+                                if str(example).strip()
+                            ]
                             if _fname not in mappings["all_fields"]:
                                 mappings["all_fields"].append(_fname)
+                            if _ftype:
+                                mappings["field_types"][_fname] = _ftype
+                            if _observed_values:
+                                mappings["field_value_examples"][_fname] = _observed_values
                             if "country" in _fname.lower() and _fname not in mappings["country_fields"]:
                                 mappings["country_fields"].append(_fname)
+                            if "country" in _fname.lower():
+                                for _value in _observed_values:
+                                    if _value not in mappings["country_values"]:
+                                        mappings["country_values"].append(_value)
                             if _ftype == "ip" and _fname not in mappings["ip_fields"]:
                                 mappings["ip_fields"].append(_fname)
                             elif _ftype == "port" and _fname not in mappings["port_fields"]:
@@ -178,6 +314,7 @@ def discover_field_mappings(db: Any, llm: Any) -> dict:
                             elif _fname not in mappings["text_fields"]:
                                 mappings["text_fields"].append(_fname)
                 if mappings["all_fields"]:
+                    _merge_fields_rag_metadata(mappings)
                     logger.debug(
                         "Discovered fields from fields_rag.json: %d total",
                         len(mappings["all_fields"]),
@@ -211,6 +348,8 @@ def discover_field_mappings(db: Any, llm: Any) -> dict:
         mappings["all_fields"] = ["message", "description", "payload", "data", "content", "@message"]
         mappings["text_fields"] = ["message", "description", "payload", "data", "content", "@message"]
         mappings["timestamp_fields"] = ["@timestamp", "timestamp"]
+
+    _merge_fields_rag_metadata(mappings)
     
     logger.debug(
         "Final mappings: %d IP, %d text, %d port, %d timestamp, %d total",

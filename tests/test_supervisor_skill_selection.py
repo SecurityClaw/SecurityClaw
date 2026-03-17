@@ -68,9 +68,10 @@ class TestSupervisorRoutingRules:
             previous_eval={"satisfied": False},
         )
         
-        # Verify the LLM was called with a prompt containing the threat_analyst rule
-        llm.chat.assert_called_once()
-        call_args = llm.chat.call_args[0][0]
+        # The supervisor now performs an explicit grounding pass before the
+        # next-action prompt, so there may be more than one LLM call.
+        assert llm.chat.call_count >= 1
+        call_args = llm.chat.call_args_list[-1][0][0]
         prompt_text = "\n".join([str(m.get("content", "")) for m in call_args])
         
         # Should mention threat_analyst priority for reputation
@@ -396,10 +397,11 @@ class TestSupervisorRoutingRules:
         """
         REGRESSION: Bug where "ET EXPLOIT type alert" routed to threat_analyst.
         This test documents that the fix prevents this misrouting.
-        """
-        # The prompt should contain alert type routing rule BEFORE threat_analyst rule
-        # So the LLM sees the alert type rule first and makes correct choice
         
+        The question is about alert TYPE discovery, not threat analysis.
+        In the capability-first flow, the supervisor may keep baseline_querier or
+        choose opensearch_querier, but it must not reframe the task as threat intel.
+        """
         llm = self._create_mock_llm(
             '{"skills": ["baseline_querier"], "reasoning": "alert type search"}'
         )
@@ -415,8 +417,10 @@ class TestSupervisorRoutingRules:
             previous_eval={"satisfied": False},
         )
         
+        # threat_analyst should NOT be routed (primary test goal)
         assert "threat_analyst" not in result.get("skills", [])
-        assert "baseline_querier" in result.get("skills", [])
+        
+        assert "opensearch_querier" in result.get("skills", []) or "baseline_querier" in result.get("skills", [])
 
     def test_field_discovery_never_skips_to_opensearch(self, available_skills):
         """
