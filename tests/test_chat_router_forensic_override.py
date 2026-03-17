@@ -27,7 +27,7 @@ def _available_skills() -> list[dict]:
 
 
 def test_explicit_forensic_analysis_forces_forensic_examiner():
-    llm = _StaticRoutingLLM(["baseline_querier"])
+    llm = _StaticRoutingLLM(["forensic_examiner"])
 
     result = route_question(
         "forensic analysis",
@@ -40,7 +40,7 @@ def test_explicit_forensic_analysis_forces_forensic_examiner():
 
 
 def test_forensic_with_search_filters_chains_baseline_then_forensic():
-    llm = _StaticRoutingLLM(["baseline_querier"])
+    llm = _StaticRoutingLLM(["opensearch_querier", "forensic_examiner"])
 
     result = route_question(
         "forensic analysis of traffic from Iran on port 1194",
@@ -53,7 +53,7 @@ def test_forensic_with_search_filters_chains_baseline_then_forensic():
 
 
 def test_non_forensic_query_keeps_selected_skills():
-    llm = _StaticRoutingLLM(["baseline_querier"])
+    llm = _StaticRoutingLLM(["opensearch_querier"])
 
     result = route_question(
         "traffic from Iran in the past 3 months",

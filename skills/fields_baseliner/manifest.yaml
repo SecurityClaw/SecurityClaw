@@ -23,6 +23,15 @@ explicit_only: true
   # Triggered automatically by record threshold; user can also say:
   # "run fields baseliner", "refresh field schema", "document fields", "force_refresh fields"
 
+explicit_keywords:
+  - "fields_baseliner"
+  - "scan fields"
+  - "catalog fields"
+  - "index fields"
+  - "refresh field schema"
+  - "update field schema"
+  - "rebuild field catalog"
+
 min_prior_context: 0
 
 returns:

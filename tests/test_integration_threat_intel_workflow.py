@@ -237,6 +237,28 @@ class TestThreatIntelWorkflow:
             assert "alienvault" in queried_apis
             assert "virustotal" in queried_apis
 
+    def test_threat_analyst_private_ip_returns_grounded_no_external_reputation_message(self):
+        from skills.threat_analyst.hooks import format_response
+
+        response = format_response(
+            "Any threat intel on 192.168.0.16",
+            {
+                "status": "ok",
+                "verdicts": [
+                    {
+                        "verdict": "UNKNOWN",
+                        "confidence": 0,
+                        "reasoning": "No external reputation data needed after excluding private/internal IPs.",
+                        "_requested_ips": ["192.168.0.16"],
+                        "_queried_apis": [],
+                    }
+                ],
+            },
+        )
+
+        assert "private/internal IP address" in response
+        assert "external threat-intelligence feeds do not apply directly" in response
+
     def test_no_ips_in_question_or_history(self):
         """When no IPs found anywhere, enrichment returns graceful message."""
         from skills.threat_analyst.logic import _enrich_with_reputation

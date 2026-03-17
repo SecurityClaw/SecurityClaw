@@ -294,7 +294,7 @@ class TestOpenSearchQuerierIpFieldSelection:
         ), patch.object(
             logic,
             "_execute_search_with_llm_repair",
-            side_effect=[[], [], []],
+            side_effect=[[], []],
         ) as search_mock:
             result = logic.run(
                 {
@@ -309,7 +309,7 @@ class TestOpenSearchQuerierIpFieldSelection:
         assert result["status"] == "ok"
         assert result["results_count"] == 0
         assert result["time_range_label"] == "today"
-        assert search_mock.call_count == 3
+        assert search_mock.call_count == 2
 
     def test_run_directional_ip_search_reports_opposite_direction_hits(self):
         from skills.opensearch_querier import logic
@@ -358,6 +358,7 @@ class TestOpenSearchQuerierIpFieldSelection:
                 "protocols": [],
                 "time_range": "custom",
                 "matching_strategy": "token",
+                "ip_direction": "source",
                 "reasoning": "Search for traffic from a specific IP today.",
             },
         ), patch.object(

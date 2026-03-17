@@ -76,7 +76,7 @@ class OllamaProvider(BaseLLMProvider):
         # concurrency conflicts when both are called close together.
         self.embed_model = cfg.get("llm", "ollama_embed_model", default=self.model)
         self.temperature = cfg.get("llm", "temperature", default=0.2)
-        self.max_tokens = cfg.get("llm", "max_tokens", default=4096)
+        self.max_tokens = cfg.get("llm", "max_tokens", default=16384)
         self._embedding_dim: Optional[int] = None  # Cache embedding dimension
 
     def chat(

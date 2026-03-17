@@ -1,4 +1,20 @@
 name: threat_analyst
+routing_group: threat_enrichment
+orchestration_role: direct
+capability_groups:
+  - threat_enrichment
+  - direct_entity_lookup
+required_entities:
+  - ip
+  - domain
+answer_types:
+  - threat reputation lookup
+  - risk and maliciousness assessment
+  - threat intelligence enrichment for known entities
+artifact_outputs:
+  - verdicts
+  - confidence_scores
+  - source_apis
 description: >
   Analyzes security findings using RAG context to determine threat level.
   Queries external threat intelligence APIs for IP/domain reputation.
@@ -31,14 +47,49 @@ priority_keywords:
   - "abuse"
   - "blacklist"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Routing Guard: Auto-Route Block Conditions
+# ──────────────────────────────────────────────────────────────────────────────
+# threat_analyst requires explicit user intent and is blocked from auto-routing
+# unless the user explicitly asks about reputation/threat/malicious analysis.
+# This prevents unnecessary API calls and expense for questions that don't need threat intel.
+requires_explicit_keywords:
+  - "reputation"
+  - "threat"
+  - "threat analysis"
+  - "threat intel"
+  - "threat intelligence"
+  - "malicious"
+  - "abuse"
+  - "blacklist"
+  - "ip reputation"
+  - "domain reputation"
+  - "risk score"
+  - "vulnerability"
+
 min_prior_context: 1
   # Expects at least 1 prior result (entity to evaluate) to work well
   # Can work without, but context makes it more valuable
+
+question_enrichment_hook: skills.threat_analyst.hooks:enrich_question_for_followup
 
 returns:
   - verdicts
   - confidence_scores
   - source_apis
+
+response_formatter: skills.threat_analyst.hooks:format_response
+
+conditional_recovery:
+  - position: back
+    when_any_question_patterns:
+      - regex: '\b(?:reputation|threat\s+intel(?:ligence)?|risk|malicious|verdict|score)\b'
+    skip_if_result_exists_for_skills:
+      - threat_analyst
+    requires_result_predicates:
+      - skill: opensearch_querier
+        path: results_count
+        min: 1
 
 required_env_vars:
   - name: ABUSEIPDB_API_KEY

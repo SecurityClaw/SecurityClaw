@@ -17,14 +17,36 @@ function upsertConversationItem(items, nextItem) {
   return copy
 }
 
-function StepChip({ step }) {
-  const cls = {
-    thinking: 'badge-cyan',
-    fetching: 'badge-amber',
-    evaluating: 'badge-green',
-    processing: 'badge-dim',
-  }[step.kind] || 'badge-dim'
-  return <span className={`badge ${cls}`}>{step.label}</span>
+function getActivityCopy(step) {
+  if (!step) {
+    return {
+      title: 'Thinking',
+      detail: 'Working through the request',
+    }
+  }
+
+  const title = {
+    thinking: 'Thinking',
+    fetching: 'Searching',
+    evaluating: 'Reviewing',
+    processing: 'Processing',
+  }[step.kind] || 'Processing'
+
+  return {
+    title,
+    detail: step.detail || 'Working through the request',
+  }
+}
+
+function getActivityPhrases(step) {
+  const byKind = {
+    thinking: ['thinking', 'working', 'checking'],
+    fetching: ['checking', 'working', 'thinking'],
+    evaluating: ['checking', 'reviewing', 'thinking'],
+    processing: ['working', 'checking', 'thinking'],
+  }
+
+  return byKind[step?.kind] || ['thinking', 'working', 'checking']
 }
 
 export default function ChatPage() {
@@ -35,10 +57,11 @@ export default function ChatPage() {
   const [input, setInput] = useState('')
   const [steps, setSteps] = useState([])
   const [busy, setBusy] = useState(false)
+  const [activityPhraseIndex, setActivityPhraseIndex] = useState(0)
+  const [reasoningExpanded, setReasoningExpanded] = useState(false)
   const activeId = conversationId || null
   
   const messagesEndRef = useRef(null)
-  const stepsEndRef = useRef(null)
   const streamingConversationIdRef = useRef(null)
   const isStreamingRef = useRef(false)
 
@@ -46,12 +69,7 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }
 
-  const scrollToStepsBottom = () => {
-    stepsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }
-
   useEffect(() => { scrollToMessagesBottom() }, [messages])
-  useEffect(() => { scrollToStepsBottom() }, [steps])
 
   const loadConversations = async () => {
     const res = await api.get('/api/conversations')
@@ -105,6 +123,8 @@ export default function ChatPage() {
     isStreamingRef.current = true
     setBusy(true)
     setSteps([])
+    setReasoningExpanded(false)
+    setActivityPhraseIndex(0)
     setInput('')
 
     if (activeId) {
@@ -184,6 +204,24 @@ export default function ChatPage() {
     })
   }, [conversations])
 
+  const currentStep = steps[steps.length - 1] || null
+  const activity = getActivityCopy(currentStep)
+  const activityPhrases = getActivityPhrases(currentStep)
+  const activityPhrase = activityPhrases[activityPhraseIndex % activityPhrases.length]
+
+  useEffect(() => {
+    if (!busy) {
+      setActivityPhraseIndex(0)
+      return undefined
+    }
+
+    const timer = window.setInterval(() => {
+      setActivityPhraseIndex((prev) => prev + 1)
+    }, 1400)
+
+    return () => window.clearInterval(timer)
+  }, [busy, currentStep])
+
   return (
     <div className="flex h-full min-h-0 gap-6">
       <div className="panel flex w-80 flex-col overflow-hidden">
@@ -211,52 +249,72 @@ export default function ChatPage() {
       <div className="flex min-w-0 flex-1 flex-col gap-6">
         <PageHeader title="Chat" subtitle="Supervisor-driven operator console with step-level progress, not raw logs." />
 
-        <div className="grid min-h-0 flex-1 gap-6 xl:grid-cols-[2fr_1fr]">
-          <div className="panel flex min-h-0 flex-col overflow-hidden">
-            <div className="border-b border-border px-5 py-3 font-mono text-xs uppercase tracking-[0.18em] text-cyan">Conversation</div>
-            <div className="min-h-0 flex-1 space-y-4 overflow-auto p-5">
-              {messages.length === 0 ? <div className="font-mono text-dim">Start a new investigation.</div> : null}
-              {messages.map((message, index) => (
-                <div key={`${message.timestamp}-${index}`} className={`rounded-xl border p-4 ${message.role === 'assistant' ? 'border-cyan/20 bg-cyan/5' : 'border-border bg-panel2'}`}>
-                  <div className="mb-2 flex items-center justify-between">
-                    <div className="font-mono text-xs uppercase tracking-[0.18em] text-dim">{message.role === 'assistant' ? 'SecurityClaw' : 'Operator'}</div>
-                    {message.routing_skills?.length ? <div className="flex flex-wrap gap-2">{message.routing_skills.map((skill) => <span key={skill} className="badge badge-green">{skill}</span>)}</div> : null}
-                  </div>
-                  <div className="markdown text-sm">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
-                  </div>
+        <div className="panel flex min-h-0 flex-1 flex-col overflow-hidden">
+          <div className="border-b border-border px-5 py-3 font-mono text-xs uppercase tracking-[0.18em] text-cyan">Conversation</div>
+          <div className="min-h-0 flex-1 space-y-4 overflow-auto p-5">
+            {messages.length === 0 ? <div className="font-mono text-dim">Start a new investigation.</div> : null}
+            {messages.map((message, index) => (
+              <div key={`${message.timestamp}-${index}`} className={`rounded-xl border p-4 ${message.role === 'assistant' ? 'border-cyan/20 bg-cyan/5' : 'border-border bg-panel2'}`}>
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <div className="font-mono text-xs uppercase tracking-[0.18em] text-dim">{message.role === 'assistant' ? 'SecurityClaw' : 'Operator'}</div>
+                  {message.routing_skills?.length ? <div className="flex flex-wrap gap-2">{message.routing_skills.map((skill) => <span key={skill} className="badge badge-green">{skill}</span>)}</div> : null}
                 </div>
-              ))}
-              <div ref={messagesEndRef} />
-            </div>
-            <div className="border-t border-border p-4">
-              <div className="flex flex-col gap-2">
-                <textarea
-                  className="textarea min-h-24 flex-1"
-                  placeholder="Ask SecurityClaw to investigate, query, compare, or triage... Press Enter to send, Shift+Enter for new line"
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={handleKeyDown}
-                />
-                <button className="btn btn-primary self-start" onClick={send} disabled={busy || !input.trim()}>
-                  <Send className="h-4 w-4" /> {busy ? 'RUNNING' : 'SEND'}
-                </button>
+                <div className="markdown text-sm">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                </div>
               </div>
-            </div>
-          </div>
-
-          <div className="panel flex min-h-0 flex-col overflow-hidden">
-            <div className="border-b border-border px-5 py-3 font-mono text-xs uppercase tracking-[0.18em] text-cyan">Reasoning Steps</div>
-            <div className="min-h-0 flex-1 space-y-3 overflow-auto p-5">
-              {steps.length === 0 ? <div className="font-mono text-dim">No active steps.</div> : null}
-              {steps.map((step, index) => (
-                <div key={`${step.kind}-${index}`} className="rounded-xl border border-border bg-panel2 p-4">
-                  <div className="mb-2"><StepChip step={step} /></div>
-                  <div className="text-sm text-text">{step.detail}</div>
-                  {step.skills?.length ? <div className="mt-3 flex flex-wrap gap-2">{step.skills.map((skill) => <span key={skill} className="badge badge-dim">{skill}</span>)}</div> : null}
+            ))}
+            {busy ? (
+              <div className="rounded-xl border border-cyan/20 bg-cyan/5 p-4">
+                <div className="mb-2 flex items-center gap-3 font-mono text-xs uppercase tracking-[0.18em] text-dim">
+                  <span>SecurityClaw</span>
+                  <span className="inline-flex items-center gap-2 text-cyan">
+                    <span>{activityPhrase}</span>
+                    <span className="activity-ellipsis" aria-hidden="true">
+                      <span />
+                      <span />
+                      <span />
+                    </span>
+                  </span>
                 </div>
-              ))}
-              <div ref={stepsEndRef} />
+                <div className="text-sm text-text">{activity.detail}</div>
+                {steps.length ? (
+                  <div className="mt-4 border-t border-border/70 pt-3">
+                    <button
+                      className="font-mono text-[11px] uppercase tracking-[0.16em] text-dim transition hover:text-cyan"
+                      onClick={() => setReasoningExpanded((prev) => !prev)}
+                      type="button"
+                    >
+                      {reasoningExpanded ? 'Hide Reasoning Steps' : 'Show Reasoning Steps'}
+                    </button>
+                    {reasoningExpanded ? (
+                      <div className="mt-3 space-y-3">
+                        {steps.map((step, index) => (
+                          <div key={`${step.kind}-${index}`} className="rounded-xl border border-border/70 bg-panel2 px-3 py-3">
+                            <div className="font-mono text-[11px] uppercase tracking-[0.16em] text-cyan">{step.label}</div>
+                            <div className="mt-1 text-sm text-text">{step.detail}</div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            <div ref={messagesEndRef} />
+          </div>
+          <div className="border-t border-border p-4">
+            <div className="flex flex-col gap-2">
+              <textarea
+                className="textarea min-h-24 flex-1"
+                placeholder="Ask SecurityClaw to investigate, query, compare, or triage... Press Enter to send, Shift+Enter for new line"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+              />
+              <button className="btn btn-primary self-start" onClick={send} disabled={busy || !input.trim()}>
+                <Send className="h-4 w-4" /> {busy ? activityPhrase.toUpperCase() : 'SEND'}
+              </button>
             </div>
           </div>
         </div>

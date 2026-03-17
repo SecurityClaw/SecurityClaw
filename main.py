@@ -269,6 +269,19 @@ def service(host: str, port: int, api_only: bool):
     """Start the web interface service (API + UI + optional scheduler)."""
     from web.api.server import run_service
 
+    # Security warning: 0.0.0.0 exposes the service to all network interfaces
+    if host == "0.0.0.0":
+        console.print("\n[bold yellow]⚠  SECURITY WARNING[/]")
+        console.print("[yellow]The API is binding to 0.0.0.0 (all network interfaces).[/]")
+        console.print("[yellow]Ensure your firewall restricts access to trusted IPs only.[/]")
+        console.print("[yellow]For local-only access, use: [cyan]--host 127.0.0.1[/][/]\n")
+
+    console.print(f"[green]Starting SecurityClaw service at {host}:{port}...[/]")
+    if not api_only:
+        console.print("[green]Background scheduler is enabled[/]")
+    else:
+        console.print("[dim]Background scheduler is disabled (--api-only)[/]")
+    
     run_service(host=host, port=port, enable_scheduler=not api_only)
 
 
@@ -479,13 +492,54 @@ def chat():
             console.print()
 
             def _supervisor_callback(event: str, data: dict, step: int, max_steps: int) -> None:
-                """Print supervisor thoughts in grey in real-time as each step unfolds."""
+                """Print a structured supervisor planning trace in real-time."""
                 if event == "deciding":
                     reasoning = data.get("reasoning", "")
                     skills = data.get("skills", [])
+                    planner_trace = data.get("planner_trace") or {}
+                    question_grounding = planner_trace.get("question_grounding") or {}
+                    initial_candidate = planner_trace.get("initial_candidate") or {}
+                    reviews = planner_trace.get("reviews") or []
                     console.print(f"[dim]┌ Supervisor step {step}/{max_steps}[/]")
+                    if question_grounding:
+                        summary = str(question_grounding.get("summary") or "").strip()
+                        immediate_need = str(question_grounding.get("immediate_need") or "").strip()
+                        preserve = list(question_grounding.get("must_preserve") or [])
+                        blocked = list(question_grounding.get("must_not_reframe_as") or [])
+                        if summary:
+                            console.print(f"[dim]│ Ask: {summary}[/]")
+                        if immediate_need:
+                            console.print(f"[dim]│ Immediate need: {immediate_need}[/]")
+                        if preserve:
+                            console.print(f"[dim]│ Must preserve: {', '.join(str(item) for item in preserve[:4])}[/]")
+                        if blocked:
+                            console.print(f"[dim]│ Must not reframe as: {', '.join(str(item) for item in blocked[:3])}[/]")
+                    if initial_candidate:
+                        initial_skills = initial_candidate.get("skills") or []
+                        initial_reasoning = str(initial_candidate.get("reasoning") or "").strip()
+                        if initial_skills:
+                            console.print(f"[dim]│ Initial candidate: {', '.join(initial_skills)}[/]")
+                        if initial_reasoning:
+                            console.print(f"[dim]│ Initial reasoning: {initial_reasoning}[/]")
+                    for review in reviews:
+                        stage = str(review.get("stage") or "review")
+                        proposed_skills = review.get("proposed_skills") or []
+                        verdict = "accept" if review.get("valid", False) and review.get("should_execute", False) else "reject"
+                        if stage == "grounding_group_rejection":
+                            console.print(f"[dim]│ Grounding rejection: {review.get('issue', '')}[/]")
+                            continue
+                        review_reasoning = str(review.get("reasoning") or "").strip()
+                        review_issue = str(review.get("issue") or "").strip()
+                        confidence = float(review.get("confidence") or 0.0)
+                        console.print(
+                            f"[dim]│ Review round {review.get('round', '?')}: {verdict} "
+                            f"({confidence:.0%}) for [{', '.join(proposed_skills) if proposed_skills else 'no skills'}][/]")
+                        if review_issue:
+                            console.print(f"[dim]│ Review issue: {review_issue}[/]")
+                        elif review_reasoning:
+                            console.print(f"[dim]│ Review reasoning: {review_reasoning}[/]")
                     if reasoning:
-                        console.print(f"[dim]│ {reasoning}[/]")
+                        console.print(f"[dim]│ Final reasoning: {reasoning}[/]")
                     if skills:
                         console.print(f"[dim]│ → Invoking: {', '.join(skills)}[/]")
                     else:

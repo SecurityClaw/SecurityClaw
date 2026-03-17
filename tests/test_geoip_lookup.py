@@ -150,38 +150,6 @@ def test_missing_license_and_missing_database_returns_error(tmp_path):
     assert "MAXMIND_LICENSE_KEY" in result["error"]
 
 
-def test_format_response_renders_geoip_result_without_llm():
-    class _LLM:
-        def chat(self, messages):
-            raise AssertionError("LLM should not be used for geoip formatter")
-
-    rendered = format_response(
-        "What country is 8.8.8.8 from?",
-        {"skills": ["geoip_lookup"], "parameters": {}},
-        {
-            "geoip_lookup": {
-                "status": "ok",
-                "action": "ready",
-                "ip": "8.8.8.8",
-                "geo": {
-                    "country": "United States",
-                    "country_iso_code": "US",
-                    "subdivision": "California",
-                    "city": "Mountain View",
-                    "timezone": "America/Los_Angeles",
-                    "latitude": 37.386,
-                    "longitude": -122.0838,
-                },
-            }
-        },
-        _LLM(),
-    )
-
-    assert "8.8.8.8" in rendered
-    assert "United States" in rendered
-    assert "California" in rendered
-
-
 def test_geoip_lookup_uses_previous_results_for_followup_country_question(monkeypatch, tmp_path):
     db_path = tmp_path / "GeoLite2-City.mmdb"
     db_path.write_bytes(b"existing-mmdb")
@@ -213,12 +181,41 @@ def test_geoip_lookup_uses_previous_results_for_followup_country_question(monkey
     assert result["lookups"][0]["geo"]["country"] == "United States"
 
 
-def test_format_response_renders_multi_ip_geoip_result_without_llm():
+def test_format_response_renders_geoip_result_with_single_and_multiple_ips():
+    """Core component test: format_response renders both single and multi-IP geoip results without LLM."""
     class _LLM:
         def chat(self, messages):
             raise AssertionError("LLM should not be used for geoip formatter")
 
-    rendered = format_response(
+    # Test single IP result
+    single_result = format_response(
+        "What country is 8.8.8.8 from?",
+        {"skills": ["geoip_lookup"], "parameters": {}},
+        {
+            "geoip_lookup": {
+                "status": "ok",
+                "action": "ready",
+                "ip": "8.8.8.8",
+                "geo": {
+                    "country": "United States",
+                    "country_iso_code": "US",
+                    "subdivision": "California",
+                    "city": "Mountain View",
+                    "timezone": "America/Los_Angeles",
+                    "latitude": 37.386,
+                    "longitude": -122.0838,
+                },
+            }
+        },
+        _LLM(),
+    )
+
+    assert "8.8.8.8" in single_result
+    assert "United States" in single_result
+    assert "California" in single_result
+
+    # Test multi-IP result
+    multi_result = format_response(
         "What country are these IPs from?",
         {"skills": ["geoip_lookup"], "parameters": {}},
         {
@@ -235,6 +232,6 @@ def test_format_response_renders_multi_ip_geoip_result_without_llm():
         _LLM(),
     )
 
-    assert "8.8.8.8" in rendered
-    assert "United States" in rendered
-    assert "192.168.0.16: not found" in rendered
+    assert "8.8.8.8" in multi_result
+    assert "United States" in multi_result
+    assert "192.168.0.16: not found" in multi_result

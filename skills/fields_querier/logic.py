@@ -91,6 +91,9 @@ def _extract_field_mappings(docs: list[dict]) -> dict:
         "protocol_fields": [],
         "bytes_fields": [],
         "all_fields": [],
+        "field_value_examples": {},
+        "country_values": [],
+        "protocol_values": [],
     }
 
     for doc in docs:
@@ -100,6 +103,20 @@ def _extract_field_mappings(docs: list[dict]) -> dict:
         for field, info in fields.items():
             inferred = info.get("inferred_type", "string").lower()
             fl = field.lower()
+            top_values = info.get("top_values") or []
+            observed_values = [
+                str(entry.get("value")).strip()
+                for entry in top_values
+                if isinstance(entry, dict) and str(entry.get("value", "")).strip()
+            ]
+            if not observed_values:
+                observed_values = [
+                    str(value).strip()
+                    for value in info.get("examples") or []
+                    if str(value).strip()
+                ]
+            if observed_values:
+                mappings["field_value_examples"][field] = observed_values
 
             # Track everything
             if field not in mappings["all_fields"]:
@@ -138,11 +155,17 @@ def _extract_field_mappings(docs: list[dict]) -> dict:
                     mappings["geoip_fields"].append(field)
             if "country" in fl and field not in mappings["country_fields"]:
                 mappings["country_fields"].append(field)
+                for value in observed_values:
+                    if value not in mappings["country_values"]:
+                        mappings["country_values"].append(value)
 
             # --- Protocol ---
             if any(k in fl for k in ("proto", "protocol", "transport")):
                 if field not in mappings["protocol_fields"]:
                     mappings["protocol_fields"].append(field)
+                for value in observed_values:
+                    if value not in mappings["protocol_values"]:
+                        mappings["protocol_values"].append(value)
 
             # --- Bytes/Volume ---
             if any(k in fl for k in ("byte", "packet", "size", "length")):

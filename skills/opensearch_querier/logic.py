@@ -51,7 +51,81 @@ _COUNTRY_CODE_REVERSE_MAP = {
     "DE": "Germany",
     "IN": "India",
     "PK": "Pakistan",
+    "GR": "Greece",
+    "TR": "Turkey",
+    "UA": "Ukraine",
+    "IT": "Italy",
+    "ES": "Spain",
+    "NL": "Netherlands",
+    "CA": "Canada",
+    "MX": "Mexico",
+    "BR": "Brazil",
+    "AU": "Australia",
 }
+_COUNTRY_TRAFFIC_STOPWORDS = {
+    "this",
+    "that",
+    "these",
+    "those",
+    "traffic",
+    "connection",
+    "connections",
+    "activity",
+    "activities",
+    "flow",
+    "flows",
+    "network",
+    "logs",
+    "log",
+    "ip",
+    "ips",
+    "ip address",
+    "address",
+    "addresses",
+    "country",
+    "countries",
+}
+
+
+def _extract_field_value_examples(field_mappings: dict | None, field_names: list[str] | None = None) -> list[str]:
+    if not isinstance(field_mappings, dict):
+        return []
+
+    field_value_examples = field_mappings.get("field_value_examples")
+    if not isinstance(field_value_examples, dict):
+        return []
+
+    selected_fields = field_names or list(field_value_examples.keys())
+    observed: list[str] = []
+    for field_name in selected_fields:
+        values = field_value_examples.get(field_name) or []
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            rendered = str(value).strip()
+            if not rendered or rendered in observed:
+                continue
+            observed.append(rendered)
+    return observed
+
+
+def _extract_country_candidates_from_field_mappings(field_mappings: dict | None) -> list[str]:
+    if not isinstance(field_mappings, dict):
+        return []
+
+    observed: list[str] = []
+    for value in field_mappings.get("country_values") or []:
+        rendered = str(value).strip()
+        if not rendered or rendered in observed:
+            continue
+        observed.append(rendered)
+
+    country_fields = [str(field) for field in field_mappings.get("country_fields") or []]
+    for value in _extract_field_value_examples(field_mappings, country_fields):
+        if value not in observed:
+            observed.append(value)
+
+    return observed
 
 
 def _parse_time_expression(value: str, *, now: datetime | None = None) -> datetime | None:
@@ -312,110 +386,340 @@ def _log_excerpt(text: Any, limit: int = 600) -> str:
     return trimmed + " ..."
 
 
-def _extract_countries_from_text(text: str) -> list[str]:
+def _extract_countries_from_text(text: str, field_mappings: dict | None = None) -> list[str]:
     """Extract country names from text."""
     if not text:
         return []
-    
-    # Common country names that might appear
+
     countries_map = {
-        'united states': 'United States',
-        'us': 'United States',
-        'usa': 'United States',
-        'china': 'China',
-        'russia': 'Russia',
-        'uk': 'United Kingdom',
-        'united kingdom': 'United Kingdom',
-        'germany': 'Germany',
-        'india': 'India',
-        'france': 'France',
-        'japan': 'Japan',
-        'brazil': 'Brazil',
-        'canada': 'Canada',
-        'mexico': 'Mexico',
-        'australia': 'Australia',
+        "united states": "United States",
+        "us": "United States",
+        "usa": "United States",
+        "uk": "United Kingdom",
+        "united kingdom": "United Kingdom",
     }
-    
-    countries = set()
+    for canonical_name in _COUNTRY_CODE_REVERSE_MAP.values():
+        countries_map.setdefault(canonical_name.lower(), canonical_name)
+    for observed_value in _extract_country_candidates_from_field_mappings(field_mappings):
+        countries_map.setdefault(observed_value.lower(), observed_value)
+
+    matches: list[tuple[int, int, str]] = []
     text_lower = text.lower()
-    
+
     for country_key, country_name in countries_map.items():
-        if country_key in text_lower:
-            countries.add(country_name)
-    
-    return sorted(list(countries))
+        pattern = r"\b" + re.escape(country_key) + r"\b"
+        for match in re.finditer(pattern, text_lower):
+            matches.append((match.start(), -len(country_key), country_name))
+
+    ordered_countries: list[str] = []
+    seen: set[str] = set()
+    for _, _, country_name in sorted(matches):
+        if country_name in seen:
+            continue
+        seen.add(country_name)
+        ordered_countries.append(country_name)
+
+    for candidate in _extract_country_candidates_from_traffic_phrase(text, field_mappings):
+        if candidate not in seen:
+            seen.add(candidate)
+            ordered_countries.append(candidate)
+
+    return ordered_countries
 
 
-def _question_asks_for_country_aggregation(question: str) -> bool:
-    q = str(question or "").lower()
-    asks_for_country_list = any(
-        phrase in q
+def _extract_country_candidates_from_traffic_phrase(text: str, field_mappings: dict | None = None) -> list[str]:
+    if not text:
+        return []
+
+    observed_country_values = {
+        str(value).strip().lower(): str(value).strip()
+        for value in _extract_country_candidates_from_field_mappings(field_mappings)
+        if str(value).strip()
+    }
+    known_countries = {
+        canonical_name.lower(): canonical_name
+        for canonical_name in _COUNTRY_CODE_REVERSE_MAP.values()
+    }
+
+    def _canonicalize(raw_value: str) -> str | None:
+        candidate = re.sub(r"\s+", " ", str(raw_value or "")).strip(" ,.?;:!\n\t")
+        if not candidate:
+            return None
+        if _extract_ips_from_text(candidate):
+            return None
+
+        lower_candidate = candidate.lower()
+        if lower_candidate in _COUNTRY_TRAFFIC_STOPWORDS:
+            return None
+        if lower_candidate in observed_country_values:
+            return observed_country_values[lower_candidate]
+        if lower_candidate in known_countries:
+            return known_countries[lower_candidate]
+        if re.fullmatch(r"[A-Za-z][A-Za-z\s'.-]{1,40}", candidate):
+            return " ".join(part.capitalize() for part in candidate.split())
+        return None
+
+    patterns = [
+        r"\b(?:traffic|connections?|activity|flows?|network\s+traffic)\s+from\s+([A-Za-z][A-Za-z\s'.-]{1,50}?)(?=\s+(?:today|yesterday|this|past|last|during|on|in|for)\b|[?.!,]|$)",
+        r"\b(?:originating\s+from|from)\s+([A-Za-z][A-Za-z\s'.-]{1,50}?)(?=\s+(?:today|yesterday|this|past|last|during|on|in|for)\b|[?.!,]|$)",
+    ]
+
+    extracted: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            canonical = _canonicalize(match.group(1))
+            if canonical and canonical not in extracted:
+                extracted.append(canonical)
+
+    return extracted
+
+
+def _question_mentions_traffic(question: str) -> bool:
+    question_lower = str(question or "").lower()
+    return any(
+        keyword in question_lower
+        for keyword in (
+            "traffic",
+            "connection",
+            "connections",
+            "flow",
+            "flows",
+            "activity",
+            "network",
+            "packet",
+        )
+    )
+
+
+def _question_asks_for_country_distribution(question: str) -> bool:
+    question_lower = str(question or "").lower()
+    return any(
+        phrase in question_lower
         for phrase in (
             "what countries",
             "which countries",
+            "top countries",
+            "country distribution",
+            "distribution by country",
             "countries other than",
             "countries besides",
-            "countries except",
             "countries excluding",
-            "non-us countries",
+            "countries except",
             "countries outside",
+            "non-us countries",
         )
     )
-    asks_about_traffic = any(
-        token in q
-        for token in ("traffic", "connection", "connections", "flow", "flows", "activity", "activities", "do we get")
+
+
+def _question_has_explicit_time_range(question: str) -> bool:
+    question_lower = str(question or "").lower()
+    return bool(
+        re.search(
+            r"\btoday\b|\bsince midnight\b|\bthis\s+week\b|\bthis\s+month\b|"
+            r"\b(?:past|last)\s+month\b|\b(?:past|last)\s+year\b|"
+            r"\b(?:past|last)\s+\d+\s+(?:hour|hours|day|days|week|weeks|month|months)\b",
+            question_lower,
+        )
     )
-    return asks_for_country_list and asks_about_traffic
 
 
-def _extract_excluded_countries_from_text(text: str) -> list[str]:
-    if not re.search(r"\b(other than|except|excluding|exclude|besides|outside)\b", str(text or "").lower()):
-        return []
-    return _extract_countries_from_text(text)
+def _infer_ip_direction_from_question(question: str) -> str:
+    question_lower = str(question or "").lower()
+    if re.search(r"\b(from|originating\s+from|source)\b", question_lower):
+        return "source"
+    if re.search(r"\b(to|targeting|destination|dest)\b", question_lower):
+        return "destination"
+    return "any"
 
 
-def _extract_result_limit(question: str, default: int = 10) -> int:
-    match = re.search(r"\btop\s+(\d+)\b", str(question or "").lower())
-    if not match:
-        return default
-    try:
-        return max(1, min(50, int(match.group(1))))
-    except Exception:
-        return default
+def _merge_unique_preserving_order(primary: list[Any], secondary: list[Any]) -> list[Any]:
+    merged: list[Any] = []
+    for value in list(primary or []) + list(secondary or []):
+        if value in (None, "", [], {}):
+            continue
+        if value in merged:
+            continue
+        merged.append(value)
+    return merged
 
 
-def _maybe_attach_country_aggregation_plan(question: str, plan: dict | None) -> dict:
+def _build_direct_fingerprint_plan(question: str) -> dict[str, Any] | None:
+    question_lower = str(question or "").lower()
+    extracted_ips = _extract_ips_from_text(question)
+    if not extracted_ips:
+        return None
+
+    if not any(
+        keyword in question_lower
+        for keyword in ("fingerprint", "what ports", "what services", "profile", "client or server")
+    ):
+        return None
+
+    target_ip = extracted_ips[0]
+    return {
+        "reasoning": "Direct passive fingerprint lookup requested for a specific IP.",
+        "summary": f"Passive fingerprint the IP {target_ip} from observed port evidence.",
+        "search_type": "ip",
+        "search_terms": [target_ip],
+        "countries": [],
+        "ports": [],
+        "protocols": [],
+        "ips": [target_ip],
+        "time_range": "now-30d",
+        "aggregation_type": "fingerprint_ports",
+        "aggregation_field": "none",
+        "matching_strategy": "term",
+        "field_analysis": "Use directional IP and port fields from discovered schema metadata.",
+        "entity_scope": f"Stay aligned to passive fingerprinting for IP {target_ip}.",
+        "skip_search": False,
+    }
+
+
+def _normalize_question_grounding(question: str, grounding: dict | None, field_mappings: dict | None = None) -> dict:
+    normalized = dict(grounding or {})
+    extracted_ips = _extract_ips_from_text(question)
+    extracted_countries = _extract_countries_from_text(question, field_mappings)
+    explicit_time_range, _ = _resolve_time_range_for_question(question, normalized.get("time_range", "now-90d"))
+    asks_for_traffic = _question_mentions_traffic(question)
+    asks_for_country_distribution = _question_asks_for_country_distribution(question)
+    fingerprint_keywords = any(
+        keyword in str(question or "").lower()
+        for keyword in ("fingerprint", "what ports", "what services", "profile", "client or server")
+    )
+
+    normalized["ips"] = _merge_unique_preserving_order(extracted_ips, normalized.get("ips") or [])
+    normalized["countries"] = _merge_unique_preserving_order(extracted_countries, normalized.get("countries") or [])
+    normalized.setdefault("ports", [])
+    normalized.setdefault("protocols", [])
+    normalized.setdefault("summary", "")
+    normalized.setdefault("entity_scope", "")
+
+    if _question_has_explicit_time_range(question):
+        normalized["time_range"] = explicit_time_range
+
+    if fingerprint_keywords and extracted_ips:
+        normalized["search_type"] = "ip"
+        normalized["aggregation_type"] = "fingerprint_ports"
+        normalized["time_range"] = "now-30d"
+    elif asks_for_traffic:
+        normalized["search_type"] = "traffic"
+        normalized["aggregation_type"] = "country_terms" if asks_for_country_distribution else "none"
+    elif extracted_ips:
+        normalized["search_type"] = "ip"
+        normalized.setdefault("aggregation_type", "none")
+    elif extracted_countries:
+        normalized["search_type"] = "traffic"
+        normalized["aggregation_type"] = "country_terms" if asks_for_country_distribution else "none"
+
+    if normalized["countries"]:
+        explicit_entities = ", ".join(normalized["countries"])
+        if asks_for_country_distribution:
+            normalized["entity_scope"] = f"Stay aligned to country traffic distribution for {explicit_entities}."
+        else:
+            normalized["entity_scope"] = f"Stay aligned to traffic involving {explicit_entities}."
+    elif normalized["ips"]:
+        normalized["entity_scope"] = f"Stay aligned to traffic involving {', '.join(normalized['ips'])}."
+
+    if not normalized["summary"]:
+        normalized["summary"] = str(question or "").strip()
+
+    return normalized
+
+
+def _normalize_query_plan_to_question(
+    question: str,
+    plan: dict | None,
+    question_grounding: dict | None = None,
+    field_mappings: dict | None = None,
+) -> dict:
     normalized = dict(plan or {})
-    if not _question_asks_for_country_aggregation(question):
+    grounding = _normalize_question_grounding(question, question_grounding, field_mappings)
+    question_lower = str(question or "").lower()
+    extracted_ips = grounding.get("ips") or []
+    extracted_countries = grounding.get("countries") or []
+    asks_for_traffic = _question_mentions_traffic(question)
+    asks_for_country_distribution = _question_asks_for_country_distribution(question)
+    explicit_fingerprint = any(
+        keyword in question_lower
+        for keyword in ("fingerprint", "what ports", "what services", "profile", "client or server")
+    ) and bool(extracted_ips)
+
+    normalized["search_terms"] = list(normalized.get("search_terms") or [])
+    normalized["countries"] = list(normalized.get("countries") or [])
+    normalized["ports"] = list(normalized.get("ports") or [])
+    normalized["protocols"] = list(normalized.get("protocols") or [])
+    normalized.setdefault("reasoning", "")
+    normalized.setdefault("matching_strategy", "token")
+    normalized.setdefault("aggregation_type", "none")
+    normalized.setdefault("time_range", grounding.get("time_range", "now-90d"))
+    normalized["ip_direction"] = normalized.get("ip_direction") or _infer_ip_direction_from_question(question)
+
+    if _question_has_explicit_time_range(question):
+        normalized["time_range"] = grounding.get("time_range", normalized["time_range"])
+
+    if explicit_fingerprint:
+        normalized["search_type"] = "ip"
+        normalized["aggregation_type"] = "fingerprint_ports"
+        normalized["search_terms"] = _merge_unique_preserving_order(extracted_ips, normalized["search_terms"])
+        normalized["time_range"] = "now-30d"
+        normalized["matching_strategy"] = "term"
         return normalized
 
-    excluded_countries = normalized.get("exclude_countries")
-    if not isinstance(excluded_countries, list):
-        excluded_countries = []
+    if asks_for_traffic:
+        normalized["search_type"] = "traffic"
 
-    question_exclusions = _extract_excluded_countries_from_text(question)
-    if question_exclusions:
-        excluded_countries = question_exclusions
+    if extracted_countries:
+        normalized["countries"] = _merge_unique_preserving_order(extracted_countries, normalized["countries"])
+        if asks_for_traffic and not asks_for_country_distribution:
+            normalized["aggregation_type"] = "none"
 
-    countries = normalized.get("countries")
-    if not isinstance(countries, list):
-        countries = []
-    if not excluded_countries and countries and re.search(r"\b(other than|except|excluding|exclude|besides|outside)\b", str(question or "").lower()):
-        excluded_countries = countries
-        countries = []
+    if asks_for_country_distribution:
+        normalized["aggregation_type"] = "country_terms"
 
-    normalized["countries"] = countries
-    normalized["exclude_countries"] = excluded_countries
-    normalized["aggregation_type"] = "country_terms"
-    normalized["aggregation_field"] = "country"
-    normalized["result_limit"] = _extract_result_limit(question)
-    normalized["search_type"] = normalized.get("search_type") or "traffic"
-    normalized["matching_strategy"] = normalized.get("matching_strategy") or "term"
-    normalized["skip_search"] = False
-    normalized["reasoning"] = (
-        (str(normalized.get("reasoning", "")).strip() + " ") if normalized.get("reasoning") else ""
-    ) + "Use a country aggregation over traffic logs instead of a document hit query."
+    if extracted_ips and normalized.get("search_type") in {"traffic", "ip"}:
+        normalized["search_terms"] = _merge_unique_preserving_order(extracted_ips, normalized["search_terms"])
+
+    if extracted_countries and asks_for_traffic and not extracted_ips:
+        structural_terms = {
+            "traffic",
+            "connection",
+            "connections",
+            "activity",
+            "flow",
+            "flows",
+            "country",
+            "countries",
+            "ip",
+            "ip address",
+            "ip addresses",
+            "ips",
+            "address",
+            "addresses",
+            "threat",
+        }
+        normalized["search_terms"] = [
+            term for term in normalized["search_terms"]
+            if str(term).strip().lower() not in structural_terms
+            and str(term).strip() not in extracted_countries
+        ]
+        if normalized["aggregation_type"] == "fingerprint_ports":
+            normalized["aggregation_type"] = "none"
+        normalized["matching_strategy"] = "term"
+
+    if extracted_countries and normalized.get("reasoning"):
+        if not any(country.lower() in normalized["reasoning"].lower() for country in extracted_countries):
+            normalized["reasoning"] = (
+                normalized["reasoning"].rstrip() + f" [Grounded to current question country filter: {', '.join(extracted_countries)}]"
+            ).strip()
+
     return normalized
+
+
+
+
+
+
+
 
 
 def _rank_country_aggregation_fields(field_mappings: dict) -> list[str]:
@@ -444,6 +748,25 @@ def _rank_country_aggregation_fields(field_mappings: dict) -> list[str]:
             expanded.append(f"{field_name}.keyword")
         expanded.append(field_name)
     return list(dict.fromkeys(expanded))
+
+
+def _rank_port_aggregation_fields(field_mappings: dict) -> list[str]:
+    candidates = [str(field) for field in (field_mappings.get("port_fields") or [])]
+    if not candidates:
+        return []
+
+    def _score(field_name: str) -> tuple[int, int, str]:
+        lower_name = field_name.lower()
+        rank = 0
+        if "destination.port" in lower_name or lower_name.endswith(("dest_port", "destination_port", "dport")):
+            rank += 50
+        elif "port" in lower_name:
+            rank += 20
+        if ".keyword" in lower_name:
+            rank -= 5
+        return (-rank, len(field_name), field_name)
+
+    return sorted(dict.fromkeys(candidates), key=_score)
 
 
 def _country_terms_for_field(country_name: str, field_name: str) -> list[str]:
@@ -606,6 +929,509 @@ def _execute_country_aggregation_query(
     }
 
 
+def _build_fingerprint_port_aggregation_query(
+    ip_field: str,
+    target_ip: str,
+    port_field: str,
+    time_range: str | dict[str, str],
+    result_limit: int,
+) -> dict:
+    return {
+        "size": 0,
+        "track_total_hits": True,
+        "query": {
+            "bool": {
+                "filter": [
+                    _build_time_filter(time_range),
+                    {"term": {ip_field: target_ip}},
+                ]
+            }
+        },
+        "aggs": {
+            "port_counts": {
+                "terms": {
+                    "field": port_field,
+                    "size": int(result_limit or 256),
+                    "order": {"_count": "desc"},
+                },
+            }
+        },
+    }
+
+
+def _candidate_protocol_fields(field_mappings: dict | None) -> list[str]:
+    """Return likely protocol fields from discovered schema metadata."""
+    if not isinstance(field_mappings, dict):
+        return []
+
+    explicit = [str(field) for field in field_mappings.get("protocol_fields") or []]
+    if explicit:
+        return list(dict.fromkeys(explicit))
+
+    all_fields = [str(field) for field in field_mappings.get("all_fields") or []]
+    candidates = [
+        field for field in all_fields
+        if any(token in field.lower() for token in ("proto", "protocol", "transport", "network.transport"))
+    ]
+    return list(dict.fromkeys(candidates))[:8]
+
+
+def _build_typed_fingerprint_candidates(field_mappings: dict) -> dict[str, list[str]]:
+    """Expose typed field candidates so the LLM can choose a simple aggregation shape."""
+    field_types = {
+        str(field): str(field_type).lower()
+        for field, field_type in (field_mappings.get("field_types") or {}).items()
+        if str(field)
+    }
+    all_fields = [str(field) for field in field_mappings.get("all_fields") or []]
+
+    directional_ip_candidates = list(dict.fromkeys([
+        *[str(field) for field in field_mappings.get("destination_ip_fields") or []],
+        *[str(field) for field in field_mappings.get("source_ip_fields") or []],
+    ]))
+    ip_candidates = directional_ip_candidates or [str(field) for field in field_mappings.get("ip_fields") or []]
+    if not ip_candidates:
+        ip_candidates = [field for field, field_type in field_types.items() if field_type == "ip"]
+
+    directional_port_candidates = list(dict.fromkeys([
+        *[str(field) for field in field_mappings.get("destination_port_fields") or []],
+        *[str(field) for field in field_mappings.get("source_port_fields") or []],
+    ]))
+    port_candidates = directional_port_candidates or [str(field) for field in field_mappings.get("port_fields") or []]
+    if not port_candidates:
+        port_like_types = {"port", "integer", "long", "short", "byte"}
+        port_candidates = [field for field, field_type in field_types.items() if field_type in port_like_types]
+
+    candidate_set = set(ip_candidates) | set(port_candidates)
+    if not candidate_set:
+        candidate_set = set(all_fields)
+
+    return {
+        "all_candidates": [field for field in all_fields if field in candidate_set] or all_fields[:20],
+        "ip_candidates": ip_candidates[:10],
+        "port_candidates": port_candidates[:10],
+    }
+
+
+def _build_fingerprint_field_fallback(field_mappings: dict) -> dict[str, Any]:
+    typed_candidates = _build_typed_fingerprint_candidates(field_mappings)
+
+    return {
+        "ip_fields": list(typed_candidates.get("ip_candidates") or [])[:6],
+        "port_fields": list(typed_candidates.get("port_candidates") or [])[:3],
+        "reasoning": "Fallback field selection from discovered schema metadata.",
+    }
+
+
+def _select_directional_ip_fields(field_mappings: dict, selected_ip_fields: list[str]) -> dict[str, list[str]]:
+    selected = [str(field) for field in selected_ip_fields or []]
+    source_set = {str(field) for field in field_mappings.get("source_ip_fields") or []}
+    destination_set = {str(field) for field in field_mappings.get("destination_ip_fields") or []}
+
+    source_fields = [field for field in selected if field in source_set]
+    destination_fields = [field for field in selected if field in destination_set]
+
+    if not source_fields:
+        source_fields = [field for field in field_mappings.get("source_ip_fields") or [] if field in selected or not selected]
+    if not destination_fields:
+        destination_fields = [field for field in field_mappings.get("destination_ip_fields") or [] if field in selected or not selected]
+
+    return {
+        "source": source_fields[:4],
+        "destination": destination_fields[:4],
+    }
+
+
+def _select_directional_port_fields(field_mappings: dict, selected_port_fields: list[str]) -> dict[str, list[str]]:
+    selected = [str(field) for field in selected_port_fields or []]
+    source_set = {str(field) for field in field_mappings.get("source_port_fields") or []}
+    destination_set = {str(field) for field in field_mappings.get("destination_port_fields") or []}
+
+    source_fields = [field for field in selected if field in source_set]
+    destination_fields = [field for field in selected if field in destination_set]
+
+    if not source_fields:
+        source_fields = [field for field in field_mappings.get("source_port_fields") or [] if field in selected or not selected]
+    if not destination_fields:
+        destination_fields = [field for field in field_mappings.get("destination_port_fields") or [] if field in selected or not selected]
+
+    return {
+        "source": source_fields[:4],
+        "destination": destination_fields[:4],
+    }
+
+
+def _build_filter_terms_agg(term_fields: list[str], target_ip: str, port_field: str, result_limit: int) -> dict[str, Any] | None:
+    if not term_fields or not port_field:
+        return None
+    should = [{"term": {field_name: target_ip}} for field_name in term_fields]
+    if not should:
+        return None
+    return {
+        "filter": {"bool": {"should": should, "minimum_should_match": 1}},
+        "aggs": {
+            "ports": {
+                "terms": {
+                    "field": port_field,
+                    "size": int(result_limit or 256),
+                    "order": {"_count": "desc"},
+                }
+            }
+        },
+    }
+
+
+def _merge_port_buckets(
+    target: dict[int, dict[str, Any]],
+    buckets: list[dict[str, Any]],
+    *,
+    evidence_label: str,
+) -> None:
+    for bucket in buckets or []:
+        try:
+            port = int(bucket.get("key"))
+        except (TypeError, ValueError):
+            continue
+
+        entry = target.setdefault(
+            port,
+            {
+                "observations": 0,
+                "protocols": [],
+                "is_known": True,
+                "evidence_roles": [],
+            },
+        )
+        entry["observations"] += int(bucket.get("doc_count", 0) or 0)
+        if evidence_label not in entry["evidence_roles"]:
+            entry["evidence_roles"].append(evidence_label)
+
+
+def _llm_plan_fingerprint_fields(
+    question: str,
+    target_ip: str,
+    field_mappings: dict,
+    llm: Any | None,
+) -> dict[str, Any]:
+    """Use the LLM to choose which discovered fields should drive passive IP fingerprinting."""
+    fallback = _build_fingerprint_field_fallback(field_mappings)
+    if llm is None:
+        return fallback
+
+    typed_candidates = _build_typed_fingerprint_candidates(field_mappings)
+    field_value_examples = field_mappings.get("field_value_examples") if isinstance(field_mappings, dict) else {}
+    prompt = f"""Choose the best discovered fields for a passive IP fingerprint aggregation.
+
+CURRENT USER QUESTION:
+{question}
+
+TARGET IP:
+{target_ip}
+
+DISCOVERED FIELD CANDIDATES:
+{json.dumps({
+    'field_types': field_mappings.get('field_types') or {},
+    'all_candidates': typed_candidates.get('all_candidates') or [],
+    'ip_candidates': typed_candidates.get('ip_candidates') or [],
+    'port_candidates': typed_candidates.get('port_candidates') or [],
+    'source_ip_fields': field_mappings.get('source_ip_fields') or [],
+    'destination_ip_fields': field_mappings.get('destination_ip_fields') or [],
+    'source_port_fields': field_mappings.get('source_port_fields') or [],
+    'destination_port_fields': field_mappings.get('destination_port_fields') or [],
+    'field_value_examples': field_value_examples if isinstance(field_value_examples, dict) else {},
+}, indent=2, default=str)}
+
+TASK:
+- Select the field names that best support a simple OpenSearch aggregation answering: which ports are observed for the target IP?
+- Prefer the directional schema buckets from the discovered metadata when they are present.
+- Use destination IP + destination port fields for target-owned service evidence.
+- Only choose field names that already exist in DISCOVERED FIELD CANDIDATES.
+- Keep the selection minimal and data agnostic.
+
+RETURN STRICT JSON ONLY:
+{{
+  "ip_fields": ["field1", "field2"],
+  "port_fields": ["field3"],
+  "reasoning": "why these fields are the best fit"
+}}"""
+
+    try:
+        response = llm.complete(prompt)
+        plan = _extract_json_from_response(response) or {}
+        if not isinstance(plan, dict):
+            return fallback
+
+        allowed_ip_fields = {str(field) for field in (typed_candidates.get("ip_candidates") or fallback["ip_fields"])}
+        allowed_port_fields = {str(field) for field in (typed_candidates.get("port_candidates") or fallback["port_fields"])}
+        def _filter_fields(values: Any, allowed: set[str], limit: int) -> list[str]:
+            filtered: list[str] = []
+            for value in values or []:
+                rendered = str(value)
+                if rendered not in allowed or rendered in filtered:
+                    continue
+                filtered.append(rendered)
+                if len(filtered) >= limit:
+                    break
+            return filtered
+
+        selected_ip_fields = _filter_fields(plan.get("ip_fields"), allowed_ip_fields, 6) or fallback["ip_fields"]
+        selected_port_fields = _filter_fields(plan.get("port_fields"), allowed_port_fields, 3) or fallback["port_fields"]
+
+        return {
+            "ip_fields": selected_ip_fields,
+            "port_fields": selected_port_fields,
+            "reasoning": str(plan.get("reasoning") or fallback["reasoning"]),
+        }
+    except Exception as exc:
+        logger.warning("[%s] Fingerprint field planning failed: %s", SKILL_NAME, exc)
+        return fallback
+
+
+def _build_flexible_fingerprint_aggregation_query(
+    ip_fields: list[str],
+    target_ip: str,
+    port_fields: list[str],
+    field_mappings: dict,
+    time_range: str | dict[str, str],
+    result_limit: int,
+) -> dict:
+    """Build an aggregation query that searches for IP across multiple fields (LLM-guided)."""
+    
+    # Create a flexible query that searches for the IP in any of the IP fields
+    ip_should_clauses = [{"term": {ip_field: target_ip}} for ip_field in ip_fields]
+    directional_ip_fields = _select_directional_ip_fields(field_mappings, ip_fields)
+    directional_port_fields = _select_directional_port_fields(field_mappings, port_fields)
+
+    aggs: dict = {}
+    for idx, port_field in enumerate((directional_port_fields.get("destination") or [])[:3]):
+        inbound_agg = _build_filter_terms_agg(directional_ip_fields.get("destination") or [], target_ip, port_field, result_limit)
+        if inbound_agg:
+            aggs[f"service_ports_target_destination_{idx}"] = inbound_agg
+
+        outbound_remote_agg = _build_filter_terms_agg(directional_ip_fields.get("source") or [], target_ip, port_field, result_limit)
+        if outbound_remote_agg:
+            aggs[f"remote_destination_ports_{idx}"] = outbound_remote_agg
+
+    for idx, port_field in enumerate((directional_port_fields.get("source") or [])[:3]):
+        source_service_agg = _build_filter_terms_agg(directional_ip_fields.get("source") or [], target_ip, port_field, result_limit)
+        if source_service_agg:
+            aggs[f"service_ports_target_source_{idx}"] = source_service_agg
+
+    if not aggs:
+        for idx, port_field in enumerate(port_fields[:3]):
+            aggs[f"port_counts_{idx}"] = {
+                "terms": {
+                    "field": port_field,
+                    "size": int(result_limit or 256),
+                    "order": {"_count": "desc"},
+                }
+            }
+    
+    return {
+        "size": 0,
+        "track_total_hits": True,
+        "query": {
+            "bool": {
+                "filter": [
+                    _build_time_filter(time_range),
+                    {"bool": {"should": ip_should_clauses, "minimum_should_match": 1}} if ip_should_clauses else {"match_all": {}},
+                ]
+            }
+        },
+        "aggs": aggs,
+    }
+
+
+def _execute_fingerprint_port_aggregation_query(
+    db: Any,
+    index: str,
+    field_mappings: dict,
+    target_ip: str,
+    time_range: str | dict[str, str],
+    result_limit: int = 256,
+    llm: Any | None = None,
+    question: str = "",
+) -> dict:
+    field_plan = _llm_plan_fingerprint_fields(question, target_ip, field_mappings, llm)
+    ip_fields = list(field_plan.get("ip_fields") or [])
+    port_fields = list(field_plan.get("port_fields") or [])
+
+    logger.info(
+        "[%s] Fingerprint aggregation: target_ip=%s | ip_fields=%s | port_fields=%s",
+        SKILL_NAME,
+        target_ip,
+        ip_fields,
+        port_fields[:3] if port_fields else [],
+    )
+
+    if not ip_fields or not port_fields:
+        logger.warning(
+            "[%s] Fingerprint aggregation: missing fields! ip_fields=%s, port_fields=%s",
+            SKILL_NAME,
+            bool(ip_fields),
+            bool(port_fields),
+        )
+        return {
+            "status": "ok",
+            "results_count": 0,
+            "results": [],
+            "observed_ports": [],
+            "aggregated_ports": {},
+            "aggregation_type": "fingerprint_ports",
+            "fingerprint_field_plan": field_plan,
+        }
+
+    # Use the flexible query that searches across all IP fields
+    query = _build_flexible_fingerprint_aggregation_query(ip_fields, target_ip, port_fields, field_mappings, time_range, result_limit)
+    
+    logger.debug("[%s] Fingerprint aggregation query: %s", SKILL_NAME, query)
+    
+    try:
+        if hasattr(db, "_client"):
+            raw_response = db._client.search(index=index, body=query, size=0)
+            
+            # Extract aggregations from any of the port field aggregations
+            aggregated_ports: dict[int, dict[str, Any]] = {}
+            remote_destination_ports: dict[int, dict[str, Any]] = {}
+            for agg_key in raw_response.get("aggregations", {}):
+                agg_body = raw_response["aggregations"].get(agg_key) or {}
+                raw_buckets = ((agg_body.get("ports") or {}).get("buckets") or [])
+                if not raw_buckets:
+                    continue
+                if agg_key.startswith("service_ports_target_"):
+                    evidence_label = "target_as_destination" if "destination" in agg_key else "target_as_source"
+                    _merge_port_buckets(aggregated_ports, raw_buckets, evidence_label=evidence_label)
+                elif agg_key.startswith("remote_destination_ports_"):
+                    _merge_port_buckets(remote_destination_ports, raw_buckets, evidence_label="remote_destination")
+                elif agg_key == "port_counts" or agg_key.startswith("port_counts_"):
+                    _merge_port_buckets(aggregated_ports, raw_buckets, evidence_label="ambiguous_direction")
+
+            hits_total = (((raw_response or {}).get("hits") or {}).get("total")) or 0
+            if isinstance(hits_total, dict):
+                hits_total = hits_total.get("value", 0)
+
+            if aggregated_ports:
+                logger.info(
+                    "[%s] Fingerprint aggregation succeeded: found %d unique ports across %d total records",
+                    SKILL_NAME,
+                    len(aggregated_ports),
+                    hits_total,
+                )
+                return {
+                    "status": "ok",
+                    "results_count": int(hits_total),
+                    "results": [],
+                    "summary_results": [],
+                    "observed_ports": sorted(aggregated_ports.keys()),
+                    "aggregated_ports": aggregated_ports,
+                    "remote_destination_ports": remote_destination_ports,
+                    "aggregation_type": "fingerprint_ports",
+                    "aggregation_strategy": "flexible_multi_field",
+                    "fingerprint_field_plan": field_plan,
+                }
+            elif hits_total > 0:
+                # Records found but no ports aggregated - might be data issue
+                logger.warning(
+                    "[%s] Fingerprint aggregation found %d records but no ports aggregated. This may indicate port fields are empty or mismatched.",
+                    SKILL_NAME,
+                    hits_total,
+                )
+                return {
+                    "status": "ok",
+                    "results_count": int(hits_total),
+                    "results": [],
+                    "summary_results": [],
+                    "observed_ports": [],
+                    "aggregated_ports": {},
+                    "remote_destination_ports": remote_destination_ports,
+                    "aggregation_type": "fingerprint_ports",
+                    "aggregation_strategy": "flexible_multi_field",
+                    "note": "Records found but no target-owned ports extracted",
+                    "fingerprint_field_plan": field_plan,
+                }
+    except Exception as exc:
+        logger.warning(
+            "[%s] Fingerprint aggregation error: %s",
+            SKILL_NAME,
+            exc,
+        )
+
+    return {
+        "status": "ok",
+        "results_count": 0,
+        "results": [],
+        "summary_results": [],
+        "observed_ports": [],
+        "aggregated_ports": {},
+        "remote_destination_ports": {},
+        "aggregation_type": "fingerprint_ports",
+        "fingerprint_field_plan": field_plan,
+    }
+
+
+def _llm_summarize_fingerprint_profile(
+    question: str,
+    target_ip: str,
+    aggregation_result: dict,
+    llm: Any | None,
+) -> dict[str, Any]:
+    """Use the LLM to interpret the observed port profile for the target IP."""
+    if llm is None:
+        return {}
+
+    aggregated_ports = aggregation_result.get("aggregated_ports") or {}
+    if not aggregated_ports:
+        return {}
+
+    prompt = f"""Interpret this passive IP fingerprint from aggregated network evidence.
+
+CURRENT USER QUESTION:
+{question}
+
+TARGET IP:
+{target_ip}
+
+PORT PROFILE:
+{json.dumps(aggregated_ports, indent=2, default=str)}
+
+REMOTE DESTINATION PORTS CONTACTED BY THE TARGET IP:
+{json.dumps(aggregation_result.get('remote_destination_ports') or {}, indent=2, default=str)}
+
+TOTAL MATCHING RECORDS:
+{int(aggregation_result.get('results_count', 0) or 0)}
+
+TASK:
+- Explain what the observed ports suggest about the system or role of the target IP.
+- Treat PORT PROFILE as ports belonging to the target IP.
+- Treat REMOTE DESTINATION PORTS CONTACTED BY THE TARGET IP as external service ports the target talked to, not listening ports on the target.
+- Stay grounded to the observed port evidence only.
+- Mention uncertainty when the evidence is limited.
+
+RETURN STRICT JSON ONLY:
+{{
+  "summary": "short analyst-ready interpretation",
+  "likely_role": "server|client|mixed|unclear",
+  "confidence": 0.0,
+  "evidence": ["bullet evidence 1", "bullet evidence 2"]
+}}"""
+
+    try:
+        response = llm.complete(prompt)
+        summary = _extract_json_from_response(response) or {}
+        if not isinstance(summary, dict):
+            return {}
+        evidence = summary.get("evidence") if isinstance(summary.get("evidence"), list) else []
+        return {
+            "summary": str(summary.get("summary") or "").strip(),
+            "likely_role": str(summary.get("likely_role") or "").strip(),
+            "confidence": float(summary.get("confidence", 0.0) or 0.0),
+            "evidence": [str(item).strip() for item in evidence if str(item).strip()],
+        }
+    except Exception as exc:
+        logger.warning("[%s] Fingerprint interpretation failed: %s", SKILL_NAME, exc)
+        return {}
+
+
 def _score_ip_query_field(field_name: str) -> int:
     """Score candidate fields for exact IP queries while excluding geo metadata."""
     lower_name = str(field_name).lower()
@@ -687,7 +1513,8 @@ def _select_ip_query_fields(field_mappings: dict, ip_direction: str = "any") -> 
 
 def _fallback_plan_from_question(
     question: str,
-    previous_results: dict | None = None
+    previous_results: dict | None = None,
+    field_mappings: dict | None = None,
 ) -> dict:
     """
     Fallback query planning when LLM fails: extract search parameters from question text.
@@ -707,7 +1534,7 @@ def _fallback_plan_from_question(
     # Extract structured data
     ports = _extract_ports_from_text(question)
     ips = _extract_ips_from_text(question)
-    countries = _extract_countries_from_text(question)
+    countries = _extract_countries_from_text(question, field_mappings)
     
     # Also extract IPs from previous results if available
     # For follow-up questions, add these directly to search_terms
@@ -754,6 +1581,13 @@ def _fallback_plan_from_question(
         # IPs become search terms for IP-specific searches
         search_terms = ips + search_terms
     
+    # Set aggregation_type based on search context
+    aggregation_type = "none"
+    # Only use fingerprint_ports if this is an explicit IP analysis search
+    # (not just any query that mentions an IP)
+    if search_type == "ip" and any(kw in question_lower for kw in ["fingerprint", "what ports", "what services", "profile", "analyze", "client or server"]):
+        aggregation_type = "fingerprint_ports"
+    
     return {
         "reasoning": f"Fallback plan (LLM planning failed): Extracted ports={ports}, countries={countries}, ips={ips}, search_type={search_type}",
         "search_type": search_type,
@@ -763,6 +1597,7 @@ def _fallback_plan_from_question(
         "protocols": [],
         "time_range": "now-90d",
         "matching_strategy": "token",
+        "aggregation_type": aggregation_type,
         "field_analysis": "Using fallback heuristic extraction from question text",
         "skip_search": False,  # Important: don't skip the search
     }
@@ -789,6 +1624,7 @@ def _extract_ips_from_previous_results(previous_results: dict) -> list[str]:
         if not isinstance(skill_result, dict):
             continue
 
+        # First try: Extract IPs from structured "results" array (standard format)
         for record in skill_result.get("results", []) or []:
             if not isinstance(record, dict):
                 continue
@@ -807,38 +1643,24 @@ def _extract_ips_from_previous_results(previous_results: dict) -> list[str]:
                     seen.add(value)
                     ips.append(value)
 
+        # Second try: Extract IPs from text fields like "description", "findings", "text"
+        # This handles results that present IPs in a human-readable format
+        if not ips:
+            for text_field in ("description", "findings", "text", "content", "summary"):
+                text_value = skill_result.get(text_field)
+                if isinstance(text_value, str):
+                    extracted = _extract_ips_from_text(text_value)
+                    for ip in extracted:
+                        if ip not in seen:
+                            seen.add(ip)
+                            ips.append(ip)
+                    if ips:
+                        break  # Found IPs, no need to check other text fields
+
     return ips
 
 
-def _infer_ip_direction(question: str, reasoning: str = "") -> str:
-    """Infer whether the user means source, destination, or any IP direction."""
-    combined = f"{question} {reasoning}".lower()
 
-    if any(re.search(pattern, combined) for pattern in (
-        r"\bfrom\s+",
-        r"\boriginating\s+from\b",
-        r"\bsource\s+ip\b",
-        r"\bclient\s+ip\b",
-        r"\bremote\s+ip\b",
-    )):
-        return "source"
-    if any(re.search(pattern, combined) for pattern in (
-        r"\bto\s+",
-        r"\bdestination\s+ip\b",
-        r"\bdest\s+ip\b",
-        r"\bserver\s+ip\b",
-        r"\btarget\s+ip\b",
-    )):
-        return "destination"
-    return "any"
-
-
-def _opposite_ip_direction(ip_direction: str) -> str:
-    if ip_direction == "source":
-        return "destination"
-    if ip_direction == "destination":
-        return "source"
-    return "any"
 
 
 def _get_nested_value(record: dict, field_name: str) -> Any:
@@ -860,6 +1682,74 @@ def _first_present_value(record: dict, field_names: list[str]) -> Any:
         value = _get_nested_value(record, field_name)
         if value not in (None, "", [], {}):
             return value
+
+
+def _build_aggregated_ports_from_results(
+    rows: list[dict[str, Any]],
+    target_ips: list[str],
+) -> dict[int, dict[str, Any]]:
+    """Aggregate observed destination ports for target IPs from sampled results."""
+    target_ip_set = {str(ip) for ip in target_ips if ip}
+    aggregated: dict[int, dict[str, Any]] = {}
+
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+
+        destination = row.get("destination") if isinstance(row.get("destination"), dict) else {}
+        destination_ip = (
+            row.get("dest_ip")
+            or row.get("destination_ip")
+            or row.get("destination.ip")
+            or destination.get("ip")
+        )
+        if target_ip_set and destination_ip not in target_ip_set:
+            continue
+
+        port_value = (
+            row.get("destination.port")
+            or row.get("destination_port")
+            or row.get("dest_port")
+            or row.get("dport")
+            or destination.get("port")
+        )
+        if port_value is None:
+            continue
+
+        try:
+            port = int(port_value)
+        except (TypeError, ValueError):
+            continue
+
+        if port <= 0 or port > 65535:
+            continue
+
+        protocol_value = (
+            row.get("protocol")
+            or row.get("proto")
+            or row.get("network.transport")
+            or row.get("transport")
+        )
+        protocol = str(protocol_value).lower() if protocol_value else None
+
+        entry = aggregated.setdefault(
+            port,
+            {
+                "observations": 0,
+                "protocols": set(),
+                "is_known": True,
+            },
+        )
+        entry["observations"] += 1
+        if protocol:
+            entry["protocols"].add(protocol)
+
+    for entry in aggregated.values():
+        protocols = entry.get("protocols")
+        if isinstance(protocols, set):
+            entry["protocols"] = sorted(protocols)
+
+    return aggregated
     return None
 
 
@@ -1041,10 +1931,16 @@ def _question_asks_for_followup_details(question: str) -> bool:
         "from that", "from those", "from the"
     ))
     # More flexible pattern matching for previous context references
-    refers_to_prior_context = any(phrase in q for phrase in (
-        "this traffic", "these ips", "that ip", "the traffic",
-        "that connection", "that traffic", "these connections"
-    ))
+    # Allow adjectives/modifiers between article and noun (e.g., "the above traffic", "this recent connection")
+    refers_to_prior_context = (
+        any(phrase in q for phrase in (
+            "this traffic", "these ips", "that ip", "the traffic",
+            "that connection", "that traffic", "these connections",
+            "the above traffic", "the mentioned traffic", "the recent traffic"
+        )) or
+        # Regex pattern to catch "the [modifiers] traffic/ips/connection"
+        bool(re.search(r'\b(?:the|these|those)\s+(?:\w+\s+)*(?:traffic|ips?|connection|items?)\b', q))
+    )
     return asks_for_details and refers_to_prior_context
 
 
@@ -1068,11 +1964,20 @@ def _recover_followup_plan_from_context(
       - User asks: "What port was associated with this traffic?" → Search for ports on recovered IPs
     """
     plan = dict(query_plan or {})
-    if plan.get("search_terms") or plan.get("countries") or plan.get("ports") or plan.get("protocols"):
-        return plan
+    
+    # PRIORITIZE follow-up detection: These questions should override LLM planning if the LLM
+    # made a generic/incorrect extraction (e.g., extracting "traffic" as search term instead of
+    # using prior IP context). Check this BEFORE the guard clause.
+    is_geo_followup = _question_asks_for_ip_geolocation(question)
+    is_detail_followup = _question_asks_for_followup_details(question)
+    
+    if not (is_geo_followup or is_detail_followup):
+        # Only apply the guard if this is NOT a marked follow-up question
+        if plan.get("search_terms") or plan.get("countries") or plan.get("ports") or plan.get("protocols"):
+            return plan
 
     # Check if this is a follow-up asking for details about previously mentioned traffic
-    if _question_asks_for_ip_geolocation(question):
+    if is_geo_followup:
         # Existing geolocation recovery logic
         candidate_ips = _extract_ips_from_previous_results(previous_results)
         if not candidate_ips:
@@ -1104,7 +2009,7 @@ def _recover_followup_plan_from_context(
         return plan
     
     # Handle follow-ups asking about traffic details (ports, protocols, etc.)
-    if _question_asks_for_followup_details(question):
+    if is_detail_followup:
         candidate_ips = _extract_ips_from_previous_results(previous_results)
         if not candidate_ips:
             for message in reversed(conversation_history or []):
@@ -1280,6 +2185,7 @@ def _sample_results_across_time_range(
         "newest_sample_count": len(newest_results),
     }
 
+
 SKILL_NAME = "opensearch_querier"
 
 
@@ -1376,16 +2282,17 @@ def run(context: dict) -> dict:
         previous_results,
         conversation_history,
     )
-    query_plan = _maybe_attach_country_aggregation_plan(question, query_plan)
     
     if not query_plan or query_plan.get("skip_search"):
         logger.info("[%s] LLM determined no search needed.", SKILL_NAME)
         return {"status": "no_action", "reason": "query not needed for raw logs"}
     
     # ── LOG REASONING STEP 1: Intent Analysis ──────────────────────────
+    # Note: aggregation_type should be set by the LLM in its planning phase
     logger.info("[%s] REASONING CHAIN - Step 1: Intent Analysis", SKILL_NAME)
     logger.info("[%s]   Search Type: %s", SKILL_NAME, query_plan.get("search_type"))
     logger.info("[%s]   Matching Strategy: %s", SKILL_NAME, query_plan.get("matching_strategy"))
+    logger.info("[%s]   Aggregation Type: %s (from LLM planning)", SKILL_NAME, query_plan.get("aggregation_type", "none"))
     logger.info("[%s]   Reasoning: %s", SKILL_NAME, _log_excerpt(query_plan.get("reasoning", ""), limit=500))
     
     search_terms = query_plan.get("search_terms", [])
@@ -1395,7 +2302,7 @@ def run(context: dict) -> dict:
     raw_time_range = query_plan.get("time_range", "now-90d")
     resolved_time_range, time_range_label = _resolve_time_range_for_question(question, raw_time_range)
     matching_strategy = query_plan.get("matching_strategy", "token")
-    ip_direction = _infer_ip_direction(question, query_plan.get("reasoning", ""))
+    ip_direction = query_plan.get("ip_direction", "any")
     aggregation_type = query_plan.get("aggregation_type")
     exclude_countries = query_plan.get("exclude_countries", []) if isinstance(query_plan.get("exclude_countries"), list) else []
     result_limit = int(query_plan.get("result_limit", 10) or 10)
@@ -1430,6 +2337,65 @@ def run(context: dict) -> dict:
             exclude_countries=exclude_countries,
             result_limit=result_limit,
         )
+        aggregation_validation = _llm_validate_country_aggregation(
+            question=question,
+            requested_filters=requested_filters,
+            aggregation_result=aggregation_result,
+            llm=llm,
+        )
+        aggregation_result.update(
+            {
+                "search_terms": search_terms,
+                "countries": countries,
+                "ports": ports,
+                "protocols": protocols,
+                "time_range": raw_time_range,
+                "time_range_label": time_range_label,
+                "time_range_resolved": resolved_time_range,
+                "reasoning": query_plan.get("reasoning", ""),
+                "ip_direction": ip_direction,
+                "directional_alternative": None,
+                "validation_failed": not aggregation_validation.get("is_valid", True),
+                "validation_issue": aggregation_validation.get("issue", ""),
+                "validation_reasoning": aggregation_validation.get("reasoning", ""),
+                "validation_reflection": aggregation_validation.get("reasoning", ""),
+                "reasoning_chain": {
+                    "planning": query_plan.get("reasoning"),
+                    "strategy_used": matching_strategy,
+                    "validation_issue": aggregation_validation.get("issue", ""),
+                    "validation_reflection": aggregation_validation.get("reasoning", ""),
+                    "recovery_performed": False,
+                },
+            }
+        )
+        logger.info(
+            "[%s]   Aggregated countries found: %d",
+            SKILL_NAME,
+            len(aggregation_result.get("country_buckets") or []),
+        )
+        if aggregation_result.get("validation_failed"):
+            logger.warning(
+                "[%s] Country aggregation rejected by evaluation: %s | %s",
+                SKILL_NAME,
+                aggregation_result.get("validation_issue", ""),
+                _log_excerpt(aggregation_result.get("validation_reasoning", ""), limit=700),
+            )
+        return aggregation_result
+
+    if aggregation_type == "fingerprint_ports":
+        logger.info("[%s] REASONING CHAIN - Step 2: Fingerprint Port Aggregation", SKILL_NAME)
+        target_ip = search_terms[0] if search_terms else ""
+        aggregation_result = _execute_fingerprint_port_aggregation_query(
+            db=db,
+            index=index,
+            field_mappings=field_mappings,
+            target_ip=target_ip,
+            time_range=resolved_time_range,
+            result_limit=int(parameters.get("aggregation_size", 256) or 256),
+            llm=llm,
+            question=question,
+        )
+        fingerprint_interpretation = _llm_summarize_fingerprint_profile(question, target_ip, aggregation_result, llm)
         aggregation_result.update(
             {
                 "search_terms": search_terms,
@@ -1445,9 +2411,13 @@ def run(context: dict) -> dict:
                 "validation_failed": False,
                 "validation_issue": "",
                 "validation_reflection": "",
+                "fingerprint_summary": fingerprint_interpretation.get("summary", ""),
+                "fingerprint_likely_role": fingerprint_interpretation.get("likely_role", ""),
+                "fingerprint_confidence": fingerprint_interpretation.get("confidence", 0.0),
+                "fingerprint_evidence": fingerprint_interpretation.get("evidence", []),
                 "reasoning_chain": {
                     "planning": query_plan.get("reasoning"),
-                    "strategy_used": matching_strategy,
+                    "strategy_used": "aggregation",
                     "validation_issue": "",
                     "validation_reflection": "",
                     "recovery_performed": False,
@@ -1455,9 +2425,10 @@ def run(context: dict) -> dict:
             }
         )
         logger.info(
-            "[%s]   Aggregated countries found: %d",
+            "[%s]   Aggregated fingerprint ports found: %d across %d matching records",
             SKILL_NAME,
-            len(aggregation_result.get("country_buckets") or []),
+            len(aggregation_result.get("observed_ports") or []),
+            int(aggregation_result.get("results_count", 0) or 0),
         )
         return aggregation_result
 
@@ -1617,7 +2588,7 @@ def run(context: dict) -> dict:
         directional_alternative = None
 
         if not results and search_terms and ip_direction in {"source", "destination"}:
-            alternative_direction = _opposite_ip_direction(ip_direction)
+            alternative_direction = "destination" if ip_direction == "source" else "source"
             logger.info(
                 "[%s] No %s-direction IP matches found; probing %s direction before LLM diagnosis",
                 SKILL_NAME,
@@ -1758,6 +2729,9 @@ def run(context: dict) -> dict:
                         sampled_results_count = int(sampled_search.get("sampled_results_count", len(summary_results)) or 0)
                         logger.info("[%s] Relaxed recovery succeeded: got %d results", SKILL_NAME, len(results))
 
+        aggregated_ports = _build_aggregated_ports_from_results(summary_results, search_terms)
+        observed_ports = sorted(aggregated_ports)
+
         return {
             "status": "ok",
             "results_count": total_results_count,
@@ -1771,6 +2745,8 @@ def run(context: dict) -> dict:
             "search_terms": search_terms,
             "countries": countries,
             "ports": ports,
+            "observed_ports": observed_ports,
+            "aggregated_ports": aggregated_ports,
             "protocols": protocols,
             "time_range": raw_time_range,
             "time_range_label": time_range_label,
@@ -2155,6 +3131,7 @@ def _llm_validate_results(
     
     structured_filters = requested_filters if isinstance(requested_filters, dict) else {}
     samples = _extract_validation_samples(results, field_mappings)
+    question_grounding = _llm_ground_question_intent(question, llm, field_mappings)
     
     sample_text = json.dumps(samples, indent=2, default=str)
     
@@ -2171,6 +3148,8 @@ def _llm_validate_results(
     prompt = f"""Validate that these search results match the user's intent.
 
 USER QUESTION: "{question}"
+QUESTION GROUNDING FROM CURRENT QUESTION ONLY:
+{json.dumps(question_grounding, indent=2, default=str)}
 
 SEARCH TERMS: {', '.join(search_terms)}
 REQUESTED FILTERS: {json.dumps(structured_filters, default=str)}
@@ -2183,10 +3162,13 @@ VALIDATION TASK:
 2. For signature/alert searches: Do results contain EXACT signatures? (e.g., if searching "ET POLICY", are there records with signature containing "ET POLICY"?)
 3. For traffic searches: Do results contain the countries/IPs/ports/protocols/time window requested?
 4. Are results relevant to the user's intent?
+5. Compare the entities explicitly requested in the question against the entities shown in the sampled results. If the question asks for one country, IP, port, protocol, or alert family and the samples show a different one, mark the results invalid.
+6. Treat QUESTION GROUNDING FROM CURRENT QUESTION ONLY as authoritative over conversation bleed or prior answers.
 
 RETURN STRICT JSON:
 {{
   "is_valid": true/false,
+    "reasoning": "why the results do or do not answer the question",
   "issue": "if not valid, describe the specific problem",
   "suggestion": "how to fix the query if needed",
   "confidence": 0.0-1.0
@@ -2196,6 +3178,8 @@ CRITICAL CHECKS:
 - If searching for "ET POLICY", results must have signatures containing "ET POLICY"
 - If searching for "ET EXPLOIT", results must have "ET EXPLOIT", NOT "ET POLICY" or others
 - If searching for a country, results must have that country in geoip data
+- If the question asks for Russia and the samples show China, that is invalid even if there are many matching records
+- If the question asks for a specific IP/port/protocol and the samples show different entities, that is invalid even if the records are otherwise well-formed
 - If a sample includes `country_field`, trust that as evidence that the record carries country metadata
 - If a sample includes timestamps inside the requested time range, do not fail validation only because the prompt did not restate the time window verbatim
 - Partial matches ARE acceptable for alert signatures (e.g., "ET POLICY Dropbox" contains "ET POLICY")
@@ -2220,6 +3204,11 @@ CRITICAL CHECKS:
         logger.info("[%s] Result validation: valid=%s, confidence=%.1f%%, issue='%s'",
                    SKILL_NAME, is_valid, float(validation.get("confidence", 0.5)) * 100,
                    str(validation.get("issue", ""))[:60])
+        logger.info(
+            "[%s] Result validation reasoning: %s",
+            SKILL_NAME,
+            _log_excerpt(validation.get("reasoning", validation.get("issue", "")), limit=700),
+        )
         
         # Also log if this is an alert search that failed validation
         if not is_valid and ("alert" in question.lower() or any("ET" in str(t) for t in search_terms)):
@@ -2229,6 +3218,7 @@ CRITICAL CHECKS:
         
         return {
             "is_valid": is_valid,
+            "reasoning": str(validation.get("reasoning", "")),
             "issue": str(validation.get("issue", "")),
             "suggestion": str(validation.get("suggestion", "")),
             "confidence": float(validation.get("confidence", 0.5)),
@@ -2236,6 +3226,237 @@ CRITICAL CHECKS:
     except Exception as exc:
         logger.warning("[%s] Result validation failed: %s", SKILL_NAME, exc)
         return {"is_valid": True, "confidence": 0.0}  # Assume valid on error
+
+
+def _llm_validate_country_aggregation(
+    question: str,
+    requested_filters: dict,
+    aggregation_result: dict,
+    llm: Any,
+) -> dict:
+    """Validate whether a country aggregation actually answers the user's question."""
+    question_grounding = _llm_ground_question_intent(question, llm, requested_filters)
+    country_buckets = aggregation_result.get("country_buckets") or []
+
+    prompt = f"""Validate that this country aggregation answers the user's question.
+
+USER QUESTION: "{question}"
+QUESTION GROUNDING FROM CURRENT QUESTION ONLY:
+{json.dumps(question_grounding, indent=2, default=str)}
+
+REQUESTED FILTERS: {json.dumps(requested_filters, default=str)}
+AGGREGATION TYPE: country_terms
+AGGREGATED COUNTRY BUCKETS:
+{json.dumps(country_buckets, indent=2, default=str)}
+
+VALIDATION TASK:
+1. Decide whether a country distribution is the right answer shape for this question.
+2. If the question asks about traffic from a specific country, verify the aggregation still answers that specific request.
+3. If the aggregation broadens the scope into a top-countries list or omits the explicitly requested country, mark it invalid.
+4. Treat QUESTION GROUNDING FROM CURRENT QUESTION ONLY as authoritative.
+
+RETURN STRICT JSON:
+{{
+  "is_valid": true/false,
+  "reasoning": "why the aggregation does or does not answer the question",
+  "issue": "if invalid, describe the mismatch",
+  "suggestion": "how to fix the query or answer shape",
+  "confidence": 0.0-1.0
+}}
+"""
+
+    try:
+        response = llm.complete(prompt)
+        validation = None
+        try:
+            validation = json.loads(response)
+        except Exception:
+            import re
+            match = re.search(r"\{[\s\S]*\}", response)
+            if match:
+                validation = json.loads(match.group())
+
+        if not isinstance(validation, dict):
+            return {"is_valid": True, "confidence": 0.5}
+
+        logger.info(
+            "[%s] Aggregation validation: valid=%s, confidence=%.1f%%, reasoning=%s, issue=%s",
+            SKILL_NAME,
+            bool(validation.get("is_valid", True)),
+            float(validation.get("confidence", 0.5)) * 100,
+            _log_excerpt(validation.get("reasoning", ""), limit=500),
+            _log_excerpt(validation.get("issue", ""), limit=300),
+        )
+
+        return {
+            "is_valid": bool(validation.get("is_valid", True)),
+            "reasoning": str(validation.get("reasoning", "")),
+            "issue": str(validation.get("issue", "")),
+            "suggestion": str(validation.get("suggestion", "")),
+            "confidence": float(validation.get("confidence", 0.5)),
+        }
+    except Exception as exc:
+        logger.warning("[%s] Aggregation validation failed: %s", SKILL_NAME, exc)
+        return {"is_valid": True, "confidence": 0.0}
+
+
+def _llm_review_query_plan(
+    question: str,
+    conversation_summary: str,
+    question_grounding: dict,
+    plan: dict,
+    llm: Any,
+) -> dict:
+    """Ask the LLM to verify that its own plan is grounded in the current question."""
+    prompt = f"""Review this OpenSearch query plan for grounding and relevance.
+
+CURRENT USER QUESTION:
+{question}
+
+QUESTION GROUNDING FROM CURRENT QUESTION ONLY:
+{json.dumps(question_grounding, indent=2, default=str)}
+
+RECENT CONVERSATION CONTEXT:
+{conversation_summary or '(No prior context)'}
+
+PROPOSED PLAN:
+{json.dumps(plan, indent=2, default=str)}
+
+TASK:
+- Decide whether the plan is grounded in the CURRENT USER QUESTION.
+- Treat QUESTION GROUNDING FROM CURRENT QUESTION ONLY as the source of truth for explicit entities and requested scope.
+- Detect context bleed from earlier conversation.
+- Reject plans that answer a different country, IP, port, protocol, alert family, or aggregation intent than the user asked for.
+- Focus on semantic alignment, not whether the JSON is well-formed.
+
+RETURN STRICT JSON:
+{{
+  "is_valid": true/false,
+    "reasoning": "why the plan is or is not grounded in the current question",
+  "issue": "specific grounding problem if invalid",
+  "suggestion": "how the plan should be corrected",
+  "confidence": 0.0-1.0
+}}
+
+EXAMPLES OF INVALID PLANS:
+- The user asks for traffic from 1.1.1.1 but the plan switches to country aggregation because earlier context mentioned countries.
+- The user asks for Russia but the plan targets China.
+- The user asks for raw traffic evidence but the plan answers a different analytical question.
+"""
+
+    try:
+        response = llm.complete(prompt)
+        review = None
+
+        try:
+            review = json.loads(response)
+        except Exception:
+            import re
+            m = re.search(r"\{[\s\S]*\}", response)
+            if m:
+                review = json.loads(m.group())
+
+        if not review:
+            return {"is_valid": True, "confidence": 0.5}
+
+        logger.info(
+            "[%s] Plan grounding review: valid=%s, confidence=%.1f%%, reasoning=%s, issue=%s",
+            SKILL_NAME,
+            bool(review.get("is_valid", True)),
+            float(review.get("confidence", 0.5)) * 100,
+            _log_excerpt(review.get("reasoning", ""), limit=500),
+            _log_excerpt(review.get("issue", ""), limit=300),
+        )
+
+        return {
+            "is_valid": bool(review.get("is_valid", True)),
+            "reasoning": str(review.get("reasoning", "")),
+            "issue": str(review.get("issue", "")),
+            "suggestion": str(review.get("suggestion", "")),
+            "confidence": float(review.get("confidence", 0.5)),
+        }
+    except Exception as exc:
+        logger.warning("[%s] Plan grounding review failed: %s", SKILL_NAME, exc)
+        return {"is_valid": True, "confidence": 0.0}
+
+
+def _llm_ground_question_intent(question: str, llm: Any, field_mappings: dict | None = None) -> dict:
+    """Extract authoritative intent and entities from the current user question only."""
+    direct_fingerprint = _build_direct_fingerprint_plan(question)
+    if direct_fingerprint:
+        return _normalize_question_grounding(question, direct_fingerprint, field_mappings)
+
+    prompt = f"""Analyze ONLY the current user question below.
+
+CURRENT USER QUESTION:
+{question}
+
+TASK:
+- Extract only entities and intent that are explicitly present or directly implied by this question.
+- Do NOT use prior conversation, memory, or likely follow-up assumptions.
+- If the question names a country, IP, port, protocol, alert family, or time range, preserve it exactly.
+- If the question does not mention an entity, leave that field empty.
+
+RETURN STRICT JSON:
+{{
+  "summary": "one-sentence summary of what the user is asking now",
+  "search_type": "alert|traffic|domain|ip|general",
+  "countries": ["CountryName"],
+  "ips": ["1.2.3.4"],
+  "ports": [443],
+  "protocols": ["TCP"],
+  "time_range": "now-90d or explicit range if present",
+  "aggregation_type": "none|country_terms|fingerprint_ports",
+  "entity_scope": "what exact entities/filters the answer must stay aligned to"
+}}
+"""
+
+    try:
+        response = llm.complete(prompt)
+        grounding = None
+        try:
+            grounding = json.loads(response)
+        except Exception:
+            import re
+            match = re.search(r"\{[\s\S]*\}", response)
+            if match:
+                grounding = json.loads(match.group())
+
+        if not isinstance(grounding, dict):
+            return {}
+        if not any(
+            key in grounding
+            for key in (
+                "summary",
+                "search_type",
+                "countries",
+                "ips",
+                "ports",
+                "protocols",
+                "time_range",
+                "aggregation_type",
+                "entity_scope",
+            )
+        ):
+            return {}
+
+        for key in ("countries", "ips", "ports", "protocols"):
+            if not isinstance(grounding.get(key), list):
+                grounding[key] = []
+        if not isinstance(grounding.get("summary"), str):
+            grounding["summary"] = ""
+        if not isinstance(grounding.get("search_type"), str):
+            grounding["search_type"] = "general"
+        if not isinstance(grounding.get("time_range"), str):
+            grounding["time_range"] = "now-90d"
+        if not isinstance(grounding.get("aggregation_type"), str):
+            grounding["aggregation_type"] = "none"
+        if not isinstance(grounding.get("entity_scope"), str):
+            grounding["entity_scope"] = ""
+        return _normalize_question_grounding(question, grounding, field_mappings)
+    except Exception as exc:
+        logger.warning("[%s] Question grounding failed: %s", SKILL_NAME, exc)
+        return _normalize_question_grounding(question, {}, field_mappings)
 
 
 def _execute_explicit_query(context: dict, index: str) -> dict:
@@ -2327,26 +3548,67 @@ def _plan_opensearch_query_with_llm_simplified(
     Returns None if this also fails, allowing fallback to heuristic extraction.
     """
     import json
+
+    direct_fingerprint = _build_direct_fingerprint_plan(question)
+    if direct_fingerprint:
+        return {
+            "search_terms": list(direct_fingerprint.get("search_terms") or []),
+            "ports": [],
+            "countries": [],
+            "protocols": [],
+            "search_type": "ip",
+            "matching_strategy": "term",
+            "aggregation_type": "fingerprint_ports",
+            "time_range": "now-30d",
+            "reasoning": str(direct_fingerprint.get("reasoning") or ""),
+        }
     
-    prompt = f"""Analyze this question and return ONLY valid JSON, no other text:
+    prompt = f"""You are analyzing a security question about network traffic and IPs.
+Your task: Extract structured information and return ONLY valid JSON.
 
 Question: "{question}"
 
-Return this exact JSON structure (all fields required):
+Return EXACTLY this JSON structure (all fields must be present):
 {{
   "search_terms": ["term1", "term2"],
   "ports": [443, 8080],
   "search_type": "alert|traffic|ip|general",
-  "matching_strategy": "phrase|token"
+  "matching_strategy": "phrase|token",
+  "aggregation_type": "none|fingerprint_ports|country_terms"
 }}
 
-Rules:
-- search_terms: Extract key words from question (exclude: "what", "port", "associated", pronouns)
-- ports: Extract numbers like "443", "8080" (must be 1-65535)
-- search_type: "alert" if mentions signatures/rules, "traffic" if mentions connections, "ip" if IP addresses, else "general"
-- matching_strategy: "phrase" for alerts, "token" for everything else
+CRITICAL - Search Type Determination (choose the DOMINANT intent):
+- "traffic": The user is asking for TRAFFIC RECORDS/LOGS/FLOWS showing activity
+  Examples: "any traffic from 1.1.1.1" → traffic
+           "show me connections from this IP" → traffic
+           "is there activity on port 443" → traffic
+           "what destination IPs do we connect to" → traffic
+- "ip": The user is asking for IP CHARACTERISTICS/ANALYSIS (ports, services, behavior)
+  Examples: "fingerprint 192.168.0.17" → ip
+           "what ports does 10.0.0.5 use" → ip
+           "analyze 172.16.0.1 for services" → ip
+- "alert": Asking for signature/rule names or suricata/snort alerts
+- "general": Everything else
 
-Output ONLY the JSON, nothing else."""
+KEY RULE: If the question contains BOTH "traffic" and an IP, it's asking for TRAFFIC RECORDS of that IP, so search_type="traffic", NOT "ip".
+
+CRITICAL - Aggregation Type Decision:
+1. Use "fingerprint_ports" ONLY if:
+   - search_type="ip" AND the question explicitly asks for IP analysis (keys: "fingerprint", "what ports", "what services", "profile", "analyze [IP]")
+   Examples: "fingerprint 192.168.0.17" → fingerprint_ports
+             "what ports does 10.0.0.5 use" → fingerprint_ports
+
+2. Use "country_terms" if asking about:
+   - Geographic distribution (keywords: "country", "countries", "where", "origin", "distribution by")
+
+3. Use "none" for all other queries (raw document/traffic search)
+
+EXTRACTION Rules:
+- search_terms: Extract meaningful words (exclude: "what", "port", "service", "traffic", "connection", "flow", "activity", pronouns, articles)
+- ports: Extract only valid port numbers (1-65535)
+- matching_strategy: Use "phrase" only for specific rule names, use "token" for everything else
+
+Output ONLY the JSON, nothing else. No explanations."""
 
     try:
         response = llm.complete(prompt).strip()
@@ -2354,13 +3616,33 @@ Output ONLY the JSON, nothing else."""
         
         # Try direct parse first
         try:
-            return json.loads(response)
+            result = json.loads(response)
+            # Set reasonable defaults if missing
+            if "aggregation_type" not in result:
+                result["aggregation_type"] = "none"
+            if "time_range" not in result:
+                result["time_range"] = "now-90d"
+            if "countries" not in result:
+                result["countries"] = []
+            if "protocols" not in result:
+                result["protocols"] = []
+            return result
         except json.JSONDecodeError:
             # Try extracting JSON from response
             import re
             m = re.search(r"\{[\s\S]*\}", response)
             if m:
-                return json.loads(m.group())
+                result = json.loads(m.group())
+                # Set reasonable defaults if missing
+                if "aggregation_type" not in result:
+                    result["aggregation_type"] = "none"
+                if "time_range" not in result:
+                    result["time_range"] = "now-90d"
+                if "countries" not in result:
+                    result["countries"] = []
+                if "protocols" not in result:
+                    result["protocols"] = []
+                return result
         
         return None
     except Exception as exc:
@@ -2385,6 +3667,10 @@ def _plan_opensearch_query_with_llm(
     This is fully data-agnostic - LLM makes all decisions based on field schema.
     """
     from pathlib import Path
+
+    direct_fingerprint = _build_direct_fingerprint_plan(question)
+    if direct_fingerprint:
+        return _normalize_query_plan_to_question(question, direct_fingerprint, direct_fingerprint, field_mappings)
     
     # Build conversation context
     conversation_summary = ""
@@ -2396,6 +3682,7 @@ def _plan_opensearch_query_with_llm(
             content = msg.get("content", "")[:200]
             conversation_parts.append(f"[{role}]: {content}")
         conversation_summary = "\n".join(conversation_parts)
+    question_grounding = _llm_ground_question_intent(question, llm, field_mappings)
 
     # ── BUILD DETAILED FIELD CONTEXT FOR LLM ──────────────────────────────────
     # Give LLM detailed field characteristics to analyze
@@ -2415,7 +3702,9 @@ def _plan_opensearch_query_with_llm(
             fields_list = field_mappings.get(field_type, [])
             if fields_list:
                 sample_fields = fields_list[:3]
-                field_info_parts.append(f"{description}: {', '.join(sample_fields)}")
+                sample_values = _extract_field_value_examples(field_mappings, sample_fields)[:4]
+                value_hint = f" | sample values: {', '.join(sample_values)}" if sample_values else ""
+                field_info_parts.append(f"{description}: {', '.join(sample_fields)}{value_hint}")
         
         if field_info_parts:
             field_context = "\n\nAVAILABLE FIELDS:\n" + "\n".join(field_info_parts)
@@ -2428,10 +3717,14 @@ CONVERSATION CONTEXT:
 
 USER QUESTION: "{question}"
 
+QUESTION GROUNDING FROM CURRENT QUESTION ONLY:
+{json.dumps(question_grounding, indent=2, default=str)}
+
 Additional runtime requirements:
 - Include search_type as one of: alert|traffic|domain|ip|general
 - Include matching_strategy as one of: phrase|token|term|match
 - Include field_analysis explaining which discovered field categories matter most
+- Treat QUESTION GROUNDING FROM CURRENT QUESTION ONLY as authoritative for explicit entities in the current turn
 - Return STRICT JSON only
 """
 
@@ -2439,7 +3732,6 @@ Additional runtime requirements:
         response = llm.complete(prompt)
         logger.debug("[%s] LLM Plan raw: %s", SKILL_NAME, _log_excerpt(response, limit=700))
 
-        import json
         # Try direct parse; fallback to regex JSON extraction.
         plan = None
         try:
@@ -2452,6 +3744,44 @@ Additional runtime requirements:
 
         if not plan:
             raise ValueError("No JSON in LLM response")
+
+        plan = _normalize_query_plan_to_question(question, plan, question_grounding, field_mappings)
+
+        # ── FINGERPRINTING VALIDATION ──
+        # If the question clearly asks for fingerprinting but LLM didn't detect it,
+        # fall back to simplified planning (which has explicit fingerprinting rules)
+        question_lower = question.lower()
+        has_fingerprinting_keywords = any(kw in question_lower for kw in 
+            ["fingerprint", "what ports", "what services", "client or server", "profile"])
+        has_ip_in_question = bool(_extract_ips_from_text(question))
+        
+        is_clearly_fingerprinting = has_fingerprinting_keywords and has_ip_in_question
+        is_planned_as_fingerprinting = (
+            plan.get("aggregation_type") == "fingerprint_ports" and 
+            plan.get("search_type") == "ip"
+        )
+        
+        if is_clearly_fingerprinting and not is_planned_as_fingerprinting:
+            # LLM missed fingerprinting intent; try simplified planning
+            logger.warning(
+                "[%s] Main LLM missed fingerprinting intent (has keywords: %s, has IP: %s, "
+                "planned as: %s/%s). Falling back to simplified planning...",
+                SKILL_NAME, has_fingerprinting_keywords, has_ip_in_question,
+                plan.get("search_type"), plan.get("aggregation_type")
+            )
+            raise ValueError("Fingerprinting intent not detected by main prompt")
+
+        plan_review = _llm_review_query_plan(question, conversation_summary, question_grounding, plan, llm)
+        if not plan_review.get("is_valid", True):
+            logger.warning(
+                "[%s] LLM plan grounding review rejected the plan: %s",
+                SKILL_NAME,
+                plan_review.get("issue", "Plan did not match the user question."),
+            )
+            raise ValueError(
+                "Plan-question mismatch: "
+                + (plan_review.get("issue") or "Plan did not match the user question.")
+            )
 
         # Ensure all required fields exist
         if not isinstance(plan.get("search_terms"), list):
@@ -2476,6 +3806,34 @@ Additional runtime requirements:
             strategy = "token"
         plan["matching_strategy"] = strategy
 
+        # ── FALLBACK: If search_terms is empty for IP-type search, extract from question ──
+        # The LLM may have correctly identified the search type as "ip" but failed to extract
+        # the actual IP addresses into search_terms. Apply heuristic extraction as a fallback.
+        if not plan.get("search_terms") and plan.get("search_type") == "ip":
+            extracted_ips = _extract_ips_from_text(question)
+            if extracted_ips:
+                logger.info(
+                    "[%s] LLM plan had empty search_terms for IP-type search. "
+                    "Applying fallback extraction: found %d IP(s): %s",
+                    SKILL_NAME, len(extracted_ips), extracted_ips
+                )
+                plan["search_terms"] = extracted_ips
+                plan["reasoning"] = (
+                    (plan.get("reasoning") or "") + 
+                    " [Supplemented with heuristic IP extraction from question text]"
+                )
+        
+        # Similar fallback for traffic-type searches with IPs in the question
+        if not plan.get("search_terms") and plan.get("search_type") == "traffic":
+            extracted_ips = _extract_ips_from_text(question)
+            if extracted_ips:
+                logger.info(
+                    "[%s] LLM plan had empty search_terms for traffic-type search. "
+                    "Applying fallback IP extraction: found %d IP(s): %s",
+                    SKILL_NAME, len(extracted_ips), extracted_ips
+                )
+                plan["search_terms"] = extracted_ips
+
         logger.info(
             "[%s] LLM Plan: Type=%s | Strategy=%s | Terms=%s | Countries=%s | Reasoning=%s",
             SKILL_NAME, plan.get("search_type"), plan.get("matching_strategy"),
@@ -2483,7 +3841,7 @@ Additional runtime requirements:
             plan.get("reasoning", "")[:60]
         )
 
-        return _maybe_attach_country_aggregation_plan(question, plan)
+        return plan
     except Exception as exc:
         logger.warning("[%s] LLM planning failed: %s. Attempting simplified prompt...", SKILL_NAME, exc)
         
@@ -2494,14 +3852,63 @@ Additional runtime requirements:
                        simplified_plan.get("search_type", "unknown"))
             # Fill in any missing fields
             simplified_plan.setdefault("reasoning", "Simplified LLM planning")
+            simplified_plan.setdefault("aggregation_type", "none")
             simplified_plan.setdefault("countries", [])
             simplified_plan.setdefault("protocols", [])
             simplified_plan.setdefault("time_range", "now-90d")
             simplified_plan.setdefault("field_analysis", "Using simplified LLM planning")
-            return _maybe_attach_country_aggregation_plan(question, simplified_plan)
+            simplified_plan = _normalize_query_plan_to_question(question, simplified_plan, question_grounding, field_mappings)
+
+            simplified_question_lower = question.lower()
+            simplified_has_ip = bool(_extract_ips_from_text(question))
+            simplified_asks_for_traffic = any(
+                kw in simplified_question_lower for kw in ["traffic", "connections", "activity"]
+            )
+            simplified_explicit_countries = any(
+                kw in simplified_question_lower for kw in ["country", "countries", "where", "origin", "geographic", "distribution"]
+            )
+            if (
+                simplified_plan.get("aggregation_type") == "country_terms"
+                and simplified_asks_for_traffic
+                and simplified_has_ip
+                and not simplified_explicit_countries
+            ):
+                simplified_plan["aggregation_type"] = "none"
+                simplified_plan["reasoning"] = (
+                    (simplified_plan.get("reasoning") or "Simplified LLM planning")
+                    + " [Corrected mismatched country aggregation for traffic-from-IP question]"
+                )
+            
+            # ── FALLBACK: If search_terms is empty for IP-type search, extract from question ──
+            if not simplified_plan.get("search_terms") and simplified_plan.get("search_type") == "ip":
+                extracted_ips = _extract_ips_from_text(question)
+                if extracted_ips:
+                    logger.info(
+                        "[%s] Simplified plan had empty search_terms for IP-type search. "
+                        "Applying fallback extraction: found %d IP(s): %s",
+                        SKILL_NAME, len(extracted_ips), extracted_ips
+                    )
+                    simplified_plan["search_terms"] = extracted_ips
+
+            simplified_review = _llm_review_query_plan(
+                question,
+                conversation_summary,
+                question_grounding,
+                simplified_plan,
+                llm,
+            )
+            if not simplified_review.get("is_valid", True):
+                logger.warning(
+                    "[%s] Simplified plan grounding review rejected the plan: %s",
+                    SKILL_NAME,
+                    simplified_review.get("issue", "Simplified plan did not match the user question."),
+                )
+                simplified_plan = None
+            else:
+                return simplified_plan
         
         # If even simplified LLM fails, fall back to heuristic extraction
         logger.warning("[%s] Simplified LLM also failed. Using fallback heuristic extraction.", SKILL_NAME)
-        fallback_plan = _fallback_plan_from_question(question, None)
+        fallback_plan = _fallback_plan_from_question(question, None, field_mappings)
         logger.info("[%s] Fallback plan: %s", SKILL_NAME, fallback_plan.get("reasoning", "")[:100])
-        return _maybe_attach_country_aggregation_plan(question, fallback_plan)
+        return fallback_plan

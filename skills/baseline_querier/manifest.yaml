@@ -1,4 +1,16 @@
 name: baseline_querier
+routing_group: behavioral_analysis
+orchestration_role: direct
+capability_groups:
+  - behavioral_analysis
+  - evidence_search
+answer_types:
+  - behavioral baseline comparison
+  - anomaly-vs-normal assessment
+  - evidence-backed traffic pattern analysis
+artifact_outputs:
+  - findings
+  - field_mappings
 description: >
   Searches behavioral baselines (OpenSearch vector index) and raw logs.
   Answers questions about observed traffic, IPs, ports, protocols, alerts, and
@@ -33,8 +45,33 @@ priority_keywords:
   - "country"
   - "protocol"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Routing Guard: Reserved for Follow-up Analysis
+# ──────────────────────────────────────────────────────────────────────────────
+# baseline_querier is reserved for FOLLOW-UP analysis after initial data gathering.
+# It requires explicit baseline comparison language or supervisor follow-up request.
+# For initial searching, opensearch_querier is used instead.
+reserved_for_followup_only: true
+
+followup_keywords:
+  - "compare to baseline"
+  - "baseline comparison"
+  - "baseline analysis"
+  - "analyze baseline"
+  - "research baseline"
+  - "baseline investigation"
+  - "what's normal"
+  - "normal behavior"
+
+fallback_on_block: "opensearch_querier"
+  # If user didn't ask for baseline comparison, use opensearch_querier instead
+
 min_prior_context: 0
   # Can work standalone or after fields_querier has discovered field names
+
+question_enrichment_hook: skills.baseline_querier.hooks:enrich_question_for_followup
+
+response_formatter: skills.baseline_querier.hooks:format_response
 
 returns:
   - findings (question, answer, rag_sources, log_records, evidence, confidence)
