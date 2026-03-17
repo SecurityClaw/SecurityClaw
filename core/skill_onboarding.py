@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any, Optional
 
@@ -148,6 +149,14 @@ def ensure_skill_variables_onboarded() -> None:
     If not, prompt user to onboard them (on first chat only).
     """
     load_dotenv()
+
+    # Never trigger interactive onboarding in CI or other non-interactive runs.
+    # Chat integration tests pipe stdin, which is not a TTY, so prompting here
+    # would consume the scripted chat input and abort the subprocess.
+    if os.getenv("CI") or os.getenv("SECURITYCLAW_SKIP_SKILL_ONBOARDING"):
+        return
+    if not sys.stdin or not sys.stdin.isatty():
+        return
     
     # Check onboarding state
     state = _load_onboarding_state()
