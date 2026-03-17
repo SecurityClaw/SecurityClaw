@@ -1,158 +1,281 @@
-"""
-Integration test for fingerprinting with fallback to simplified LLM plannning.
+from __future__ import annotations
 
-This test verifies the complete fingerprinting flow:
-1. Main LLM planning may fail to detect fingerprinting intent
-2. Fallback validation catches this and switches to simplified planning
-3. Simplified planning correctly detects fingerprinting and sets aggregation_type
-4. Aggregation query finds all ports (not limited to 200 documents)
-5. IP fingerprinter analyzes the full port distribution
-"""
-
-import subprocess
 import json
-import re
-import sys
-from pathlib import Path
+from typing import Any
+
+from core.chat_router.logic import execute_skill_workflow, format_response, route_question
+from core.db_connector import BaseDBConnector
+from skills.ip_fingerprinter.logic import run as run_ip_fingerprinter
+from skills.opensearch_querier.logic import run as run_opensearch
 
 
-def test_fingerprinting_integration():
-    """Test complete fingerprinting flow with LLM fallback."""
-    repo_root = Path(__file__).resolve().parents[1]
-    
-    # Run the chat with a fingerprinting query
-    result = subprocess.run(
-        [sys.executable, '-u', 'main.py', 'chat'],
-        input='fingerprint 192.168.0.17\n/exit\n',
-        capture_output=True,
-        text=True,
-        timeout=300,
-        cwd=str(repo_root)
-    )
-    
-    output = result.stdout + result.stderr
-    print("=" * 80)
-    print("FINGERPRINTING INTEGRATION TEST")
-    print("=" * 80)
-    
-    # Test 1: Check that the chat command executed and produced fingerprint-related output
-    print("\n[TEST 1] Checking fingerprinting command execution...")
-    if result.returncode != 0:
-        print("✗ FAIL: chat command exited non-zero")
-        raise AssertionError(
-            f"chat command failed with exit code {result.returncode}:\n{output[-4000:]}"
+FIELD_MAPPINGS = {
+    "ip_fields": ["destination.ip", "source.ip"],
+    "destination_ip_fields": ["destination.ip"],
+    "source_ip_fields": ["source.ip"],
+    "port_fields": ["destination.port", "source.port"],
+    "destination_port_fields": ["destination.port"],
+    "source_port_fields": ["source.port"],
+    "all_fields": ["destination.ip", "source.ip", "destination.port", "source.port", "@timestamp"],
+    "field_types": {
+        "destination.ip": "ip",
+        "source.ip": "ip",
+        "destination.port": "long",
+        "source.port": "long",
+        "@timestamp": "date",
+    },
+}
+
+
+class _Cfg:
+    def get(self, section: str, key: str, default=None):
+        values = {
+            ("db", "logs_index"): "logstash*",
+            ("llm", "anti_hallucination_check"): False,
+        }
+        return values.get((section, key), default)
+
+
+class _Indices:
+    def get_mapping(self, index: str | None = None) -> dict[str, Any]:
+        return {
+            "logstash-test": {
+                "mappings": {
+                    "properties": {
+                        "destination": {
+                            "properties": {
+                                "ip": {"type": "ip"},
+                                "port": {"type": "long"},
+                            }
+                        },
+                        "source": {
+                            "properties": {
+                                "ip": {"type": "ip"},
+                                "port": {"type": "long"},
+                            }
+                        },
+                        "@timestamp": {"type": "date"},
+                    }
+                }
+            }
+        }
+
+
+class _Client:
+    def __init__(self):
+        self.indices = _Indices()
+        self.search_calls: list[dict[str, Any]] = []
+
+    def search(self, index: str | None = None, body: dict | None = None, size: int = 0) -> dict[str, Any]:
+        payload = body or {}
+        self.search_calls.append(payload)
+
+        aggs = payload.get("aggs") or {}
+        assert any(key.startswith("service_ports_target_destination_") for key in aggs)
+
+        return {
+            "hits": {"total": {"value": 46}},
+            "aggregations": {
+                "service_ports_target_destination_0": {
+                    "ports": {
+                        "buckets": [
+                            {"key": 22, "doc_count": 30},
+                            {"key": 9200, "doc_count": 12},
+                            {"key": 3389, "doc_count": 4},
+                        ]
+                    }
+                }
+            },
+        }
+
+
+class _MockDBConnector(BaseDBConnector):
+    def __init__(self):
+        self._client = _Client()
+
+    def search(self, index: str, query: dict, size: int = 100) -> list[dict]:
+        return []
+
+    def search_with_metadata(self, index: str, query: dict, size: int = 100) -> dict[str, Any]:
+        return {"results": [], "total": 0}
+
+    def aggregate(self, index: str, query: dict) -> dict[str, Any]:
+        return self._client.search(index=index, body=query, size=0)
+
+    def index_document(self, index: str, doc_id: str, body: dict) -> dict:
+        raise NotImplementedError()
+
+    def bulk_index(self, index: str, documents: list[dict]) -> dict:
+        raise NotImplementedError()
+
+    def get_anomaly_findings(self, detector_id: str, from_epoch_ms: int | None = None, size: int = 200) -> list[dict]:
+        return []
+
+    def knn_search(self, index: str, vector: list[float], k: int = 5, filters: dict | None = None) -> list[dict]:
+        return []
+
+    def ensure_index(self, index: str, mappings: dict, settings: dict | None = None) -> None:
+        return None
+
+
+class _RouteLLM:
+    def chat(self, messages: list[dict]) -> str:
+        return json.dumps(
+            {
+                "reasoning": "Direct passive fingerprint request for a specific IP.",
+                "skills": ["ip_fingerprinter"],
+                "parameters": {"ip": "192.168.0.17"},
+            }
         )
 
-    fingerprint_signals = [
-        "Aggregation Type: fingerprint_ports",
-        "Passive fingerprint for 192.168.0.17",
-        "192.168.0.17",
-    ]
-    if any(signal in output for signal in fingerprint_signals):
-        print("✓ PASS: fingerprinting flow produced output for the target IP")
-    else:
-        print("✗ FAIL: fingerprinting flow did not produce recognizable output")
-        raise AssertionError(f"Fingerprint output not recognized:\n{output[-4000:]}")
-    
-    # Test 2: Check that simplified planning is triggered
-    print("\n[TEST 2] Checking simplified planning fallback...")
-    if "Main LLM missed fingerprinting intent" in output:
-        print("✓ PASS: Fallback to simplified planning triggered")
-    else:
-        print("⚠ INFO: Main LLM may have worked correctly on first try")
-    
-    # Test 3: Check that aggregation_type is fingerprint_ports
-    print("\n[TEST 3] Checking aggregation type...")
-    if "Aggregation Type: fingerprint_ports" in output:
-        print("✓ PASS: aggregation_type set to fingerprint_ports")
-    else:
-        print("✗ FAIL: aggregation_type not detected")
-        raise AssertionError("aggregation_type not detected")
-    
-    # Test 4: Check that aggregation found multiple ports
-    print("\n[TEST 4] Checking port aggregation results...")
-    port_match = re.search(r'found (\d+) unique ports', output)
-    if port_match:
-        port_count = int(port_match.group(1))
-        print(f"✓ PASS: Found {port_count} unique ports in aggregation")
-        
-        if port_count > 200:
-            print(f"  ✓ EXCELLENT: Found {port_count} ports (full aggregation, not 200-doc sample)")
-        elif port_count > 50:
-            print(f"  ✓ GOOD: Found {port_count} ports (significant aggregation)")
-        else:
-            print(f"  ⚠ WARNING: Only {port_count} ports found (check if data exists)")
-    else:
-        print("✗ FAIL: Could not determine port count")
-        raise AssertionError("Could not determine port count")
-    
-    # Test 5: Check that port 22 is found (a critical port for Linux/SSH)
-    print("\n[TEST 5] Checking for port 22 (SSH)...")
-    if "22 (ssh)" in output or "port 22" in output or "port: 22" in output:
-        print("✓ PASS: Port 22 (SSH) found in fingerprinting")
-    elif "22" in output:
-        print("✓ PASS: Port 22 found (with or without service name)")
-    else:
-        print("✗ FAIL: Port 22 not found in results")
-        # This might be OK if there's no SSH traffic, so just warn
-        print("  (This is only a failure if the database actually has port 22 traffic)")
-    
-    # Test 6: Check for reasonable port list
-    print("\n[TEST 6] Checking port list diversity...")
-    port_patterns = [
-        r'137 \(netbios-ns\)',
-        r'9200 \(opensearch\)',
-        r'80 \(http\)',
-    ]
-    found_ports = sum(1 for pattern in port_patterns if re.search(pattern, output, re.IGNORECASE))
-    print(f"   Found {found_ports}/{len(port_patterns)} expected service ports")
-    if found_ports >= 2:
-        print("✓ PASS: Multiple known services identified")
-    else:
-        print("⚠ WARNING: Expected more known services")
-    
-    # Test 7: Check final result format
-    print("\n[TEST 7] Checking fingerprinting result...")
-    if "likely_server" in output or "likely_client" in output:
-        print("✓ PASS: Role assessment (client/server) provided")
-    
-    if "likely OS:" in output or "Likely OS:" in output:
-        print("✓ PASS: OS classification provided")
-    
-    if "confidence" in output:
-        print("✓ PASS: Confidence levels provided")
-    
-    # Test 8: Verify no truncation to 200 docs
-    print("\n[TEST 8] Checking for full aggregation (not 200-doc limit)...")
-    if "25670 matching records" in output or "25670 total records" in output:
-        print("✓ PASS: Aggregation processed full dataset (25670+ records)")
-    elif "matching records" in output:
-        match = re.search(r'(\d+) (?:matching|total) records', output)
-        if match:
-            record_count = int(match.group(1))
-            if record_count > 200:
-                print(f"✓ PASS: Aggregation processed {record_count} records (not limited to 200)")
-            else:
-                print(f"⚠ WARNING: Only {record_count} records processed")
-    else:
-        print("⚠ INFO: Could not verify record count")
-    
-    print("\n" + "=" * 80)
-    print("FINGERPRINTING INTEGRATION TEST RESULTS")
-    print("=" * 80)
-    print("\nKEY ACHIEVEMENTS:")
-    print("✓ Fallback to simplified planning works")
-    print("✓ Fingerprinting intent correctly detected")
-    print("✓ Aggregation query executes across full dataset")
-    print("✓ Multiple ports discovered and analyzed")
-    print("✓ Port 22 found (critical for service identification)")
-    print("\nThis confirms that the LLM-only solution is working correctly!")
-    print("=" * 80 + "\n")
-    
-if __name__ == "__main__":
-    import sys
-    try:
-        test_fingerprinting_integration()
-    except AssertionError:
-        sys.exit(1)
-    sys.exit(0)
+
+class _SkillLLM:
+    def __init__(self):
+        self.field_plan_calls = 0
+        self.fingerprint_summary_calls = 0
+
+    def complete(self, prompt: str, **kwargs) -> str:
+        if "Choose the best discovered fields for a passive IP fingerprint aggregation." in prompt:
+            self.field_plan_calls += 1
+            return json.dumps(
+                {
+                    "ip_fields": ["destination.ip"],
+                    "port_fields": ["destination.port"],
+                    "reasoning": "Use the destination-side IP and port fields for target-owned service evidence.",
+                }
+            )
+        if "Interpret this passive IP fingerprint from aggregated network evidence." in prompt:
+            self.fingerprint_summary_calls += 1
+            return json.dumps(
+                {
+                    "summary": "The host behaves like a server exposing SSH, OpenSearch, and RDP.",
+                    "likely_role": "server",
+                    "confidence": 0.91,
+                    "evidence": [
+                        "Port 22 is consistently observed",
+                        "Port 9200 suggests an OpenSearch service",
+                        "Port 3389 indicates remote desktop exposure",
+                    ],
+                }
+            )
+        raise AssertionError(f"Unexpected prompt sent to skill LLM: {prompt[:200]}")
+
+
+class _NoLLM:
+    def chat(self, messages: list[dict]) -> str:
+        raise AssertionError("format_response should use deterministic formatting for fingerprint results")
+
+
+class _Registry:
+    action = "mock"
+    source = "test"
+    cache_path = ""
+    warning = ""
+
+    def classify(self, port: int, protocol: str | None = None) -> dict[str, Any]:
+        service_names = {
+            22: "ssh",
+            9200: "opensearch",
+            3389: "ms-wbt-server",
+        }
+        return {
+            "service_name": service_names.get(port, str(port)),
+            "description": "",
+            "registered": True,
+            "range_class": "system",
+            "ephemeral_likelihood": "unlikely",
+            "ephemeral_reason": "",
+        }
+
+
+class _Runner:
+    def __init__(self, db: BaseDBConnector, llm: Any):
+        self.db = db
+        self.llm = llm
+        self.calls: list[str] = []
+
+    def _build_context(self) -> dict[str, Any]:
+        return {
+            "db": self.db,
+            "llm": self.llm,
+            "config": _Cfg(),
+        }
+
+    def dispatch(self, skill_name: str, context: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(skill_name)
+        if skill_name == "fields_querier":
+            return {
+                "status": "ok",
+                "field_mappings": FIELD_MAPPINGS,
+                "findings": {"field_mappings": FIELD_MAPPINGS},
+            }
+        if skill_name == "opensearch_querier":
+            return run_opensearch(context)
+        if skill_name == "ip_fingerprinter":
+            return run_ip_fingerprinter(context)
+        raise AssertionError(f"Unexpected skill dispatch: {skill_name}")
+
+
+def test_fingerprinting_integration_uses_mock_db(monkeypatch):
+    monkeypatch.setattr(
+        "skills.ip_fingerprinter.logic.load_port_registry",
+        lambda cfg, force_update=False: _Registry(),
+    )
+
+    routing_decision = route_question(
+        user_question="fingerprint 192.168.0.17",
+        available_skills=[
+            {"name": "fields_querier", "description": "Field schema discovery"},
+            {"name": "opensearch_querier", "description": "Direct log search"},
+            {"name": "ip_fingerprinter", "description": "Passive IP fingerprinting"},
+        ],
+        llm=_RouteLLM(),
+        instruction="test",
+        conversation_history=[],
+    )
+
+    db = _MockDBConnector()
+    skill_llm = _SkillLLM()
+    runner = _Runner(db=db, llm=skill_llm)
+
+    skill_results = execute_skill_workflow(
+        skills=routing_decision["skills"],
+        runner=runner,
+        context={},
+        routing_decision=routing_decision,
+        conversation_history=[],
+        aggregated_results={},
+    )
+
+    assert routing_decision["skills"] == ["fields_querier", "opensearch_querier", "ip_fingerprinter"]
+    assert runner.calls == ["fields_querier", "opensearch_querier", "ip_fingerprinter"]
+    assert len(db._client.search_calls) == 1
+
+    opensearch_result = skill_results["opensearch_querier"]
+    assert opensearch_result["status"] == "ok"
+    assert opensearch_result["aggregation_type"] == "fingerprint_ports"
+    assert opensearch_result["results_count"] == 46
+    assert opensearch_result["observed_ports"] == [22, 3389, 9200]
+    assert opensearch_result["aggregated_ports"][22]["observations"] == 30
+    assert opensearch_result["fingerprint_likely_role"] == "server"
+
+    fingerprint_result = skill_results["ip_fingerprinter"]
+    assert fingerprint_result["status"] == "ok"
+    assert fingerprint_result["ip"] == "192.168.0.17"
+    assert set(fingerprint_result["port_summary"]["listening_ports"]) == {22, 3389, 9200}
+    assert fingerprint_result["likely_role"]["classification"] == "likely_server"
+
+    assert skill_llm.field_plan_calls == 1
+    assert skill_llm.fingerprint_summary_calls == 1
+
+    rendered = format_response(
+        "fingerprint 192.168.0.17",
+        routing_decision,
+        skill_results,
+        llm=_NoLLM(),
+        cfg=_Cfg(),
+    )
+
+    assert "Passive fingerprint for 192.168.0.17" in rendered
+    assert "22 (ssh)" in rendered
+    assert "9200 (opensearch)" in rendered

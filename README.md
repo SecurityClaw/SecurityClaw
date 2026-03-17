@@ -703,6 +703,7 @@ Respond in JSON format with:
 
 Contributions welcome! Areas for enhancement:
 - [ ] Elasticsearch compatibility testing
+- [ ] anomaly_triage, forensic_examiner currently underperforming or not working depending on the query patterns; active validation and refactor needed
 - [ ] Advanced MITRE ATT&CK mapping
 - [ ] Enhanced RAG context (e.g., no hard-coded country codes, instead parse through RAG)
 - [ ] Multi-tenant support
