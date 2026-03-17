@@ -12,10 +12,12 @@ This test verifies the complete fingerprinting flow:
 import subprocess
 import json
 import re
+from pathlib import Path
 
 
 def test_fingerprinting_integration():
     """Test complete fingerprinting flow with LLM fallback."""
+    repo_root = Path(__file__).resolve().parents[1]
     
     # Run the chat with a fingerprinting query
     result = subprocess.run(
@@ -24,7 +26,7 @@ def test_fingerprinting_integration():
         capture_output=True,
         text=True,
         timeout=300,
-        cwd='/mnt/c/Users/tsike/Desktop/SecurityClaw'
+        cwd=str(repo_root)
     )
     
     output = result.stdout + result.stderr
@@ -38,7 +40,7 @@ def test_fingerprinting_integration():
         print("✓ PASS: Query contains 'fingerprint' and target IP")
     else:
         print("✗ FAIL: Query not recognized")
-        return False
+        raise AssertionError("Query not recognized")
     
     # Test 2: Check that simplified planning is triggered
     print("\n[TEST 2] Checking simplified planning fallback...")
@@ -53,7 +55,7 @@ def test_fingerprinting_integration():
         print("✓ PASS: aggregation_type set to fingerprint_ports")
     else:
         print("✗ FAIL: aggregation_type not detected")
-        return False
+        raise AssertionError("aggregation_type not detected")
     
     # Test 4: Check that aggregation found multiple ports
     print("\n[TEST 4] Checking port aggregation results...")
@@ -70,7 +72,7 @@ def test_fingerprinting_integration():
             print(f"  ⚠ WARNING: Only {port_count} ports found (check if data exists)")
     else:
         print("✗ FAIL: Could not determine port count")
-        return False
+        raise AssertionError("Could not determine port count")
     
     # Test 5: Check that port 22 is found (a critical port for Linux/SSH)
     print("\n[TEST 5] Checking for port 22 (SSH)...")
@@ -135,10 +137,10 @@ def test_fingerprinting_integration():
     print("\nThis confirms that the LLM-only solution is working correctly!")
     print("=" * 80 + "\n")
     
-    return True
-
-
 if __name__ == "__main__":
     import sys
-    success = test_fingerprinting_integration()
-    sys.exit(0 if success else 1)
+    try:
+        test_fingerprinting_integration()
+    except AssertionError:
+        sys.exit(1)
+    sys.exit(0)

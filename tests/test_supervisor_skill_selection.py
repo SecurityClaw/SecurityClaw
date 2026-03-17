@@ -68,17 +68,17 @@ class TestSupervisorRoutingRules:
             previous_eval={"satisfied": False},
         )
         
-        # The supervisor now performs an explicit grounding pass before the
-        # next-action prompt, so there may be more than one LLM call.
-        assert llm.chat.call_count >= 1
-        call_args = llm.chat.call_args_list[-1][0][0]
-        prompt_text = "\n".join([str(m.get("content", "")) for m in call_args])
-        
-        # Should mention threat_analyst priority for reputation
-        assert any(
-            "reputation" in p.lower() and "threat_analyst" in p.lower()
-            for p in prompt_text.split("\n")
-        ), "Prompt should guide threat_analyst for reputation questions"
+        assert result["skills"] == ["threat_analyst"]
+
+        # Deterministic direct-routing may short-circuit before any LLM call.
+        if llm.chat.call_count >= 1:
+            call_args = llm.chat.call_args_list[-1][0][0]
+            prompt_text = "\n".join([str(m.get("content", "")) for m in call_args])
+
+            assert any(
+                "reputation" in p.lower() and "threat_analyst" in p.lower()
+                for p in prompt_text.split("\n")
+            ), "Prompt should guide threat_analyst for reputation questions"
 
     def test_threat_keyword_questions_route_correctly(self, available_skills):
         """RULE: Questions with threat/malicious/risk keywords should hint at threat_analyst."""

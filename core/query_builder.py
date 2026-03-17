@@ -8,6 +8,12 @@ This module discovers available fields from RAG and builds intelligent queries.
 
 All field-aware query building happens here. No hardcoded field names.
 """
+
+# ARCHITECTURE GUARDRAIL:
+# Do not add hardcoded field names or synthetic field aliases in this module.
+# Field semantics and concrete field names must come from discovered mappings and
+# fields_rag.json / field-querier output, not from query-builder guesses.
+
 from __future__ import annotations
 
 import logging
