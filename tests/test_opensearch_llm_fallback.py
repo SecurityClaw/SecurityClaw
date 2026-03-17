@@ -448,8 +448,31 @@ def test_format_response_renders_fingerprint_summary():
     assert "Remote destination ports contacted by 192.168.0.16 were also observed: 53." in rendered
 
 
-def test_discover_field_mappings_classifies_numeric_port_fields():
-    from core.query_builder import discover_field_mappings
+def test_discover_field_mappings_classifies_numeric_port_fields(tmp_path, monkeypatch):
+    from core import query_builder
+
+    rag_path = tmp_path / "fields_rag.json"
+    rag_path.write_text(
+        json.dumps(
+            [
+                {
+                    "category": "field_documentation",
+                    "fields": {
+                        "src_port": {
+                            "inferred_type": "port",
+                            "description": "Source port observed in the network flow",
+                        },
+                        "dest_port": {
+                            "inferred_type": "port",
+                            "description": "Destination port observed in the network flow",
+                        },
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(query_builder, "_FIELDS_RAG_PATH", rag_path)
 
     class _Client:
         class indices:
@@ -472,7 +495,7 @@ def test_discover_field_mappings_classifies_numeric_port_fields():
         def __init__(self):
             self._client = _Client()
 
-    mappings = discover_field_mappings(_DB(), llm=None)
+    mappings = query_builder.discover_field_mappings(_DB(), llm=None)
 
     assert "dest_port" in mappings["port_fields"]
     assert "dest_port" in mappings["destination_port_fields"]
