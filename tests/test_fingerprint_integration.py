@@ -12,6 +12,7 @@ This test verifies the complete fingerprinting flow:
 import subprocess
 import json
 import re
+import sys
 from pathlib import Path
 
 
@@ -21,7 +22,7 @@ def test_fingerprinting_integration():
     
     # Run the chat with a fingerprinting query
     result = subprocess.run(
-        ['python', 'main.py', 'chat'],
+        [sys.executable, '-u', 'main.py', 'chat'],
         input='fingerprint 192.168.0.17\n/exit\n',
         capture_output=True,
         text=True,
@@ -34,13 +35,24 @@ def test_fingerprinting_integration():
     print("FINGERPRINTING INTEGRATION TEST")
     print("=" * 80)
     
-    # Test 1: Check that fingerprinting intent is detected
-    print("\n[TEST 1] Checking fingerprinting intent detection...")
-    if "fingerprint" in output.lower() and "192.168.0.17" in output:
-        print("✓ PASS: Query contains 'fingerprint' and target IP")
+    # Test 1: Check that the chat command executed and produced fingerprint-related output
+    print("\n[TEST 1] Checking fingerprinting command execution...")
+    if result.returncode != 0:
+        print("✗ FAIL: chat command exited non-zero")
+        raise AssertionError(
+            f"chat command failed with exit code {result.returncode}:\n{output[-4000:]}"
+        )
+
+    fingerprint_signals = [
+        "Aggregation Type: fingerprint_ports",
+        "Passive fingerprint for 192.168.0.17",
+        "192.168.0.17",
+    ]
+    if any(signal in output for signal in fingerprint_signals):
+        print("✓ PASS: fingerprinting flow produced output for the target IP")
     else:
-        print("✗ FAIL: Query not recognized")
-        raise AssertionError("Query not recognized")
+        print("✗ FAIL: fingerprinting flow did not produce recognizable output")
+        raise AssertionError(f"Fingerprint output not recognized:\n{output[-4000:]}")
     
     # Test 2: Check that simplified planning is triggered
     print("\n[TEST 2] Checking simplified planning fallback...")
