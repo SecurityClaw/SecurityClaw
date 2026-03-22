@@ -194,6 +194,25 @@ def _apply_query_filter(docs: list[dict], query: dict) -> list[dict]:
         field, value = next(iter(q["term"].items()))
         return [d for d in docs if _get_nested(d, field) == value]
 
+    if "terms" in q:
+        field, values = next(iter(q["terms"].items()))
+        return [d for d in docs if _get_nested(d, field) in values]
+
+    if "bool" in q:
+        # Nested bool without explicit must key — try should
+        should_clauses = q["bool"].get("should", [])
+        min_match = q["bool"].get("minimum_should_match", 1)
+        if should_clauses:
+            result = []
+            for doc in docs:
+                matched = sum(
+                    1 for clause in should_clauses
+                    if _apply_query_filter([doc], {"query": clause})
+                )
+                if matched >= min_match:
+                    result.append(doc)
+            return result
+
     return docs
 
 
@@ -202,6 +221,11 @@ def _apply_range(docs: list[dict], range_clause: dict) -> list[dict]:
     for field, conditions in range_clause.items():
         gte = conditions.get("gte")
         lte = conditions.get("lte")
+        # Relative time strings like "now-2M" cannot be compared numerically — pass all
+        if isinstance(gte, str) and gte.startswith("now"):
+            continue
+        if isinstance(lte, str) and lte.startswith("now"):
+            continue
         filtered = []
         for doc in result:
             val = _get_nested(doc, field)

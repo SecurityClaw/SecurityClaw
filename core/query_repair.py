@@ -184,14 +184,28 @@ class QueryRepairStrategy:
         """Ask LLM to fix the query with increasingly detailed instructions."""
         
         memory = get_memory()
-        
-        # Only use cached fix on very first attempt - if it fails, we need new approaches
+
+        # On first attempt, check if we have a known structural fix for this error pattern.
+        # Guard: reject cached fixes that introduce IP addresses absent from the original query
+        # (prevents stale cache entries for a different query from polluting this repair).
         if attempt == 0:
             known_fix = memory.get_known_fix(error_msg)
             if known_fix:
-                logger.info("[Repair] Using known fix for this error pattern")
-                return known_fix["fixed"]
-        
+                cached_fixed = known_fix.get("fixed") or {}
+                _ip_re = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+                original_ips = set(_ip_re.findall(json.dumps(query)))
+                fixed_ips = set(_ip_re.findall(json.dumps(cached_fixed)))
+                # Only apply the cached fix if it doesn't introduce IPs not in the original
+                new_ips = fixed_ips - original_ips
+                if not new_ips:
+                    logger.info("[Repair] Applying known cached fix (attempt 0)")
+                    return cached_fixed
+                else:
+                    logger.warning(
+                        "[Repair] Rejected cached fix: introduces IPs %s absent from original query",
+                        new_ips,
+                    )
+
         # Build repair prompt based on retry attempt
         # Force different approaches on retries to avoid reusing failed fixes
         if attempt == 0:

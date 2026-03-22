@@ -1,28 +1,23 @@
 ---
 skill: ip_fingerprinter
 description: >
-  Data-agnostic IP fingerprinting skill. Analyzes pre-aggregated port observations
-  from any log schema. The LLM orchestrates field discovery and query construction;
-  this skill receives only aggregated port counts and performs pure analysis:
-  service classification, ephemeral filtering, role inference, and OS-family scoring.
+  Passive IP fingerprinting from aggregated port observations.
+  Analyzes pre-aggregated port data and infers host role, services, and OS patterns.
+  Data-agnostic: works with any schema via opensearch_querier's port aggregation.
 ---
 
-# IPFingerprinter - Data-Agnostic IP Fingerprinting
+# IP Fingerprinter - Passive Port Analysis
 
-## Architecture: Skills Separate Function, LLM Orchestrates
+## Architecture: Supervisor Orchestrates Prerequisites
 
-This skill is **completely data-agnostic**:
-- Does NOT know about field names (no `src_ip`, `dest_ip`, `port` hardcoding)
-- Does NOT perform queries or schema discovery
-- Does NOT handle field mappings or data access
-- **Only performs analytical enrichment of pre-aggregated data**
-
-The **LLM orchestrates** the entire flow:
-1. **fields_querier** → Discovers available fields in data
-2. **LLM decision** → "Which field is destination IP? Which is destination port?"
-3. **opensearch_querier** → Aggregates ports using LLM-selected fields
-4. **ip_fingerprinter** (this skill) → Analyzes aggregated counts
-5. **LLM synthesis** → Presents results to user
+The **supervisor** handles orchestration based on manifest declarations:
+1. Supervisor sees user asks to "fingerprint 192.168.0.1"
+2. Supervisor checks manifest → ip_fingerprinter requires "evidence_search"
+3. Supervisor routes to opensearch_querier to gather port evidence for the IP
+4. opensearch_querier returns aggregated ports for that IP
+5. Supervisor passes those results to ip_fingerprinter via previous_results
+6. ip_fingerprinter analyzes the aggregated ports
+7. ip_fingerprinter returns role, services, OS likelihood, etc.
 
 ## Role
 You are a **pure analysis skill** for network fingerprinting.

@@ -85,6 +85,7 @@ class OllamaProvider(BaseLLMProvider):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        format: Optional[str] = None,
     ) -> str:
         payload = {
             "model": self.model,
@@ -93,8 +94,11 @@ class OllamaProvider(BaseLLMProvider):
             "options": {
                 "temperature": temperature or self.temperature,
                 "num_predict": max_tokens or self.max_tokens,
+                "num_ctx": max_tokens or self.max_tokens,  # Context window matches max_tokens from config
             },
         }
+        if format:
+            payload["format"] = format
         try:
             resp = self._requests.post(
                 f"{self.base_url}/api/chat",

@@ -10,43 +10,55 @@ answer_types:
   - direct record lookup with known schema
 artifact_inputs:
   - schema_discovery
+  - discovered_fields  # CRITICAL: Must come from fields_querier
 artifact_outputs:
   - results
   - results_count
-  - countries
-  - ports
+  - aggregated_ports
   - protocols
   - time_range
 description: >
-  Direct OpenSearch query execution for when exact field names are known.
-  Searches logs with precise filters when schema is understood.
+  DATA-AGNOSTIC OpenSearch query executor.
+  
+  !!!CRITICAL CONSTRAINT!!!
+  This skill ONLY operates with discovered field names from fields_querier.
+  DO NOT add hardcoded field name assumptions to future versions.
+  
+  REQUIRES: fields_querier to have run first and discovered:
+    - destination_ip_field (e.g., "destination.ip" or "dest_ip")
+    - destination_port_field (e.g., "destination.port" or "dest_port")
+    - protocol_field (optional, e.g., "network.transport")
+  
+  Returns: Aggregated ports with observation counts for fingerprinting
 
 can_answer:
-  - "log search with known field names"
-  - "traffic from specific country/IP/port (after schema discovery)"
-  - "connection patterns"
-  - "alert type filtering"
-  - "alert/event filtering"
-  - "event type searches"
-  - "log signature matching"
+  - "direct log search and filter queries against OpenSearch"
+  - "traffic to IPs (after field discovery)"
+  - "connection patterns to targets"
+  - "ports in use on servers"
+  - "network flows after schema known"
 
 cannot_answer:
-  - "field schema discovery"
-  - "user-friendly term to field mapping"
-  - "generic alert queries without specific type/filter"
-  - "generic signal/event queries without criteria"
-  - "IP reputation"
-  - "timeline reconstruction"
+  - "field schema discovery (use fields_querier)"
+  - "user-friendly term to field mapping (use fields_querier)"
+  - "generic queries without schema (data-agnostic requires discovery first)"
+  - "any field question without running fields_querier first"
 
 priority_keywords:
-  - "search"
-  - "find"
-  - "query"
-  - "filter"
+  - "traffic to"
+  - "ports on"
+  - "fingerprint"
+  - "flows to"
 
 min_prior_context: 1
-  # Works best after rag_querier has discovered available fields
-  # Can attempt directly but may fail if schema is wrong
+  # MUST have fields_querier results to know actual field names
+  # Will reject and error if fields_querier hasn't run
+
+prerequisites:
+  - skill: fields_querier
+    required: true
+    reason: "Discover actual field names (destination_ip_field, destination_port_field, protocol_field)"
+    must_succeed: true
 
 returns:
   - results (raw log records)
