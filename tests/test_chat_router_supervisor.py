@@ -178,10 +178,17 @@ def test_route_question_chains_field_discovery_into_opensearch_for_alert_search(
     assert result["skills"] == ["fields_querier", "opensearch_querier"]
 
 
-def test_route_question_shortcuts_explicit_private_ip_threat_intel_to_threat_analyst():
+def test_route_question_threat_intel_routes_via_llm_to_threat_analyst():
+    """Threat-intel routing is LLM-driven; verify the LLM decision is respected."""
     class _RouteLLM:
         def chat(self, messages: list[dict]):
-            raise AssertionError("LLM should not be called for direct threat-intel IP routing")
+            return json.dumps(
+                {
+                    "reasoning": "User explicitly asked for threat intelligence on an IP.",
+                    "skills": ["threat_analyst"],
+                    "parameters": {"question": "Any threat intel on 192.168.0.16"},
+                }
+            )
 
     result = route_question(
         user_question="Any threat intel on 192.168.0.16",
@@ -348,20 +355,6 @@ def test_decide_node_prepends_fingerprint_prerequisites_for_chat_flow():
 def test_supervisor_next_action_anchors_fingerprint_followup_to_previous_user_ip():
     class _FingerprintFollowupLLM:
         def chat(self, messages: list[dict]):
-            prompt = messages[-1].get("content", "")
-            if "Analyze ONLY the current user question below." in prompt:
-                return json.dumps(
-                    {
-                        "summary": "Fingerprint the previously discussed IP using ports and services.",
-                        "requested_capability": "composite workflow",
-                        "immediate_need": "gather evidence for host fingerprinting",
-                        "preferred_routing_groups": ["host_fingerprinting"],
-                        "disallowed_routing_groups": ["geo_enrichment"],
-                        "must_preserve": ["ports", "services"],
-                        "must_not_reframe_as": ["geolocation lookup"],
-                        "confidence": 0.98,
-                    }
-                )
             return json.dumps(
                 {
                     "reasoning": "Use the fingerprinting skill for the referenced IP.",
@@ -399,20 +392,6 @@ def test_supervisor_next_action_anchors_fingerprint_followup_to_previous_user_ip
 def test_decide_node_preserves_anchored_fingerprint_followup_for_routing_guards():
     class _FingerprintFollowupLLM:
         def chat(self, messages: list[dict]):
-            prompt = messages[-1].get("content", "")
-            if "Analyze ONLY the current user question below." in prompt:
-                return json.dumps(
-                    {
-                        "summary": "Fingerprint the previously discussed IP using ports and services.",
-                        "requested_capability": "composite workflow",
-                        "immediate_need": "gather evidence for host fingerprinting",
-                        "preferred_routing_groups": ["host_fingerprinting"],
-                        "disallowed_routing_groups": ["geo_enrichment"],
-                        "must_preserve": ["ports", "services"],
-                        "must_not_reframe_as": ["geolocation lookup"],
-                        "confidence": 0.98,
-                    }
-                )
             return json.dumps(
                 {
                     "reasoning": "Use the fingerprinting skill for the referenced IP.",
@@ -454,26 +433,13 @@ def test_decide_node_preserves_anchored_fingerprint_followup_for_routing_guards(
 
 
 def test_supervisor_next_action_promotes_host_fingerprint_skill_when_plan_only_has_evidence_search():
+    """When the LLM returns ip_fingerprinter, manifest expansion adds prerequisites."""
     class _EvidenceOnlyFingerprintLLM:
         def chat(self, messages: list[dict]):
-            prompt = messages[-1].get("content", "")
-            if "Analyze ONLY the current user question below." in prompt:
-                return json.dumps(
-                    {
-                        "summary": "Passive fingerprint the IP using observed behavior and port evidence.",
-                        "requested_capability": "composite workflow",
-                        "immediate_need": "gather evidence for host fingerprinting",
-                        "preferred_routing_groups": ["schema_discovery", "evidence_search", "host_fingerprinting"],
-                        "disallowed_routing_groups": ["geo_enrichment"],
-                        "must_preserve": ["192.168.0.16", "fingerprinting"],
-                        "must_not_reframe_as": ["geolocation lookup", "traffic analysis"],
-                        "confidence": 0.99,
-                    }
-                )
             return json.dumps(
                 {
                     "reasoning": "Gather fingerprint evidence from logs first.",
-                    "skills": ["opensearch_querier"],
+                    "skills": ["ip_fingerprinter"],
                     "parameters": {"question": "fingerprint 192.168.0.16"},
                 }
             )
@@ -1176,49 +1142,23 @@ def test_supervisor_evaluation_does_not_satisfy_country_mismatch_results():
     assert "wrong country" in eval_result["reasoning"].lower() or "missing" in eval_result
 
 
-def test_opensearch_validation_rejects_country_mismatch_samples():
-    from skills.opensearch_querier.logic import _llm_validate_results
+def test_opensearch_query_includes_country_filter_for_country_question():
+    """_build_opensearch_query with countries=["Russia"] must include Russia in query body."""
+    from skills.opensearch_querier.logic import _build_opensearch_query
 
-    mock_llm = MagicMock()
-    mock_llm.complete.side_effect = [
-        json.dumps(
-            {
-                "summary": "User wants traffic from Russia in the past 30 days.",
-                "search_type": "traffic",
-                "countries": ["Russia"],
-                "ips": [],
-                "ports": [],
-                "protocols": [],
-                "time_range": "now-30d",
-                "aggregation_type": "none",
-                "entity_scope": "Traffic from Russia in the past 30 days.",
-            }
-        ),
-        json.dumps(
-            {
-                "is_valid": False,
-                "issue": "The question asks for Russia but the sampled results are for China.",
-                "suggestion": "Re-run the search with country grounding preserved from the question.",
-                "confidence": 0.98,
-            }
-        ),
-    ]
-
-    validation = _llm_validate_results(
-        question="any traffic from russia in the past 30 days",
+    query = _build_opensearch_query(
         search_terms=[],
-        requested_filters={"countries": ["Russia"], "ports": [], "protocols": [], "time_range": "now-30d"},
-        results=[
-            {"geoip": {"country_name": "China"}, "src_ip": "118.190.162.28"},
-            {"geoip": {"country_name": "China"}, "src_ip": "223.4.221.28"},
-        ],
-        field_mappings={"country_fields": ["geoip.country_name"]},
-        llm=mock_llm,
+        dest_ip_field="dest_ip",
+        time_range="now-30d",
+        size=200,
+        src_ip_field="src_ip",
+        ip_direction="source",
+        countries=["Russia"],
     )
 
-    assert validation["is_valid"] is False
-    assert "Russia" in validation["issue"]
-    assert mock_llm.complete.call_count == 2
+    query_str = json.dumps(query)
+    assert "Russia" in query_str
+    assert "geoip.country_name" in query_str or "source.geo.country_name" in query_str
 
 
 def test_route_question_strips_threat_analyst_for_plain_country_traffic_question():
@@ -1249,39 +1189,40 @@ def test_route_question_strips_threat_analyst_for_plain_country_traffic_question
     assert result["skills"] == ["fields_querier", "opensearch_querier"]
 
 
-def test_supervisor_grounding_keeps_country_traffic_as_evidence_search():
+def test_supervisor_grounding_extracts_ips_only():
+    """Grounding is now a pure IP extractor; country/intent routing is LLM-owned."""
     grounding = _ground_supervisor_question_with_llm(
         user_question="Any traffic from Greece today?",
         llm=MagicMock(),
         instruction="test",
     )
 
-    assert grounding["requested_capability"] == "evidence search"
-    assert grounding["preferred_routing_groups"] == ["schema_discovery", "evidence_search"]
-    assert "geo_enrichment" in grounding["disallowed_routing_groups"]
-    assert "host_fingerprinting" in grounding["disallowed_routing_groups"]
-    assert "Greece" in grounding["must_preserve"]
-    assert "today" in [item.lower() for item in grounding["must_preserve"]]
+    # No IPs in the question → grounding returns empty dict (alias returns {})
+    assert grounding == {}
 
 
-def test_supervisor_grounding_routes_private_ip_threat_intel_to_threat_analysis():
+def test_supervisor_grounding_extracts_ip_from_threat_intel_question():
+    """When an IP appears in the question, grounding extracts it."""
     grounding = _ground_supervisor_question_with_llm(
         user_question="Any threat intel on 192.168.0.16",
         llm=MagicMock(),
         instruction="test",
     )
 
-    assert grounding["requested_capability"] == "enrichment"
-    assert grounding["preferred_routing_groups"] == ["threat_enrichment"]
-    assert "geo_enrichment" in grounding["disallowed_routing_groups"]
-    assert "host_fingerprinting" in grounding["disallowed_routing_groups"]
-    assert "192.168.0.16" in grounding["must_preserve"]
+    assert "192.168.0.16" in grounding.get("ips", [])
 
 
-def test_supervisor_next_action_shortcuts_explicit_private_ip_threat_intel():
+def test_supervisor_next_action_routes_threat_intel_via_llm():
+    """Threat-intel routing is LLM-driven; verify the LLM's choice is respected."""
     class _LLM:
         def chat(self, messages: list[dict]):
-            raise AssertionError("LLM planning should not run for direct threat-intel IP shortcut")
+            return json.dumps(
+                {
+                    "reasoning": "User wants threat intelligence for this IP.",
+                    "skills": ["threat_analyst"],
+                    "parameters": {"question": "Any threat intel on 192.168.0.16"},
+                }
+            )
 
     decision = _supervisor_next_action(
         user_question="Any threat intel on 192.168.0.16",

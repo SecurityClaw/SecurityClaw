@@ -36,7 +36,10 @@ def test_explicit_forensic_analysis_forces_forensic_examiner():
         "You are a SOC assistant.",
     )
 
-    assert result["skills"] == ["forensic_examiner"]
+    # forensic_examiner has declared prerequisites (evidence_search), so opensearch_querier
+    # should be included automatically by manifest routing
+    assert "forensic_examiner" in result["skills"]
+    assert "opensearch_querier" in result["skills"]
 
 
 def test_forensic_with_search_filters_chains_baseline_then_forensic():

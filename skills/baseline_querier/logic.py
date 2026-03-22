@@ -328,50 +328,6 @@ def _build_grounded_baseline_assessment(
 
     return " ".join([verdict] + details), observations
 
-
-def _heuristic_time_range(question: str, conversation_history: list[dict] | None = None) -> str:
-    text = " ".join(
-        [str(question or "")] + [str(m.get("content", "") or "") for m in (conversation_history or [])[-4:]]
-    ).lower()
-    if re.search(r"\btoday\b|\blast 24 hours\b|\bpast 24 hours\b", text):
-        return "now-24h"
-    if re.search(r"\blast week\b|\bpast week\b", text):
-        return "now-7d"
-    if re.search(r"\blast 30 days\b|\bpast 30 days\b|\blast month\b", text):
-        return "now-30d"
-    if re.search(r"\blast 90 days\b|\bpast 90 days\b|\bpast 3 months\b", text):
-        return "now-90d"
-    if "normal behavior" in text or "baseline" in text or "how often" in text:
-        return "now-30d"
-    return "now-90d"
-
-
-def _heuristic_query_plan(question: str, conversation_history: list[dict] | None = None) -> dict:
-    text = " ".join(
-        [str(question or "")] + [str(m.get("content", "") or "") for m in (conversation_history or [])[-4:]]
-    )
-    lowered = text.lower()
-    ip_matches = list(dict.fromkeys(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text)))
-    port_matches = list(dict.fromkeys(re.findall(r"\bport\s+(\d{1,5})\b", lowered)))
-    protocol_matches = [proto.upper() for proto in ["dns", "http", "https", "tls", "udp", "tcp"] if proto in lowered]
-    country_matches = [
-        country.title()
-        for country in ["iran", "russia", "china", "usa", "united states", "germany", "france"]
-        if country in lowered
-    ]
-
-    return {
-        "reasoning": "Heuristic fallback plan derived from explicit entities in the question and recent conversation.",
-        "detected_time_range": "heuristic",
-        "time_range": _heuristic_time_range(question, conversation_history),
-        "ports": port_matches,
-        "countries": list(dict.fromkeys(country_matches)),
-        "protocols": list(dict.fromkeys(protocol_matches)),
-        "search_terms": ip_matches,
-        "skip_search": not any([ip_matches, port_matches, country_matches, protocol_matches]),
-    }
-
-
 def run(context: dict) -> dict:
     """Entry point called by the Runner."""
     db = context.get("db")
@@ -629,13 +585,49 @@ Time range examples:
         if plan.get("skip_search") or not any(
             [plan.get("search_terms"), plan.get("ports"), plan.get("countries"), plan.get("protocols")]
         ):
-            heuristic = _heuristic_query_plan(question, conversation_history)
-            if not heuristic.get("skip_search"):
-                return heuristic
+            # Retry with simpler LLM prompt instead of heuristics
+            retry_prompt = f"""Question: "{question}"
+Extract ports and countries mentioned. Return JSON:
+{{"search_terms": [], "ports": [], "countries": [], "protocols": []}}"""
+            try:
+                retry_resp = llm.complete(retry_prompt)
+                retry_plan = json.loads(retry_resp)
+                if retry_plan.get("search_terms") or retry_plan.get("ports") or retry_plan.get("countries"):
+                    return {**plan, **retry_plan}
+            except:
+                pass
         return plan
     except Exception as exc:
         logger.warning("[%s] Query planning failed: %s", SKILL_NAME, exc)
-        return _heuristic_query_plan(question, conversation_history)
+        # Retry with ultra-minimal LLM prompt instead of heuristics
+        fallback_prompt = f"""Extract from: "{question}"
+Return JSON: {{"search_terms": [], "ports": [], "countries": []}}"""
+        try:
+            fallback_resp = llm.complete(fallback_prompt)
+            fallback_plan = json.loads(fallback_resp)
+            if fallback_plan:
+                return {
+                    "reasoning": "LLM fallback extraction",
+                    "time_range": "now-90d",
+                    "search_terms": list(fallback_plan.get("search_terms") or []),
+                    "ports": list(fallback_plan.get("ports") or []),
+                    "countries": list(fallback_plan.get("countries") or []),
+                    "protocols": list(fallback_plan.get("protocols") or []),
+                    "skip_search": False,
+                }
+        except:
+            pass
+        # If all LLM attempts fail, return empty plan
+        return {
+            "reasoning": "All LLM attempts failed",
+            "time_range": "now-90d",
+            "search_terms": [],
+            "ports": [],
+            "countries": [],
+            "protocols": [],
+            "skip_search": True,
+        }
+
 
 
 def _select_compact_text_fields(field_mappings: dict, max_fields: int = MAX_MULTI_MATCH_FIELDS) -> list[str]:

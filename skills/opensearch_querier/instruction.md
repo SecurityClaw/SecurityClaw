@@ -2,47 +2,58 @@
 
 ## Purpose
 
-Centralized OpenSearch/Elasticsearch query execution. This is the **single point of contact** for all database searches.
+**Simplified data access layer** for OpenSearch/Elasticsearch queries.
 
-Instead of each skill building its own queries (causing duplication and hardcoded field names), all skills now use opensearch_querier to execute searches consistently.
+- Receives a query plan from the supervisor/LLM
+- Executes exact search as planned
+- Returns results (no diagnosis, no recovery, no heuristics)
+- Lets supervisor decide next steps
+
+## Architecture: No Heuristics
+
+**Removed:**
+- Diagnostic reasoning ("data doesn't exist in database" fallbacks)
+- Strategy recovery (trying phrase→token when results are 0)
+- Field name guessing (pattern-based overrides)
+- IP/port detection heuristics
+
+**Kept:**
+- Simple query execution
+- Field selection based on search type
+- Time range filtering
+- Result tabulation
 
 ## How It Works
 
-1. **Field Discovery**: Queries RAG for field_documentation (created by network_baseliner)
-2. **Intelligent Query Building**: Uses discovered field names instead of hardcoding "source_ip", "message", etc.
-3. **Execution**: Runs the constructed query against OpenSearch
-4. **Results**: Returns both data and metadata about which fields were used
-5. **Response Formatting**: Post-processes raw results to extract and highlight relevant details (IPs, ports, countries, etc.)
+1. **Receive Plan**: Supervisor or LLM provides search_type, search_terms, fields, strategies
+2. **Validate**: Check that question exists, DB is available, fields are known
+3. **Build Query**: Construct simple bool/term query based on plan
+4. **Execute**: Run against OpenSearch (synchronous)
+5. **Return Results**: Return what we got, even if 0 results
+6. **Stop**: Do NOT attempt diagnosis or recovery
 
-## Response Post-Processing
+## Query Planning (LLM)
 
-When opensearch_querier returns results, the formatter automatically extracts and highlights:
-- **Ports**: All unique destination ports found in the matching records
-- **IPs**: All source/destination IPs with distinguishing public vs. private
-- **Countries**: All observed geoIP countries
-- **Timestamps**: Earliest and latest records for time context
+The LLM decides:
+- **search_type**: "ip" | "traffic" | "alert" | "general"
+- **search_terms**: List of values to search for
+- **matching_strategy**: "term" | "phrase" | "wildcard"
+- **time_range**: "now-90d" | "now-7d" | custom date range
+- **fields**: Which schema fields to query
 
-### Port Extraction Behavior (Important for Follow-ups)
+This is guided by PLANNING_PROMPT.md and your field_mappings discovery.
 
-When responding to **"What ports are associated with..."** follow-up questions:
+## When Results Are 0
 
-1. opensearch_querier searches for traffic matching the prior IPs (with `ports: []` meaning "all ports")
-2. The formatter examines the raw results for actual destination ports
-3. **All unique ports** found in those results are extracted and displayed
-4. This enables users to see concrete port data without needing an additional fingerprinting step
+If the query returns 0 results:
+- opensearch_querier returns 0 results
+- Supervisor sees "no data" evaluation
+- Supervisor may decide to:
+  - Retry with different supervisor/LLM planning
+  - Route to a different skill
+  - Tell the user "no matching records found"
 
-Example flow:
-```
-User: Find 1.1.1.1
-→ Agent: Found 10 records with source/destination IPs...
-
-User: What ports are associated with this traffic?
-→ opensearch_querier runs with search_terms=[1.1.1.1], ports=[]
-→ Formatter extracts actual ports from 200+ matched records
-→ Returns: "Destination port(s): 443, 80, 22, 1194"
-```
-
-This design ensures opensearch_querier can handle port-related follow-ups directly without requiring external skills.
+**This skill does NOT guess or retry.** It returns exactly what the query found.
 
 ## For Direct User Queries
 

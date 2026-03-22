@@ -146,6 +146,13 @@ When routing investigation chains, understand skill dependencies:
    - Do NOT reframe one answer type into another. For example, passive fingerprinting is not the same as geolocation or threat enrichment.
    - The CURRENT question determines skill selection, not prior questions
 
+5. **Pass Query Constraints When Applicable**:
+   - When the question mentions a specific source location/country (e.g., "traffic from iran"), include `source_country: "iran"` in the parameters
+   - When the question mentions a specific port, include `source_port` in parameters
+   - When the question mentions TCP/UDP, include `protocol` in parameters
+   - Let skills use these constraints to filter results appropriately
+   - Unlike heuristics (which are forbidden), explicit reasoning about constraints is encouraged
+
 ## Your Response
 
 Return **strict JSON** (no markdown, no code blocks):

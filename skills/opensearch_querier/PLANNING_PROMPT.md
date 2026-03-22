@@ -6,38 +6,59 @@ This prompt guides the LLM to convert natural language questions into structured
 ## Task
 Analyze a user's question and extract STRUCTURED fields that will be used to build an OpenSearch query.
 
-## ⚠️ CRITICAL: FOCUS ON THE CURRENT QUESTION FIRST
-**IMPORTANT:** You are analyzing the USER'S CURRENT QUESTION, not the conversation history.
+## ⚠️ CRITICAL: Understand Query Intent Through Conversation Context
+**IMPORTANT:** Analyze the USER'S CURRENT QUESTION with full awareness of prior context.
 - Extract plan directly from what the USER IS ASKING NOW
-- Conversation context is provided for reference only
-- If the current question and prior context seem mismatched, PRIORITIZE THE CURRENT QUESTION
-- Do NOT invent aggregations (country_terms, etc.) that aren't explicitly requested
+- Conversation context is provided FOR DECISION MAKING — use it to understand query intent
+- If the current question refers back to a previous result (e.g., "What were the IPs from that result?"), this is a DRILL-DOWN query:
+  - Previous context showed aggregation/summary → Current question asks for details from that result
+  - Example: Prior: "Any traffic from Netherlands?" → Response: "Yes, aggregation shows X buckets"
+  - Current: "What were the IP addresses from the Netherlands?" → This is asking for INDIVIDUAL RECORDS, NOT another aggregation
+  - **DRILL-DOWN RULE:** When you detect a drill-down query (asking for details/records from a previous aggregation), set `aggregation_type="none"` to return individual documents instead of an aggregation
+ 
+- Do NOT invent aggregations (country_terms, etc.) that aren't explicitly requested in the current question
 - Do NOT assume the user is asking for something different than what they typed
 
 **VALIDATION: Before returning your plan, ask yourself:**
-1. Did I extract this from the USER'S CURRENT QUESTION?
-2. Would someone reading just the question understand this plan?
-3. If I see "country" aggregation, did the question explicitly ask for countries?
+1. Is this a follow-up question asking for details from a previous aggregation result?
+2. Does the current question ask for individual records/IPs/details, or for a summary?
+3. If previous turn returned aggregation + current turn asks "what were the [things]", set aggregation_type="none"
 
-If the answer to any of these is NO, reconsider your extraction.
+## Drill-Down Query Detection
+A drill-down query COMBINES current question intent with prior context:
+- **Prior context** had an aggregation result (e.g., country_terms showing "X countries with traffic")
+- **Current question** asks "what were the [entities]" e.g., "what were the IP addresses", "what were the countries", "what specific traffic"
+- **Your decision:** Switch from aggregation_type to aggregation_type="none" to extract individual records
+
+Examples of drill-down detection:
+1. Previous: "Any traffic from Netherlands in past 3 months?" → Response: "Found aggregated results" 
+   Current: "What were the IP addresses from the Netherlands?" → **DRILL-DOWN**: Use aggregation_type="none" to retrieve IP records
+   
+2. Previous: "What countries had traffic?" → Response: "Top 5 countries: Iran, China, Russia..."
+   Current: "What was the traffic from Iran?" → **DRILL-DOWN**: Use aggregation_type="none" to get Iran traffic records
+
+3. Previous: Not an aggregation result, just context
+   Current: "Show me specific traffic events" → **NOT a drill-down necessarily**, but may still want aggregation_type="none" if asking for records
 
 ## ⚡ FINGERPRINTING DETECTION (CHECK FIRST!)
 **Before analyzing anything else, check if the user is asking for IP fingerprinting:**
 
-These queries MUST produce `search_type="ip"` and `aggregation_type="fingerprint_ports"`:
-1. Any question with "fingerprint" word: "fingerprint 192.168.0.17" → fingerprint_ports
-2. "What ports" + IP: "What ports does 10.0.0.1 use?" → fingerprint_ports
-3. "What services" + IP: "What services run on IP 172.16.0.1?" → fingerprint_ports
-4. "Profile" + IP: "Profile this IP 1.1.1.1" → fingerprint_ports
-5. "Client or server" + IP: "Is this IP a client or server?" → fingerprint_ports
-6. Port discovery on IP: "What destination ports does server X connect to?" → fingerprint_ports
+**CRITICAL: If the question contains ANY of these keywords + mentions an IP → MUST use aggregation_type="fingerprint_ports":**
+1. "fingerprint" keyword: "fingerprint 192.168.0.17" → fingerprint_ports + search_type="ip"
+2. "what ports" + IP: "What ports does 10.0.0.1 use?" → fingerprint_ports + search_type="ip"
+3. "what services" + IP: "What services run on IP 172.16.0.1?" → fingerprint_ports + search_type="ip"
+4. "what destination ports": "What destination ports does X connect to?" → fingerprint_ports + search_type="ip"
+5. "profile" + IP: "Profile this IP 1.1.1.1" → fingerprint_ports + search_type="ip"
+6. "is it a client or server" + IP: "Is this IP a client or server?" → fingerprint_ports + search_type="ip"
+7. Analyzing/characterizing an IP: "Analyze 192.168.0.16" → fingerprint_ports + search_type="ip"
 
-**CRITICAL RULE:** If the question contains a fingerprinting keyword AND mentions or implies an IP address, ALWAYS:
-- Set `search_type="ip"`
+**RULE: When fingerprinting, ALWAYS:**
+- Set `search_type="ip"` 
 - Set `aggregation_type="fingerprint_ports"`
-- Extract the target IP into `search_terms[0]`
-- Set `time_range` to "now-30d" (30-day window for fingerprinting)
+- Place target IP(s) in `search_terms`
+- Set `time_range` to "now-30d" (30-day window for fingerprinting) or longer if specified
 - Set `matching_strategy` to "term"
+- Leave `countries`, `ports`, `protocols` empty unless explicitly mentioned
 
 **DO NOT** confuse fingerprinting with traffic search:
 - ❌ "Show me traffic from this IP" (traffic search) ≠ "Fingerprint this IP" (fingerprinting)
@@ -116,12 +137,31 @@ CRITICAL: Only use lowercase: d, w, M, y. Never use uppercase D, W, Y.
 Elasticsearch date math ONLY accepts lowercase time units.
 
 ### Search Terms
-Extract keywords that don't fit structured fields:
+**CRITICAL: Minimize search_terms. Most queries should have 0-2 terms MAX. At most 5 in extreme cases.**
+
+Extract ONLY keywords that require semantic/text searching:
 - Domain names: "example.com"
-- Service names that aren't standard ports: "SSH", "OpenVPN"
-- Anomaly indicators: "suspicious", "alert"
-- Event types: "DNS query", "connection failure"
-- **Do NOT extract** country names, ports, or protocols here (they have their own fields)
+- Specific anomaly keywords: "ransomware", "malware", "suspicious_activity" (if explicitly mentioned in question)
+- Rule/signature names: "ET MALWARE", "SURICATA.ALERT"
+- Custom event descriptions mentioned by user
+
+**DO NOT extract** in search_terms:
+- EXCLUDE: Country names — use `countries` field instead
+- EXCLUDE: Port numbers — use `ports` field instead
+- EXCLUDE: Protocol names — use `protocols` field instead
+- EXCLUDE: Generic metadata words like "logs", "traffic", "data", "record", "ip", "geolocation" — these are NOT searchable business terms
+- EXCLUDE: Words that are already covered by structured fields
+
+**RULE:** If the question only uses structured categories (countries/ports/protocols/time), leave search_terms EMPTY []
+
+**Examples:**
+- User: "Any traffic from Netherlands in past 3 months?" → search_terms=[] (only structured filters needed)
+- User: "Traffic from Iran containing 'malware'" → search_terms=['malware'] (1 semantic term)
+- User: "Port 1194 activity from Russia last week" → search_terms=[] (only structured)
+- User: "Show me alerts matching ET_MALWARE signature" → search_terms=['ET_MALWARE'] (1 semantic term)
+- User: "DNS queries to suspicious domains" → search_terms=['suspicious'] OR better search_terms=[] if you're filtering domains differently
+
+**WHEN IN DOUBT:** Empty search_terms is safer than hallucinating irrelevant terms.
 
 ### Search Type
 Pick the dominant category of the user's intent:
@@ -195,6 +235,54 @@ Briefly explain which discovered field categories matter most, for example:
 
 ## Examples
 
+### FINGERPRINTING EXAMPLES (Highest Priority!)
+
+Example FP1: "Fingerprint 192.168.0.16"
+```json
+{
+  "reasoning": "User asking for IP fingerprinting - determine ports, services, and characteristics of this IP",
+  "search_type": "ip",
+  "detected_time_range": "not specified",
+  "time_range": "now-30d",
+  "countries": [],
+  "exclude_countries": [],
+  "ports": [],
+  "protocols": [],
+  "search_terms": ["192.168.0.16"],
+  "ip_direction": "any",
+  "aggregation_type": "fingerprint_ports",
+  "aggregation_field": "none",
+  "result_limit": 100,
+  "matching_strategy": "term",
+  "field_analysis": "Focus on IP address fields and destination/source ports to determine services, roles (client vs server), and operating system characteristics.",
+  "skip_search": false
+}
+```
+
+Example FP2: "What ports does 10.0.0.1 use?"
+```json
+{
+  "reasoning": "User asking what ports are associated with this IP - port fingerprinting intent",
+  "search_type": "ip",
+  "detected_time_range": "not specified",
+  "time_range": "now-30d",
+  "countries": [],
+  "exclude_countries": [],
+  "ports": [],
+  "protocols": [],
+  "search_terms": ["10.0.0.1"],
+  "ip_direction": "any",
+  "aggregation_type": "fingerprint_ports",
+  "aggregation_field": "none",
+  "result_limit": 100,
+  "matching_strategy": "term",
+  "field_analysis": "Extract port distribution for the target IP to determine what services it uses, exposes, or connects to.",
+  "skip_search": false
+}
+```
+
+### TRAFFIC & LOCATION EXAMPLES
+
 Example 1: "Show me traffic from Iran in the past 3 months"
 ```json
 {
@@ -235,6 +323,28 @@ Example 2: "Port 1194 activity in Russia last week"
   "result_limit": 10,
   "matching_strategy": "term",
   "field_analysis": "Use port fields, country fields, and timestamp fields.",
+  "skip_search": false
+}
+```
+
+Example 2a: "Any traffic from Netherlands in the past 3 months?"
+```json
+{
+  "reasoning": "User asking for traffic originating from Netherlands",
+  "search_type": "traffic",
+  "detected_time_range": "past 3 months",
+  "time_range": "now-3M",
+  "countries": ["Netherlands"],
+  "exclude_countries": [],
+  "ports": [],
+  "protocols": [],
+  "search_terms": [],
+  "ip_direction": "source",
+  "aggregation_type": "none",
+  "aggregation_field": "none",
+  "result_limit": 10,
+  "matching_strategy": "term",
+  "field_analysis": "Use country/geo fields and timestamp fields. No text search needed.",
   "skip_search": false
 }
 ```
