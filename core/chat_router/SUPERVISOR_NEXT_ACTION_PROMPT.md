@@ -97,6 +97,7 @@ When routing investigation chains, understand skill dependencies:
 ### Questions about "What's normal? (Baseline/Anomaly)"
 - User asks about normal behavior, baseline, anomalies, deviations
 - They want behavioral context: "is this normal"; "typical activity"; "anomalies"
+- **Examples of baseline questions**: "is this normal?"; "baseline behavior"; "expected activity"; "frequent traffic"; "how often do we see..."; "what's typical"; "usual behavior"; "common behavior"
 - **Prerequisite**: Must have evidence first (traffic to compare against baseline)
 - **Skills to consider**: baseline_querier (calculates baselines)
 

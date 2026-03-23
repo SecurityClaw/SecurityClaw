@@ -9,24 +9,8 @@ logger = logging.getLogger(__name__)
 def format_response(user_question: str, result: dict, skill_results: dict | None = None) -> str:
     findings = result.get("findings") or {}
     grounded_assessment = " ".join(str(findings.get("grounded_assessment", "") or "").split())
-    question_lower = str(user_question or "").lower()
-    asks_for_baseline = any(
-        term in question_lower
-        for term in [
-            "baseline",
-            "normal behavior",
-            "is this normal",
-            "is it normal",
-            "what's normal",
-            "usual behavior",
-            "expected behavior",
-            "common behavior",
-            "frequent",
-            "frequency",
-            "how often",
-        ]
-    )
-    if grounded_assessment and asks_for_baseline:
+    # Use grounded assessment if available (LLM supervisor decides when baseline is needed)
+    if grounded_assessment:
         return grounded_assessment
 
     answer = " ".join(str(findings.get("answer", "") or "").split())
@@ -58,26 +42,10 @@ def format_response(user_question: str, result: dict, skill_results: dict | None
 
 
 # ─── ENTITY EXTRACTION FOR BASELINE FOLLOW-UPS ──────────────────────────
-
-def _question_asks_for_baseline(user_question: str) -> bool:
-    """Check if question is asking for baseline/normal behavior analysis."""
-    question_lower = user_question.lower()
-    return any(
-        term in question_lower
-        for term in [
-            "baseline",
-            "normal behavior",
-            "is this normal",
-            "is it normal",
-            "what's normal",
-            "usual behavior",
-            "expected behavior",
-            "common behavior",
-            "frequent",
-            "frequency",
-            "how often",
-        ]
-    )
+# NOTE: Keyword checking has been removed. The LLM supervisor decides whether
+# baseline_querier should be invoked based on the question intent and manifest
+# declarations. Baseline-related keywords are provided in supervisor prompts.
+# See: SUPERVISOR_NEXT_ACTION_PROMPT.md for baseline question examples.
 
 
 def extract_entities(
@@ -101,10 +69,7 @@ def extract_entities(
     Returns:
         Dict with keys: ips, domains, countries, ports, sources
     """
-    if not _question_asks_for_baseline(user_question):
-        return {"ips": [], "domains": [], "countries": [], "ports": [], "sources": []}
-
-    # Extract explicit IPs from question
+    # Extract explicit IPs from question (deterministic structural extraction, not keyword matching)
     explicit_ips = list(dict.fromkeys(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", user_question or "")))
     entities = {
         "ips": explicit_ips,
@@ -146,9 +111,8 @@ def extract_followup_question(original_question: str, entities: dict, conversati
     Returns:
         Enriched question string with discovered entities and baseline context
     """
-    if not _question_asks_for_baseline(original_question):
-        return original_question
-
+    # LLM supervisor decides whether baseline enrichment is needed.
+    # This function always enriches if called.
     entities = _filter_entities_for_question(entities or {}, original_question)
     ips = entities.get("ips", [])
     domains = entities.get("domains", [])
@@ -413,9 +377,6 @@ def evaluate_satisfaction(
     Returns:
         {satisfied, confidence, reasoning, missing} dict, or None to skip evaluation
     """
-    if not _question_asks_for_baseline(user_question):
-        return None
-
     # Only evaluate if baseline_querier produced findings
     if not result or result.get("status") != "ok":
         return None
@@ -443,8 +404,15 @@ def evaluate_satisfaction(
             "missing": [],
         }
     
-    # If no evidence was produced, don't override router's default evaluation
-    return None
+    # If baseline_querier ran but produced no evidence, it's still satisfied
+    # (the LLM supervisor will not have routed to baseline_querier unless appropriate)
+    logger.info("[baseline_querier] No log records or baseline sources found, but baseline_querier was routed by LLM")
+    return {
+        "satisfied": True,
+        "confidence": 0.6,
+        "reasoning": "Baseline querier was executed but found no matching evidence in available baselines or logs.",
+        "missing": [],
+    }
 
 
 def enrich_question_for_followup(
