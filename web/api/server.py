@@ -43,6 +43,57 @@ SECRET_NAME_RE = re.compile(r"(password|secret|token|api[_-]?key|client[_-]?secr
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Response Highlighting
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _extract_highlights(response: str) -> dict[str, list[dict[str, Any]]]:
+    """Extract IPs, ports, and timestamps from response text.
+    
+    Returns dict with 'ips', 'ports', 'timestamps' keys, each containing
+    list of dicts with 'value', 'start', 'end' positions.
+    """
+    highlights = {
+        "ips": [],
+        "ports": [],
+        "timestamps": [],
+    }
+    
+    # Pattern for IPv4 addresses
+    ip_pattern = r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'
+    for match in re.finditer(ip_pattern, response):
+        highlights["ips"].append({
+            "value": match.group(0),
+            "start": match.start(),
+            "end": match.end(),
+        })
+    
+    # Pattern for ISO timestamps (match first so we handle them before ports)
+    timestamp_pattern = r'\b\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?\b'
+    for match in re.finditer(timestamp_pattern, response):
+        highlights["timestamps"].append({
+            "value": match.group(0),
+            "start": match.start(),
+            "end": match.end(),
+        })
+    
+    # Pattern for ports - match "port XXX" or "ports XXX" patterns
+    port_pattern = r'\bports?\s+([0-9]{1,5})'
+    for match in re.finditer(port_pattern, response):
+        # Get just the port number (group 1)
+        port_num = match.group(1)
+        # Find the position of the port number in the match
+        port_start = match.start() + match.group(0).rfind(port_num)
+        port_end = port_start + len(port_num)
+        highlights["ports"].append({
+            "value": port_num,
+            "start": port_start,
+            "end": port_end,
+        })
+    
+    return highlights
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Input Validation
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -498,6 +549,21 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
         error_box: dict[str, str] = {}
 
         def callback(event: str, data: dict[str, Any], step: int, max_steps: int) -> None:
+            if event == "token":
+                loop.call_soon_threadsafe(
+                    queue.put_nowait,
+                    (
+                        "token",
+                        {
+                            "phase": data.get("phase", ""),
+                            "token": data.get("token", ""),
+                            "step": step,
+                            "max_steps": max_steps,
+                        },
+                    ),
+                )
+                return
+
             payload = ChatStreamParser.to_step_payload(event, data, step, max_steps)
             loop.call_soon_threadsafe(queue.put_nowait, ("step", payload))
 
@@ -543,9 +609,11 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
             if error_box:
                 yield _sse("error", {"message": error_box["message"]})
             else:
+                response_text = result_box.get("response", "")
                 yield _sse("response", {
                     "conversation_id": conversation_id,
-                    "response": result_box.get("response", ""),
+                    "response": response_text,
+                    "highlights": _extract_highlights(response_text),
                     "routing": result_box.get("routing", {}),
                     "trace": result_box.get("trace", []),
                     "skill_results": result_box.get("skill_results", {}),

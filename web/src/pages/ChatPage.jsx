@@ -49,6 +49,9 @@ function getActivityPhrases(step) {
   return byKind[step?.kind] || ['thinking', 'working', 'checking']
 }
 
+const THOUGHT_TOKEN_PHASES = new Set(['skills_check', 'think', 'reflect'])
+const FINAL_TOKEN_PHASES = new Set(['direct_answer', 'answer', 'response_final'])
+
 export default function ChatPage() {
   const { conversationId } = useParams()
   const navigate = useNavigate()
@@ -63,6 +66,8 @@ export default function ChatPage() {
   
   const messagesEndRef = useRef(null)
   const streamingConversationIdRef = useRef(null)
+  const streamingMessageIdRef = useRef(null)
+  const isNewConversationRef = useRef(false)
   const isStreamingRef = useRef(false)
 
   const scrollToMessagesBottom = () => {
@@ -82,7 +87,11 @@ export default function ChatPage() {
       return
     }
     const res = await api.get(`/api/conversations/${id}`)
-    setMessages(res.data.messages || [])
+    const loadedMessages = (res.data.messages || []).map((msg, idx) => ({
+      ...msg,
+      id: msg.id || `${msg.timestamp}-${idx}`,
+    }))
+    setMessages(loadedMessages)
   }
 
   useEffect(() => { loadConversations() }, [])
@@ -114,29 +123,32 @@ export default function ChatPage() {
     if (!input.trim() || busy) return
     const outgoing = input.trim()
     const userTimestamp = new Date().toISOString()
+    const assistantMessageId = `${userTimestamp}-assistant`
+    const userMessageId = `${userTimestamp}-user`
     const userMessage = {
+      id: userMessageId,
       role: 'user',
       content: outgoing,
       timestamp: userTimestamp,
     }
-    setMessages((prev) => [...prev, userMessage])
+    const assistantMessage = {
+      id: assistantMessageId,
+      role: 'assistant',
+      content: '',
+      thought_content: '',
+      is_streaming: true,
+      timestamp: userTimestamp,
+      routing_skills: [],
+    }
+    streamingMessageIdRef.current = assistantMessageId
+    isNewConversationRef.current = !activeId
+    setMessages((prev) => [...prev, userMessage, assistantMessage])
     isStreamingRef.current = true
     setBusy(true)
     setSteps([])
     setReasoningExpanded(false)
     setActivityPhraseIndex(0)
     setInput('')
-
-    if (activeId) {
-      setConversations((prev) => upsertConversationItem(prev, {
-        id: activeId,
-        first_question: prev.find((item) => item.id === activeId)?.first_question || outgoing,
-        preview: outgoing,
-        messages: messages.length + 1,
-        timestamp: userTimestamp,
-        last_update: userTimestamp,
-      }))
-    }
 
     try {
       await streamChat({
@@ -159,21 +171,64 @@ export default function ChatPage() {
           if (event === 'step') {
             setSteps((prev) => [...prev, payload])
           }
+          if (event === 'token') {
+            const token = String(payload.token || '')
+            const phase = String(payload.phase || '')
+            const assistantMessageId = streamingMessageIdRef.current
+            if (!token || !assistantMessageId) {
+              return
+            }
+
+            setMessages((prev) => prev.map((message) => {
+              if (message.id !== assistantMessageId) {
+                return message
+              }
+
+              if (FINAL_TOKEN_PHASES.has(phase)) {
+                return {
+                  ...message,
+                  content: `${message.content || ''}${token}`,
+                }
+              }
+
+              if (THOUGHT_TOKEN_PHASES.has(phase) || phase) {
+                return {
+                  ...message,
+                  thought_content: `${message.thought_content || ''}${token}`,
+                }
+              }
+
+              return {
+                ...message,
+                thought_content: `${message.thought_content || ''}${token}`,
+              }
+            }))
+          }
           if (event === 'response') {
             const responseTimestamp = new Date().toISOString()
             const resolvedConversationId = payload.conversation_id || activeId || streamingConversationIdRef.current
-            setMessages((prev) => [...prev, {
-              role: 'assistant',
-              content: payload.response,
-              timestamp: responseTimestamp,
-              routing_skills: payload.routing?.skills || [],
-            }])
+            const assistantMessageId = streamingMessageIdRef.current
+            if (assistantMessageId) {
+              setMessages((prev) => prev.map((message) => {
+                if (message.id !== assistantMessageId) {
+                  return message
+                }
+
+                return {
+                  ...message,
+                  content: payload.response || message.content,
+                  is_streaming: false,
+                  timestamp: responseTimestamp,
+                  routing_skills: payload.routing?.skills || [],
+                }
+              }))
+            }
             if (resolvedConversationId) {
               setConversations((prev) => upsertConversationItem(prev, {
                 id: resolvedConversationId,
                 first_question: prev.find((item) => item.id === resolvedConversationId)?.first_question || outgoing,
                 preview: outgoing,
-                messages: Math.max(prev.find((item) => item.id === resolvedConversationId)?.messages || 0, 2),
+                messages: (prev.find((item) => item.id === resolvedConversationId)?.messages || 0) + (isNewConversationRef.current ? 1 : 2),
                 timestamp: responseTimestamp,
                 last_update: responseTimestamp,
               }))
@@ -185,6 +240,8 @@ export default function ChatPage() {
     } finally {
       isStreamingRef.current = false
       streamingConversationIdRef.current = null
+      streamingMessageIdRef.current = null
+      isNewConversationRef.current = false
       setBusy(false)
     }
   }
@@ -253,15 +310,27 @@ export default function ChatPage() {
           <div className="border-b border-border px-5 py-3 font-mono text-xs uppercase tracking-[0.18em] text-cyan">Conversation</div>
           <div className="min-h-0 flex-1 space-y-4 overflow-auto p-5">
             {messages.length === 0 ? <div className="font-mono text-dim">Start a new investigation.</div> : null}
-            {messages.map((message, index) => (
-              <div key={`${message.timestamp}-${index}`} className={`rounded-xl border p-4 ${message.role === 'assistant' ? 'border-cyan/20 bg-cyan/5' : 'border-border bg-panel2'}`}>
+            {messages.filter(m => !m.is_streaming).map((message) => (
+              <div key={message.id || message.timestamp} className={`rounded-xl border p-4 ${message.role === 'assistant' ? 'border-cyan/20 bg-cyan/5' : 'border-border bg-panel2'}`}>
                 <div className="mb-2 flex items-center justify-between gap-3">
                   <div className="font-mono text-xs uppercase tracking-[0.18em] text-dim">{message.role === 'assistant' ? 'SecurityClaw' : 'Operator'}</div>
                   {message.routing_skills?.length ? <div className="flex flex-wrap gap-2">{message.routing_skills.map((skill) => <span key={skill} className="badge badge-green">{skill}</span>)}</div> : null}
                 </div>
-                <div className="markdown text-sm">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
-                </div>
+                {message.role === 'assistant' && message.thought_content ? (
+                  <div className="rounded-xl border border-border/70 bg-panel2 p-3">
+                    <div className="font-mono text-[11px] uppercase tracking-[0.16em] text-dim">LLM thought</div>
+                    <div className="mt-2 whitespace-pre-wrap text-sm text-dim">{message.thought_content}</div>
+                  </div>
+                ) : null}
+                {message.role === 'assistant' ? (
+                  <div className={`markdown text-sm text-text ${message.thought_content ? 'mt-3' : ''}`}>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                  </div>
+                ) : (
+                  <div className="markdown text-sm text-text">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                  </div>
+                )}
               </div>
             ))}
             {busy ? (

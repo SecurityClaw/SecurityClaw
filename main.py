@@ -23,9 +23,54 @@ from importlib import import_module
 from pathlib import Path
 from typing import Optional
 
+# Configure logging BEFORE any other imports that use logging
+from rich.console import Console
+from rich.text import Text
+
+_console = Console()
+
+class _GreyLogHandler(logging.Handler):
+    """Custom log handler that renders all logs in grey using ANSI codes."""
+    
+    def emit(self, record):
+        """Emit a log record, styling it as grey with ANSI codes."""
+        try:
+            message = self.format(record)
+            # Use ANSI escape codes for bright black (grey) - most reliable across terminals
+            # \033[90m = bright black (grey), \033[0m = reset to default
+            import sys
+            sys.stderr.write(f"\033[90m{message}\033[0m\n")
+            sys.stderr.flush()
+        except Exception:
+            self.handleError(record)
+
+# Set up grey logging IMMEDIATELY, before any imports
+_root_logger = logging.getLogger()
+
+# Clear ALL existing handlers from root logger
+for _h in list(_root_logger.handlers):
+    _root_logger.removeHandler(_h)
+
+# Add ONLY our grey handler
+_grey_handler = _GreyLogHandler()
+_grey_handler.setFormatter(logging.Formatter(
+    fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+))
+_root_logger.addHandler(_grey_handler)
+_root_logger.setLevel(logging.DEBUG)
+
+# Override basicConfig to not add extra handlers
+_original_basicConfig = logging.basicConfig
+def _no_op_basicConfig(*args, **kwargs):
+    """Ignore basicConfig calls from other modules."""
+    pass
+logging.basicConfig = _no_op_basicConfig
+
+# Now safe to import other modules
 import click
 import yaml
-from rich.console import Console
+from rich.logging import RichHandler
 from rich.prompt import Prompt, Confirm
 
 from core.config import Config
@@ -34,16 +79,45 @@ from core.llm_provider import build_llm_provider
 from core.memory import CheckpointBackedMemory
 from core.runner import Runner
 
-console = Console()
+console = _console
 logger = logging.getLogger(__name__)
+
+THOUGHT_TOKEN_PHASES = {"skills_check", "think", "reflect"}
+FINAL_TOKEN_PHASES = {"direct_answer", "answer", "response_final"}
 
 
 def _setup_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    """Update logging level during runtime."""
+    logging.getLogger().setLevel(getattr(logging, level.upper(), logging.INFO))
+
+
+def _highlight_response(response: str) -> str:
+    """Highlight IPs, ports, and timestamps in response text with different colors.
+    
+    Returns Rich markup string with colors:
+    - IPs: cyan
+    - Ports: yellow  
+    - Timestamps: green
+    """
+    import re
+    
+    # Pattern for IPv4 addresses
+    ip_pattern = r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'
+    
+    # Pattern for ISO timestamps FIRST (so we mark them before looking for ports)
+    timestamp_pattern = r'\b\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?\b'
+    
+    # Pattern for ports - match "port 443", "ports 22,80", etc. 
+    # Use word-specific port keyword pattern to avoid false matches
+    port_pattern = r'\bports?\s+([0-9]{1,5})'
+    
+    # Apply highlighting in order: timestamps first, then IPs, then ports
+    # This prevents port patterns from matching timestamps
+    response = re.sub(timestamp_pattern, r'[green]\g<0>[/green]', response)
+    response = re.sub(ip_pattern, r'[cyan]\g<0>[/cyan]', response)
+    response = re.sub(port_pattern, r'port \g<1>[yellow]\1[/yellow]', response)
+    
+    return response
 
 
 def _build_runner() -> Runner:
@@ -491,9 +565,53 @@ def chat():
             # Route/orchestrate with conversation context
             console.print()
 
+            llm_stream_open = False
+            llm_stream_phase: str | None = None
+
+            def _close_llm_stream_line() -> None:
+                nonlocal llm_stream_open, llm_stream_phase
+                if llm_stream_open:
+                    console.print()
+                    llm_stream_open = False
+                    llm_stream_phase = None
+
+            def _stream_format_for_phase(phase: str) -> tuple[str, str, str]:
+                if phase in FINAL_TOKEN_PHASES:
+                    return "Final answer", "white", "white"
+                if phase in THOUGHT_TOKEN_PHASES:
+                    return "LLM thought", "dim", "grey70"
+                return "LLM thought", "dim", "grey70"
+
             def _supervisor_callback(event: str, data: dict, step: int, max_steps: int) -> None:
                 """Print a structured supervisor planning trace in real-time."""
-                if event == "deciding":
+                nonlocal llm_stream_open, llm_stream_phase
+                if event != "token":
+                    _close_llm_stream_line()
+
+                if event == "skills_check":
+                    console.print(f"[dim]┌ Skills evaluation[/]")
+                    console.print(f"[dim]│ Analyzing: Do available skills match this question?[/]")
+                elif event == "skills_needed":
+                    reasoning = data.get("reasoning", "")
+                    matched = data.get("matched_skills", [])
+                    console.print(f"[dim]│ Result: Question NEEDS tools[/]")
+                    if matched:
+                        console.print(f"[dim]│ Matched skills: {', '.join(matched)}[/]")
+                    console.print(f"[dim]│ Reasoning: {reasoning}[/]")
+                    console.print(f"[dim]└ Proceeding to skill routing...[/]")
+                    console.print()
+                elif event == "skills_not_needed":
+                    reasoning = data.get("reasoning", "")
+                    console.print(f"[dim]│ Result: Question does NOT need tools[/]")
+                    console.print(f"[dim]│ Reasoning: {reasoning}[/]")
+                    console.print(f"[dim]└ Answering directly with knowledge...[/]")
+                    console.print()
+                elif event == "skills_check_failed":
+                    error = data.get("error", "Unknown error")
+                    console.print(f"[yellow]│ Skills check error: {error}[/]")
+                    console.print(f"[yellow]└ Defaulting to skill routing...[/]")
+                    console.print()
+                elif event == "deciding":
                     reasoning = data.get("reasoning", "")
                     skills = data.get("skills", [])
                     planner_trace = data.get("planner_trace") or {}
@@ -551,6 +669,18 @@ def chat():
                     icon = "✓" if satisfied else "✗"
                     console.print(f"[dim]└ {icon} {'Satisfied' if satisfied else 'Not satisfied'} ({confidence:.0%}) — {reasoning}[/]")
                     console.print()
+                elif event == "token":
+                    phase = str(data.get("phase") or "")
+                    token = str(data.get("token") or "")
+                    if not token:
+                        return
+                    label, label_style, token_style = _stream_format_for_phase(phase)
+                    if not llm_stream_open or llm_stream_phase != phase:
+                        _close_llm_stream_line()
+                        console.print(f"[{label_style}]│ {label}: [/]", end="")
+                        llm_stream_open = True
+                        llm_stream_phase = phase
+                    console.print(token, end="", style=token_style, markup=False, highlight=False)
 
             orchestration = run_graph(
                 user_question=user_input,
@@ -569,7 +699,11 @@ def chat():
             skill_results = orchestration.get("skill_results", {})
             response = orchestration.get("response", "Unable to produce a response.")
 
-            console.print(f"[bold green]Agent[/]: {response}\n")
+            _close_llm_stream_line()
+
+            # Highlight IPs, ports, and timestamps in the response
+            highlighted_response = _highlight_response(response)
+            console.print(f"[bold cyan]Agent[/]: {highlighted_response}\n")
 
             # Save to history
             add_to_history(conversation_id, user_input, response, routing, skill_results)
@@ -578,7 +712,7 @@ def chat():
             console.print("\n[yellow]Interrupted.[/]")
             break
         except Exception as e:
-            console.print(f"[red]Error: {e}[/]")
+            console.print(f"Error: {e}", style="red")
             logging.getLogger(__name__).exception("Chat error")
 
     # Clean up SQLite connection when chat session ends
