@@ -111,6 +111,74 @@ class OllamaProvider(BaseLLMProvider):
             logger.error("Ollama chat failed: %s", exc)
             raise
 
+    def stream_chat(
+        self,
+        messages: list[dict],
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        token_callback: Optional[callable] = None,
+    ) -> str:
+        """
+        Stream chat response from Ollama, calling token_callback for each token.
+        
+        Args:
+            messages: Chat messages
+            temperature: Model temperature
+            max_tokens: Maximum tokens to generate
+            token_callback: Callable(token: str) invoked for each token streamed
+            
+        Returns:
+            Full assembled response string
+        """
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+            "options": {
+                "temperature": temperature or self.temperature,
+                "num_predict": max_tokens or self.max_tokens,
+                "num_ctx": max_tokens or self.max_tokens,
+            },
+        }
+        full_response = ""
+        try:
+            logger.debug("stream_chat: Starting request to %s/api/chat", self.base_url)
+            resp = self._requests.post(
+                f"{self.base_url}/api/chat",
+                json=payload,
+                timeout=120,
+                stream=True,
+            )
+            resp.raise_for_status()
+            logger.debug("stream_chat: Response status %d, beginning iteration", resp.status_code)
+            
+            line_count = 0
+            token_count = 0
+            for line in resp.iter_lines():
+                line_count += 1
+                if line:
+                    try:
+                        import json as _json
+                        chunk = _json.loads(line)
+                        token = chunk.get("message", {}).get("content", "")
+                        if token:
+                            token_count += 1
+                            full_response += token
+                            if token_callback:
+                                token_callback(token)
+                            if token_count % 10 == 0:  # Log every 10 tokens
+                                logger.debug("stream_chat: Received %d tokens so far", token_count)
+                    except _json.JSONDecodeError as je:
+                        logger.debug("stream_chat: JSONDecodeError on line %d: %s (line=%s)", line_count, je, line[:100])
+                        pass  # Skip malformed JSON lines
+            
+            logger.debug("stream_chat: Completed - %d lines, %d tokens", line_count, token_count)
+            return full_response
+        except Exception as exc:
+            logger.error("Ollama stream_chat failed: %s", exc)
+            raise
+
     def embed(self, text: str) -> list[float]:
         """Embed using the dedicated embed model (separate from the chat model)."""
         payload = {"model": self.embed_model, "input": text}
