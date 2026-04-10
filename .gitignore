@@ -408,4 +408,5 @@ FodyWeavers.xsd
 *.sln.iml
 
 conversations/*
+tests/local_tests/
 data/*
