@@ -782,7 +782,8 @@ def _ensure_viable_plan(
         current_results=current_results,
         previous_eval=previous_eval,
         previous_trace=previous_trace,
-        invalid_skills=dropped_skills,
+        question_grounding=question_grounding,
+        invalid_skills=[],
         proposed_skills=proposed_skills,
         proposed_parameters=proposed_parameters,
         mode=mode,
@@ -841,7 +842,7 @@ def route_question(
     available_skills: list[dict],
     llm: Any,
     instruction: str,
-    conversation_history: list[dict] = None,
+    conversation_history: list[dict] | None = None,
 ) -> dict:
     """
     Analyze user question and decide which skill(s) to invoke.
@@ -1004,7 +1005,7 @@ Return a strict JSON object with reasoning, skills, and parameters.
                     result["parameters"] = {}
                 if not result["parameters"].get("question"):
                     result["parameters"]["question"] = user_question
-                
+
                 result["skills"] = _postprocess_selected_skills(
                     user_question=user_question,
                     selected_skills=result.get("skills", []),
@@ -1036,13 +1037,6 @@ Return a strict JSON object with reasoning, skills, and parameters.
             pass
         
         # If all else fails, return no skills
-        question_grounding = _deterministic_supervisor_question_grounding(user_question) or {}
-        return {
-            "reasoning": "Unable to determine relevant skill",
-            "skills": [],
-            "parameters": {"question": user_question},
-            "question_grounding": question_grounding,
-        }
 
 
 def _expand_skills_with_prerequisites(
@@ -3008,7 +3002,7 @@ def _latest_assistant_observation(conversation_history: list[dict] | None) -> st
         return ""
     for msg in reversed(conversation_history[-8:]):
         if msg.get("role") == "assistant":
-            content = " ".join(str(msg.get("content", "") or "").split())
+            content = " ".join(str(msg.get("content", "")).split())
             if content and any(
                 marker in content
                 for marker in [
@@ -3045,7 +3039,7 @@ def _build_context_aware_baseline_question(
     if domains:
         context_parts.append(f"Domains {', '.join(domains[:3])}")
     if countries:
-        context_parts.append(f"Countries {', '.join(countries[:5])}")
+        context_parts.append(f"Countries {', '.join(countries)}")
     if ports:
         context_parts.append(f"Ports {', '.join(ports[:5])}")
     if history_summary:
@@ -3130,7 +3124,7 @@ def format_response(
         else:
             skills_str = "network_baseliner, anomaly_triage, threat_analyst"
         return f"I couldn't determine which skills would help with that question. Available skills are: {skills_str}."
-    
+
     # ══════════════════════════════════════════════════════════════════════════════
     # PHASE 0: TRY MANIFEST-DECLARED FORMATTERS (NEW ARCHITECTURE)
     # ══════════════════════════════════════════════════════════════════════════════
@@ -3431,10 +3425,19 @@ def _append_threat_intel_summary(base_response: str, threat_result: dict) -> str
             summary_parts.append(f"{label} ({confidence}%)")
 
     all_apis = sorted({api for verdict in verdicts for api in verdict.get("_queried_apis", [])})
-    suffix = f" Threat intel: {'; '.join(summary_parts)}."
+    if requested_ips and all(_is_private_ip(ip) for ip in requested_ips) and not all_apis:
+        return (
+            f"{subject} is a private/internal IP address, so public GeoIP and external threat-intelligence feeds do not apply directly. "
+            "Use internal log evidence, asset ownership, and local detections to assess whether it is suspicious."
+        )
+
+    response = f"Reputation analysis for {subject}: {verdict_label} ({confidence}% confidence)."
+    if reasoning:
+        response += f" {reasoning}"
+
     if all_apis:
-        suffix += f" Sources queried: {', '.join(all_apis)}."
-    return base_response + suffix
+        response += f"\n\n_[Threat Intelligence Sources Queried: {', '.join(all_apis)}]_"
+    return response
 
 
 def _format_threat_only_response(user_question: str, threat_result: dict) -> str:
