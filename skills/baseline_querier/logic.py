@@ -594,7 +594,7 @@ Extract ports and countries mentioned. Return JSON:
                 retry_plan = json.loads(retry_resp)
                 if retry_plan.get("search_terms") or retry_plan.get("ports") or retry_plan.get("countries"):
                     return {**plan, **retry_plan}
-            except:
+            except Exception:
                 pass
         return plan
     except Exception as exc:
@@ -615,7 +615,7 @@ Return JSON: {{"search_terms": [], "ports": [], "countries": []}}"""
                     "protocols": list(fallback_plan.get("protocols") or []),
                     "skip_search": False,
                 }
-        except:
+        except Exception:
             pass
         # If all LLM attempts fail, return empty plan
         return {
