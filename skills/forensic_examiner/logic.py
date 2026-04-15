@@ -1101,7 +1101,8 @@ Output JSON:
             response = response.strip()
         
         return json.loads(response)
-    except Exception:
+    except Exception as exc:
+        logger.warning("[%s] Failed to get refined searches: %s", SKILL_NAME, exc)
         return {}
 
 
