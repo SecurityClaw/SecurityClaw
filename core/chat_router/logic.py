@@ -1150,6 +1150,10 @@ def execute_skill_workflow(
     """
     results = {}
     params = routing_decision.get("parameters", {})
+    by_skill_params = params.get("by_skill", {}) if isinstance(params, dict) else {}
+    shared_params = {
+        key: value for key, value in params.items() if key != "by_skill"
+    } if isinstance(params, dict) else {}
     aggregated_results = aggregated_results or {}
     
     # Load skill manifests for enrichment and auto-chain dispatching
@@ -1166,7 +1170,10 @@ def execute_skill_workflow(
         try:
             # Build context with parameters
             skill_context = runner._build_context()
-            skill_context["parameters"] = params.copy()
+            skill_specific = by_skill_params.get(skill_name, {})
+            if not isinstance(skill_specific, dict):
+                skill_specific = {}
+            skill_context["parameters"] = {**shared_params, **skill_specific}
             if memory is not None:
                 skill_context["memory"] = memory
             
@@ -1213,7 +1220,7 @@ def execute_skill_workflow(
                         all_manifests=all_manifests,
                         runner=runner,
                         context=context,
-                        parameters=params,
+                        parameters=shared_params,
                         conversation_history=conversation_history,
                         memory=memory,
                     )
@@ -1843,6 +1850,68 @@ def orchestrate_with_supervisor(
     )
 
 
+def _compact_prompt_value(value: Any, *, depth: int = 0) -> Any:
+    """Bound tool evidence while preserving facts needed for the next decision."""
+    if depth >= 4:
+        return str(value)[:500]
+    if isinstance(value, dict):
+        priority = (
+            "status", "error", "summary", "answer", "findings", "results_count",
+            "results", "verdicts", "ips", "domains", "countries", "ports",
+            "protocols", "time_range", "field_mappings", "timeline",
+        )
+        ordered_keys = [key for key in priority if key in value]
+        ordered_keys.extend(key for key in value if key not in ordered_keys)
+        return {
+            str(key): _compact_prompt_value(value[key], depth=depth + 1)
+            for key in ordered_keys[:24]
+        }
+    if isinstance(value, list):
+        return [_compact_prompt_value(item, depth=depth + 1) for item in value[:12]]
+    if isinstance(value, str):
+        return value[:1800]
+    return value
+
+
+def _build_conversation_context(
+    conversation_history: list[dict] | None,
+    *,
+    max_messages: int = 10,
+    max_chars: int = 7000,
+) -> str:
+    """Render recent turns for reference resolution without unbounded growth."""
+    history = list(conversation_history or [])[-max_messages:]
+    if not history:
+        return "(no previous conversation)"
+
+    lines: list[str] = []
+    for message in history:
+        role = "USER" if message.get("role") == "user" else "ASSISTANT"
+        content = " ".join(str(message.get("content") or "").split())
+        if content:
+            lines.append(f"{role}: {content[:1800]}")
+    rendered = "\n".join(lines)
+    return rendered[-max_chars:] if rendered else "(no usable previous conversation)"
+
+
+def _build_result_context(
+    current_results: dict | None,
+    *,
+    max_chars: int = 10000,
+) -> str:
+    """Expose compact, factual tool outputs instead of status counters alone."""
+    if not current_results:
+        return "(no tools have run yet)"
+    compact = {
+        skill_name: _compact_prompt_value(result)
+        for skill_name, result in current_results.items()
+    }
+    rendered = json.dumps(compact, indent=2, default=str)
+    if len(rendered) <= max_chars:
+        return rendered
+    return rendered[:max_chars] + "\n... [tool evidence truncated]"
+
+
 def _supervisor_next_action(
     user_question: str,
     available_skills: list[dict],
@@ -1891,23 +1960,12 @@ def _supervisor_next_action(
         f"- {s.get('name')}: {s.get('description', '')}"
         for s in available_skills
     )
-    history_text = "\n".join(
-        f"- {m.get('role', '?')}: {str(m.get('content', ''))[:220]}"
-        for m in conversation_history[-6:]
-    )
+    conversation_context = _build_conversation_context(conversation_history)
     prior_steps = json.dumps(previous_trace[-3:], indent=2, default=str) if previous_trace else "[]"
     result_keys = list(current_results.keys())
     question_grounding = _deterministic_supervisor_question_grounding(user_question) or {}
 
-    # Summarize what each result returned so the supervisor can make intelligent choices.
-    result_summary_lines = []
-    for skill_name, result in current_results.items():
-        count = result.get("results_count") or result.get("log_records") or (
-            len(result.get("results", [])) if isinstance(result.get("results"), list) else 0
-        )
-        status = result.get("status", "?")
-        result_summary_lines.append(f"  {skill_name}: status={status}, records_found={count}")
-    result_summary = "\n".join(result_summary_lines) or "  (no skills have run yet)"
+    result_summary = _build_result_context(current_results)
 
     next_action_template = _load_prompt_template(
         SUPERVISOR_NEXT_ACTION_PROMPT_PATH,
@@ -1916,6 +1974,9 @@ You are the SOC supervisor orchestrator.
 
 QUESTION:
 {{USER_QUESTION}}
+
+RELEVANT CONVERSATION:
+{{CONVERSATION_CONTEXT}}
 
 AVAILABLE SKILLS:
 {{SKILLS_DESCRIPTION}}{{MANIFEST_CONTEXT}}
@@ -1932,14 +1993,15 @@ QUESTION GROUNDING FROM CURRENT QUESTION ONLY:
 PREVIOUS EVALUATION:
 {{PREVIOUS_EVALUATION}}
 
-Return strict JSON with reasoning, skills, and parameters.question.
+Return strict JSON with reasoning, skills, and parameters. Use
+parameters.by_skill for skill-specific arguments.
 """,
     )
     prompt = _render_prompt(
         next_action_template,
         {
             "USER_QUESTION": user_question,
-            "HISTORY_TEXT": history_text or "- none",
+            "CONVERSATION_CONTEXT": conversation_context,
             "SKILLS_DESCRIPTION": skills_description,
             "MANIFEST_CONTEXT": manifest_context,
             "SKILL_CATALOG_JSON": skill_catalog_json,

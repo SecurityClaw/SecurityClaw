@@ -77,6 +77,7 @@ class OllamaProvider(BaseLLMProvider):
         self.embed_model = cfg.get("llm", "ollama_embed_model", default=self.model)
         self.temperature = cfg.get("llm", "temperature", default=0.2)
         self.max_tokens = cfg.get("llm", "max_tokens", default=16384)
+        self.context_window = cfg.get("llm", "context_window", default=16384)
         self.think = cfg.get("llm", "think", default=False)
         # Generation on local hardware can legitimately take several minutes.
         # Keep the connection timeout short while allowing a configurable read
@@ -105,7 +106,7 @@ class OllamaProvider(BaseLLMProvider):
             "options": {
                 "temperature": temperature or self.temperature,
                 "num_predict": max_tokens or self.max_tokens,
-                "num_ctx": max_tokens or self.max_tokens,  # Context window matches max_tokens from config
+                "num_ctx": self.context_window,
             },
         }
         if format:
@@ -150,7 +151,7 @@ class OllamaProvider(BaseLLMProvider):
             "options": {
                 "temperature": temperature or self.temperature,
                 "num_predict": max_tokens or self.max_tokens,
-                "num_ctx": max_tokens or self.max_tokens,
+                "num_ctx": self.context_window,
             },
         }
         full_response = ""

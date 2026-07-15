@@ -344,7 +344,14 @@ def _write_env(values: dict[str, str]) -> None:
 
 def _chat_history_for_router(conversation_id: str) -> list[dict[str, Any]]:
     history = load_conversation_history(conversation_id)
-    return history[-8:] if history else []
+    if not history:
+        return []
+    # The current user message is persisted before orchestration starts and is
+    # already passed separately as user_question. Do not duplicate it in the
+    # conversation context sent to the supervisor.
+    if history[-1].get("role") == "user":
+        history = history[:-1]
+    return history[-10:]
 
 
 def create_app(*, enable_scheduler: bool = True) -> FastAPI:

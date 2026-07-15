@@ -9,6 +9,7 @@ class _Config:
         ("llm", "temperature"): 0.2,
         ("llm", "think"): False,
         ("llm", "max_tokens"): 256,
+        ("llm", "context_window"): 8192,
         ("llm", "request_timeout_seconds"): 600,
         ("llm", "embedding_timeout_seconds"): 120,
     }
@@ -50,6 +51,8 @@ def test_chat_uses_configurable_local_generation_timeout(monkeypatch):
     assert provider.chat([{"role": "user", "content": "hello"}]) == "ok"
     assert requests.calls[0][1]["timeout"] == (10, 600)
     assert requests.calls[0][1]["json"]["think"] is False
+    assert requests.calls[0][1]["json"]["options"]["num_predict"] == 256
+    assert requests.calls[0][1]["json"]["options"]["num_ctx"] == 8192
 
 
 def test_embed_uses_separate_configurable_timeout(monkeypatch):

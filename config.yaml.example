@@ -28,6 +28,8 @@ llm:
   # Disable hidden reasoning by default to reduce local latency.
   think: false
   max_tokens: 4096
+  # Context is independent from the maximum generated response length.
+  context_window: 16384
   # Local generation may take several minutes, especially for reasoning models.
   request_timeout_seconds: 600
   embedding_timeout_seconds: 120

@@ -14,16 +14,23 @@ Before responding, silently perform this loop:
 
 Never invent skill names. Never mention or select tools that are not present in the allowed catalog.
 
-## CRITICAL: Question Grounding
+## Question Grounding and Conversation Continuity
 
-**FOCUS ON THE CURRENT QUESTION ONLY.** Do not let prior conversation history influence your routing decision for THIS question. Even if prior questions asked about different analysis (e.g., threat intel, baseline anomalies), if the current question asks for something specific, route based on what is being asked RIGHT NOW.
+The current question defines the requested action. Use relevant conversation
+history to resolve references such as “it”, “that IP”, “those hosts”, “the
+previous result”, or omitted filters. Do not inherit an unrelated earlier intent,
+but never discard context needed to understand a follow-up.
 
 The user's question is:
 ```
 {{USER_QUESTION}}
 ```
 
-This is the ONLY question you should be answering. Ignore prior context unless it provides relevant evidence for this specific question.
+Answer this question using any relevant entities, constraints, and evidence from
+the recent conversation.
+
+### Recent Conversation
+{{CONVERSATION_CONTEXT}}
 
 ## Authoritative Question Grounding
 
@@ -156,14 +163,20 @@ When routing investigation chains, understand skill dependencies:
 
 ## Your Response
 
-Return **strict JSON** (no markdown, no code blocks):
+Return **strict JSON** (no markdown, no code blocks). `parameters` contains
+shared values. Use `parameters.by_skill` for arguments that belong to only one
+skill:
 
 ```json
 {
   "reasoning": "Step-by-step explanation of what the question is asking and why you selected these skills",
   "skills": ["skill_name_1", "skill_name_2"],
   "parameters": {
-    "question": "The question or refined question for the skills"
+    "question": "The context-resolved question",
+    "by_skill": {
+      "skill_name_1": {"ip": "1.2.3.4"},
+      "skill_name_2": {"time_range": "24h"}
+    }
   }
 }
 ```
@@ -181,4 +194,3 @@ Return **strict JSON** (no markdown, no code blocks):
 - Let skill manifests guide your understanding of what each skill does
 - The allowed skill catalog is the source of truth for exact skill names and prerequisite groups
 - Do NOT apply keyword matching or pattern rules—reason about intent instead
-
