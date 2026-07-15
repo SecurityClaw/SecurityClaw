@@ -19,6 +19,7 @@ from rich.table import Table
 from core.config import Config
 from core.memory import CheckpointBackedMemory
 from core.scheduler import AgentScheduler
+from core.alert_store import alert_store
 from core.skill_loader import Skill, SkillLoader
 
 logger = logging.getLogger(__name__)
@@ -172,6 +173,15 @@ class Runner:
             raise RuntimeError(f"Startup initialization failed:\n{error_summary}")
 
         self.scheduler.set_context_factory(self._build_context)
+        manifests_by_name = {name: skill.metadata.get("manifest", {}) for name, skill in self._skills.items()}
+
+        def emit_passive_alert(name: str, result: Any) -> None:
+            manifest = manifests_by_name.get(name) or {}
+            contract = manifest.get("alert_contract") or {}
+            if contract and isinstance(result, dict):
+                alert_store.emit(name, result, contract)
+
+        self.scheduler.set_result_callback(emit_passive_alert)
 
         for name, skill in self._skills.items():
             if skill.schedule_cron_expr:

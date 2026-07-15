@@ -1,0 +1,14 @@
+name: endpoint_threat_hunter
+description: Periodically compares endpoint processes, connections, persistence, integrity, and defensive posture against the previous observation and asks the LLM to assess meaningful changes.
+routing_group: endpoint_monitoring
+capability_groups: [endpoint_security, passive_monitoring, threat_hunting]
+answer_types: [endpoint change detection, passive threat hunting, suspicious host activity]
+non_goals: [automatic containment, signature-only malware claims, modifying the endpoint]
+supported_platforms: [linux, windows]
+risk_level: read_only
+artifact_outputs: [endpoint_hunt_findings]
+alert_contract:
+  count_field: finding_count
+  findings_field: findings
+  default_severity: medium
+  title: Endpoint threat-hunting changes require review

@@ -12,7 +12,7 @@ export default function EditorPanel({ title, subtitle, value, onChange, onSave, 
           </button>
         ) : null}
       </div>
-      <textarea className="textarea font-mono text-xs" rows={rows} value={value} onChange={(e) => onChange(e.target.value)} spellCheck={false} />
+      <textarea className="textarea max-h-[calc(100vh-16rem)] overflow-auto font-mono text-xs" rows={rows} value={value} onChange={(e) => onChange(e.target.value)} spellCheck={false} />
     </div>
   )
 }

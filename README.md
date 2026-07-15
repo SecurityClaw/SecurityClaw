@@ -2,6 +2,32 @@
 
 A modular, skill-based autonomous Security Operations Center (SOC) agent that monitors OpenSearch/Elasticsearch data, builds RAG-based behavioral memory, and validates real-time anomalies using LLMs.
 
+## Portable launchers
+
+SecurityClaw includes versioned launchers for local and minimal-container deployments. They start services only when requested and keep the managed OpenSearch container on `restart=no`.
+
+Linux, macOS, WSL, or another POSIX-compatible shell:
+
+```bash
+./securityclaw.sh -h
+./securityclaw.sh start       # local .venv application
+./securityclaw.sh docker      # Docker Compose application
+./securityclaw.sh status
+./securityclaw.sh stop
+```
+
+Native Windows PowerShell:
+
+```powershell
+.\securityclaw.ps1 -h
+.\securityclaw.ps1 start     # local Windows .venv application
+.\securityclaw.ps1 docker    # Docker Compose application
+.\securityclaw.ps1 status
+.\securityclaw.ps1 stop
+```
+
+Both launchers verify configuration, Ollama, Docker, and OpenSearch. They also expose `chat`, `skills`, and `logs` commands. Use `OLLAMA_BASE_URL` for a remote model endpoint. The Bash launcher works on Windows through WSL or Git Bash; use the PowerShell launcher for native Windows execution.
+
 ## Features
 
 * **Skill Modularity** — Capabilities as isolated folders with `logic.py` (Python) + `instruction.md` (LLM guidance)  
@@ -346,6 +372,8 @@ db:
   vector_index: securityclaw-vectors     # RAG embedding store
 
 llm:
+  # ollama, openai, chatgpt, openai_compatible, anthropic, claude_api,
+  # codex_cli, or claude_cli
   provider: ollama
   ollama_base_url: http://localhost:11434
   ollama_model: qwen2.5:7b-instruct-q4_K_M
@@ -402,7 +430,24 @@ During onboarding, you can use any index names/patterns your environment provide
 OPENSEARCH_USERNAME=<your-opensearch-username>
 OPENSEARCH_PASSWORD=<your-opensearch-password>
 OLLAMA_BASE_URL=http://localhost:11434
+# Select one provider and define only the corresponding values:
+LLM_PROVIDER=ollama
+OPENAI_API_KEY=
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-5
+ANTHROPIC_API_KEY=
+ANTHROPIC_BASE_URL=https://api.anthropic.com/v1
+ANTHROPIC_MODEL=claude-sonnet-4-5
+CODEX_CLI_PATH=codex
+CLAUDE_CLI_PATH=claude
 ```
+
+`openai` and `chatgpt` use the OpenAI API; `openai_compatible` accepts any
+Chat Completions-compatible base URL. `anthropic` and `claude_api` use the
+Anthropic Messages API. `codex_cli` and `claude_cli` reuse an already
+authenticated local CLI. Remote and CLI chat providers continue to use the
+configured Ollama embedding model for local RAG, so embeddings remain separate
+from chat generation.
 
 ---
 
@@ -731,4 +776,3 @@ For issues, questions, or feature requests, open an issue or contact the Securit
 
   git grep -nEI '(password|api[_-]?key|BEGIN [A-Z ]*PRIVATE KEY|sk-)' -- .
   git log --all -G 'password|api[_-]?key|sk-' --oneline
-

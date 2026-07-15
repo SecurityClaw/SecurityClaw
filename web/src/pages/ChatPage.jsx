@@ -1,9 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
+import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { Plus, Send, Trash2 } from 'lucide-react'
+import { BarChart3, Brain, History, ListTree, PanelRightClose, PanelRightOpen, Plus, ScanSearch, Send, Trash2, Wrench } from 'lucide-react'
 import { api, streamChat } from '../lib/api.js'
+
+const EndpointInsights = lazy(() => import('../components/EndpointInsights.jsx'))
+const EvidenceGraph = lazy(() => import('../components/EvidenceGraph.jsx'))
 
 function upsertConversationItem(items, nextItem) {
   const index = items.findIndex((item) => item.id === nextItem.id)
@@ -42,6 +45,7 @@ function getActivityPhrases(step) {
     thinking: ['thinking', 'working', 'checking'],
     fetching: ['checking', 'working', 'thinking'],
     evaluating: ['checking', 'reviewing', 'thinking'],
+    tool: ['observing', 'checking', 'thinking'],
     processing: ['working', 'checking', 'thinking'],
   }
 
@@ -51,9 +55,31 @@ function getActivityPhrases(step) {
 const THOUGHT_TOKEN_PHASES = new Set(['skills_check', 'think', 'reflect'])
 const FINAL_TOKEN_PHASES = new Set(['direct_answer', 'answer', 'response_final'])
 
+function AgentTimeline({ items = [] }) {
+  if (!items.length) return null
+  return (
+    <div className="mb-4 space-y-3 border-l border-cyan/30 pl-4">
+      {items.map((item, index) => (
+        <details key={`${item.kind}-${item.step || 0}-${index}`} className="rounded-xl border border-border/70 bg-panel2 p-3" open={item.kind === 'tool'}>
+          <summary className="flex cursor-pointer list-none items-center gap-2">
+            {item.kind === 'thinking' ? <Brain className="h-4 w-4 text-cyan" /> : <Wrench className="h-4 w-4 text-neon" />}
+            <span className="font-mono text-[11px] uppercase tracking-[0.16em] text-cyan">{item.label}</span>
+            {item.action ? <span className="badge badge-green">{item.action}</span> : null}
+          </summary>
+          <div className="mt-2 text-sm text-text">{item.detail}</div>
+          {item.reasoning ? <div className="mt-2 text-sm text-dim">Reasoning: {item.reasoning}</div> : null}
+          {item.skills?.length ? <div className="mt-2 flex flex-wrap gap-2">{item.skills.map((skill) => <span key={skill} className="badge badge-green">{skill}</span>)}</div> : null}
+          {item.debug ? <pre className="mt-3 max-h-80 overflow-auto whitespace-pre-wrap rounded-lg bg-black/20 p-3 text-xs text-dim">{JSON.stringify(item.debug, null, 2)}</pre> : null}
+        </details>
+      ))}
+    </div>
+  )
+}
+
 export default function ChatPage() {
   const { conversationId } = useParams()
   const navigate = useNavigate()
+  const location = useLocation()
   const [conversations, setConversations] = useState([])
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
@@ -61,6 +87,9 @@ export default function ChatPage() {
   const [busy, setBusy] = useState(false)
   const [activityPhraseIndex, setActivityPhraseIndex] = useState(0)
   const [reasoningExpanded, setReasoningExpanded] = useState(false)
+  const [agentView, setAgentView] = useState('timeline')
+  const [agentDrawerOpen, setAgentDrawerOpen] = useState(true)
+  const [conversationsOpen, setConversationsOpen] = useState(false)
   const activeId = conversationId || null
   
   const messagesEndRef = useRef(null)
@@ -138,19 +167,41 @@ export default function ChatPage() {
     shouldAutoScrollRef.current = true
     setMessages([])
     setSteps([])
-    navigate('/chat')
+    navigate('/agent')
   }
 
   const removeConversation = async (id) => {
     await api.delete(`/api/conversations/${id}`)
     await loadConversations()
-    if (activeId === id) navigate('/chat')
+    if (activeId === id) navigate('/agent')
   }
 
-  const send = async () => {
-    if (!input.trim() || busy || isSendingRef.current) return
+  const send = async (messageOverride = null) => {
+    const requestedMessage = typeof messageOverride === 'string' ? messageOverride.trim() : input.trim()
+    if (!requestedMessage || isSendingRef.current) return
+    if (busy) {
+      const guidance = requestedMessage
+      const guidanceConversationId = activeId || streamingConversationIdRef.current
+      if (!guidanceConversationId) return
+      isSendingRef.current = true
+      try {
+        await api.post('/api/chat/guidance', {
+          conversation_id: guidanceConversationId,
+          message: guidance,
+        })
+        setInput('')
+        setSteps((prev) => [...prev, {
+          kind: 'guidance',
+          label: 'Operator guidance queued',
+          detail: guidance,
+        }])
+      } finally {
+        isSendingRef.current = false
+      }
+      return
+    }
     isSendingRef.current = true
-    const outgoing = input.trim()
+    const outgoing = requestedMessage
     const userTimestamp = new Date().toISOString()
     const assistantMessageId = `${userTimestamp}-assistant`
     const userMessageId = `${userTimestamp}-user`
@@ -196,7 +247,7 @@ export default function ChatPage() {
               last_update: userTimestamp,
               created_at: userTimestamp,
             }))
-            navigate(`/chat/${payload.conversation_id}`, { replace: true })
+            navigate(`/agent/${payload.conversation_id}`, { replace: true })
           }
           if (event === 'step') {
             setSteps((prev) => [...prev, payload])
@@ -250,6 +301,9 @@ export default function ChatPage() {
                   is_streaming: false,
                   timestamp: responseTimestamp,
                   routing_skills: payload.routing?.skills || [],
+                  agent_timeline: payload.agent_timeline || [],
+                  trace: payload.trace || [],
+                  skill_results: payload.skill_results || {},
                 }
               }))
             }
@@ -309,6 +363,14 @@ export default function ChatPage() {
   }, [conversations])
 
   const currentStep = steps[steps.length - 1] || null
+  const latestEvidenceMessage = [...messages].reverse().find((message) => message.role === 'assistant' && message.skill_results) || {}
+  const liveEvidenceResults = useMemo(() => {
+    const merged = { ...(latestEvidenceMessage.skill_results || {}) }
+    steps.forEach((step) => {
+      if (step.kind === 'tool' && step.debug && typeof step.debug === 'object') Object.assign(merged, step.debug)
+    })
+    return merged
+  }, [latestEvidenceMessage, steps])
   const activity = getActivityCopy(currentStep)
   const activityPhrases = getActivityPhrases(currentStep)
   const activityPhrase = activityPhrases[activityPhraseIndex % activityPhrases.length]
@@ -326,18 +388,33 @@ export default function ChatPage() {
     return () => window.clearInterval(timer)
   }, [busy, currentStep])
 
+  const runEndpointScan = () => {
+    if (busy) return
+    send('Perform a comprehensive defensive security assessment of this endpoint. Inspect host inventory, installed software and versions, vulnerability and CVE exposure, defensive posture, services, running processes, active connections, ARP/NDP neighbor integrity, routes, gateways, network interfaces, persistence mechanisms, and file integrity. Look for evidence of ARP spoofing or local network manipulation without treating an uncorroborated change as proof. Correlate all evidence, enrich suspicious network entities with the available threat-intelligence capabilities, continue with additional tools when observations create new questions, and provide a detailed risk analysis with coverage gaps and prioritized recommendations. Do not perform containment actions without my explicit authorization.')
+  }
+
+  useEffect(() => {
+    const initialPrompt = location.state?.initialPrompt
+    if (!initialPrompt) return
+    setInput(initialPrompt)
+    navigate('/agent', { replace: true, state: null })
+  }, [location.state, navigate])
+
   return (
     <div className="flex h-full min-h-0 gap-6">
-      <div className="panel flex w-80 flex-col overflow-hidden">
+      {conversationsOpen ? <div className="panel flex w-80 flex-col overflow-hidden">
         <div className="border-b border-border p-4">
           <button className="btn btn-primary w-full" onClick={newChat}>
             <Plus className="h-4 w-4" /> New Chat
+          </button>
+          <button className="btn mt-2 w-full" onClick={runEndpointScan} disabled={busy}>
+            <ScanSearch className="h-4 w-4" /> Scan endpoint
           </button>
         </div>
         <div className="min-h-0 flex-1 overflow-auto p-3 space-y-2">
           {orderedConversations.map((conv) => (
             <div key={conv.id} className={`rounded-xl border p-3 ${activeId === conv.id ? 'border-cyan bg-cyan/10' : 'border-border bg-panel2'}`}>
-              <button className="w-full text-left" onClick={() => navigate(`/chat/${conv.id}`)}>
+              <button className="w-full text-left" onClick={() => navigate(`/agent/${conv.id}`)}>
                 <div className="truncate font-mono text-xs uppercase tracking-[0.14em] text-cyan">{conv.id}</div>
                 <div className="mt-1 line-clamp-2 text-sm text-text">{conv.first_question || conv.preview || 'Conversation'}</div>
                 <div className="mt-2 font-mono text-[11px] text-dim">{conv.messages} entries</div>
@@ -348,13 +425,36 @@ export default function ChatPage() {
             </div>
           ))}
         </div>
-      </div>
+      </div> : null}
 
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="relative flex min-w-0 flex-1 flex-col overflow-hidden">
         <div className="panel flex min-h-0 flex-1 flex-col overflow-hidden">
+          <div className="flex items-center justify-between border-b border-border px-4 py-3">
+            <div><div className="font-mono text-xs uppercase tracking-[0.18em] text-cyan">Investigation Graph</div><div className="mt-1 text-xs text-dim">Evidence appears as each tool completes.</div></div>
+            <div className="flex gap-2">
+              <button className={`btn ${conversationsOpen ? 'btn-primary' : ''}`} onClick={() => setConversationsOpen((value) => !value)}><History className="h-4 w-4" /> History</button>
+              <button className={`btn ${agentDrawerOpen ? 'btn-primary' : ''}`} onClick={() => setAgentDrawerOpen((value) => !value)}>{agentDrawerOpen ? <PanelRightClose className="h-4 w-4" /> : <PanelRightOpen className="h-4 w-4" />} Agent</button>
+            </div>
+          </div>
+          <Suspense fallback={<div className="p-6 text-sm text-dim">Loading evidence graph…</div>}><EvidenceGraph skillResults={liveEvidenceResults} storageKey={activeId || 'new'} /></Suspense>
+        </div>
+
+        {agentDrawerOpen ? <div className="absolute inset-y-0 right-0 z-20 flex w-[min(720px,96%)] min-w-0 flex-col border-l border-border bg-panel shadow-2xl">
+          <div className="flex items-center justify-between border-b border-border px-5 py-3">
+            <div>
+              <div className="font-mono text-xs uppercase tracking-[0.18em] text-cyan">SecurityClaw Agent</div>
+              <div className="mt-1 text-xs text-dim">ReAct investigation console · operator-guided · approval-gated actions</div>
+            </div>
+            <div className="flex gap-2">
+              <button className={`btn ${agentView === 'timeline' ? 'btn-primary' : ''}`} onClick={() => setAgentView('timeline')}><ListTree className="h-4 w-4" /> Timeline</button>
+              <button className={`btn ${agentView === 'insights' ? 'btn-primary' : ''}`} onClick={() => setAgentView('insights')}><BarChart3 className="h-4 w-4" /> Insights</button>
+              <button className="btn" onClick={() => setAgentDrawerOpen(false)} aria-label="Close Agent"><PanelRightClose className="h-4 w-4" /></button>
+            </div>
+          </div>
+          {agentView === 'insights' ? <Suspense fallback={<div className="p-6 text-sm text-dim">Loading insights…</div>}><EndpointInsights messages={messages} liveSteps={steps} /></Suspense> : null}
           <div
             ref={messagesContainerRef}
-            className="min-h-0 flex-1 space-y-4 overflow-auto p-5"
+            className={`min-h-0 flex-1 space-y-4 overflow-auto p-5 ${agentView !== 'timeline' ? 'hidden' : ''}`}
             onScroll={handleMessagesScroll}
           >
             {messages.length === 0 ? <div className="font-mono text-dim">Start a new investigation.</div> : null}
@@ -372,6 +472,7 @@ export default function ChatPage() {
                 ) : null}
                 {message.role === 'assistant' ? (
                   <div className={`markdown text-base leading-7 text-text ${message.thought_content ? 'mt-3' : ''}`}>
+                    <AgentTimeline items={message.agent_timeline || []} />
                     {message.content ? (
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
                     ) : message.is_streaming ? (
@@ -417,6 +518,17 @@ export default function ChatPage() {
                           <div key={`${step.kind}-${index}`} className="rounded-xl border border-border/70 bg-panel2 px-3 py-3">
                             <div className="font-mono text-[11px] uppercase tracking-[0.16em] text-cyan">{step.label}</div>
                             <div className="mt-1 text-sm text-text">{step.detail}</div>
+                            {step.skills?.length ? (
+                              <div className="mt-2 flex flex-wrap gap-2">
+                                {step.skills.map((skill) => <span key={skill} className="badge badge-green">{skill}</span>)}
+                              </div>
+                            ) : null}
+                            {step.debug ? (
+                              <details className="mt-3">
+                                <summary className="cursor-pointer font-mono text-[11px] uppercase tracking-[0.14em] text-dim">Debug output</summary>
+                                <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap rounded-lg bg-black/20 p-3 text-xs text-dim">{JSON.stringify(step.debug, null, 2)}</pre>
+                              </details>
+                            ) : null}
                           </div>
                         ))}
                       </div>
@@ -436,12 +548,12 @@ export default function ChatPage() {
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
               />
-              <button className="btn btn-primary shrink-0" onClick={send} disabled={busy || !input.trim()}>
-                <Send className="h-4 w-4" /> {busy ? activityPhrase.toUpperCase() : 'SEND'}
+              <button className="btn btn-primary shrink-0" onClick={send} disabled={!input.trim()}>
+                <Send className="h-4 w-4" /> {busy ? 'GUIDE' : 'SEND'}
               </button>
             </div>
           </div>
-        </div>
+        </div> : null}
       </div>
     </div>
   )

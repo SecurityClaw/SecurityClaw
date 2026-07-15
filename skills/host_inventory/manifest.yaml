@@ -1,0 +1,9 @@
+name: host_inventory
+description: Collects read-only operating system, hardware, hostname, and user inventory on Linux and Windows.
+routing_group: endpoint_inventory
+capability_groups: [endpoint_security, host_telemetry]
+answer_types: [host inventory, operating system details, local user inventory]
+non_goals: [process termination, configuration changes, malware removal]
+supported_platforms: [linux, windows]
+risk_level: read_only
+artifact_outputs: [host_inventory]

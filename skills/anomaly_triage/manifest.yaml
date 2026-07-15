@@ -33,3 +33,11 @@ returns:
   - enriched_findings
   - baseline_comparison
   - anomaly_scores
+
+capability_groups: [soc_monitoring, passive_monitoring, anomaly_detection]
+risk_level: read_only
+alert_contract:
+  count_field: enriched
+  findings_field: findings
+  default_severity: medium
+  title: SOC anomaly findings require review

@@ -1,0 +1,9 @@
+name: network_monitor
+description: Inspects active local network connections, listeners, endpoints, states, and owning processes on Linux and Windows.
+routing_group: endpoint_network
+capability_groups: [endpoint_security, host_telemetry, network_connections]
+answer_types: [active connections, listening ports, process network activity]
+non_goals: [firewall changes, IP blocking, packet interception]
+supported_platforms: [linux, windows]
+risk_level: read_only
+artifact_outputs: [network_snapshot]

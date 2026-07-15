@@ -1,0 +1,9 @@
+name: process_monitor
+description: Inspects running processes, parent relationships, commands, executables, and owners on Linux and Windows.
+routing_group: endpoint_processes
+capability_groups: [endpoint_security, host_telemetry, process_analysis]
+answer_types: [running processes, suspicious process investigation, process tree evidence]
+non_goals: [process termination, file deletion, automatic containment]
+supported_platforms: [linux, windows]
+risk_level: read_only
+artifact_outputs: [process_snapshot]

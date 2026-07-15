@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import queue as sync_queue
 import re
 import threading
 import uuid
@@ -21,6 +22,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from core.config import Config
+from core.alert_store import alert_store
+from core.skill_manifest import manifest_supports_current_platform
 from core.skill_onboarding import discover_skill_requirements, get_missing_skill_variables
 from core.chat_router.logic import (
     add_assistant_message_to_history,
@@ -167,6 +170,15 @@ class ChatRequest(BaseModel):
     conversation_id: str | None = None
 
 
+class GuidanceRequest(BaseModel):
+    conversation_id: str
+    message: str
+
+
+class AlertStatusRequest(BaseModel):
+    status: str
+
+
 class SaveTextRequest(BaseModel):
     content: str
 
@@ -195,8 +207,18 @@ class ChatStreamParser:
             return {
                 "kind": "thinking",
                 "label": f"Thinking · step {step}/{max_steps}",
-                "detail": data.get("reasoning", "Planning next move"),
+                "detail": data.get("thought") or data.get("reasoning", "Planning next move"),
+                "reasoning": data.get("reasoning", ""),
+                "action": data.get("action") or (
+                    "answer" if data.get("response_mode") == "direct" else
+                    "ask_user" if data.get("response_mode") == "clarify" else
+                    "use_tools"
+                ),
                 "skills": data.get("skills", []),
+                "debug": {
+                    "parameters": data.get("parameters", {}),
+                    "question_grounding": data.get("question_grounding", {}),
+                },
                 "step": step,
                 "max_steps": max_steps,
             }
@@ -208,6 +230,17 @@ class ChatStreamParser:
                 "label": label,
                 "detail": ", ".join(skills) if skills else "Running selected skills",
                 "skills": skills,
+                "step": step,
+                "max_steps": max_steps,
+            }
+        if event == "observed":
+            skills = data.get("skills", [])
+            return {
+                "kind": "tool",
+                "label": f"Tool output · step {step}/{max_steps}",
+                "detail": ", ".join(skills) if skills else "Observation received",
+                "skills": skills,
+                "debug": data.get("results", {}),
                 "step": step,
                 "max_steps": max_steps,
             }
@@ -266,6 +299,10 @@ def _build_available_skills() -> list[dict[str, Any]]:
             continue
         if not _is_skill_enabled(skill_dir.name):
             continue
+        manifest_path = skill_dir / "manifest.yaml"
+        manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+        if not manifest_supports_current_platform(manifest or {}):
+            continue
         skills.append({
             "name": skill_dir.name,
             "description": _get_skill_description(skill_dir.name),
@@ -280,10 +317,12 @@ def _skill_payload(skill_dir: Path) -> dict[str, Any]:
     instruction_raw = _read_text(instruction_path)
     manifest = yaml.safe_load(manifest_raw) if manifest_raw else {}
     manifest = manifest or {}
+    platform_supported = manifest_supports_current_platform(manifest)
     frontmatter, _ = _parse_instruction_frontmatter(instruction_raw)
     return {
         "name": skill_dir.name,
-        "enabled": _is_skill_enabled(skill_dir.name),
+        "enabled": _is_skill_enabled(skill_dir.name) and platform_supported,
+        "platform_supported": platform_supported,
         "manifest": manifest,
         "manifest_raw": manifest_raw,
         "instruction_raw": instruction_raw,
@@ -304,6 +343,15 @@ def _env_payload() -> dict[str, Any]:
         "DB_USERNAME",
         "DB_PASSWORD",
         "OLLAMA_BASE_URL",
+        "LLM_PROVIDER",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_MODEL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "CODEX_CLI_PATH",
+        "CLAUDE_CLI_PATH",
         "ABUSEIPDB_API_KEY",
         "ALIENVAULT_API_KEY",
         "VIRUSTOTAL_API_KEY",
@@ -383,6 +431,7 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
             _conn.close()
 
     app = FastAPI(title="SecurityClaw Service", lifespan=lifespan)
+    app.state.guidance_queues = {}
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -527,6 +576,7 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
     @app.get("/api/crons")
     async def crons() -> dict[str, Any]:
         items = []
+        runtime_jobs = app.state.service.context.runner.scheduler.job_status
         for skill in _all_skills_payload():
             schedule_type = "manual"
             if skill.get("schedule_cron_expr"):
@@ -540,8 +590,34 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
                 "type": schedule_type,
                 "interval_seconds": skill.get("schedule_interval_seconds"),
                 "cron_expr": skill.get("schedule_cron_expr"),
+                "last_run": (runtime_jobs.get(skill["name"]) or {}).get("last_run"),
+                "last_result": (runtime_jobs.get(skill["name"]) or {}).get("last_result"),
+                "last_error": (runtime_jobs.get(skill["name"]) or {}).get("last_error"),
             })
         return {"items": items}
+
+    @app.get("/api/alerts")
+    async def alerts() -> dict[str, Any]:
+        items = alert_store.list()
+        return {"items": items, "unread": sum(item.get("status") == "unread" for item in items)}
+
+    @app.put("/api/alerts/{alert_id}/status")
+    async def update_alert_status(alert_id: str, body: AlertStatusRequest) -> dict[str, Any]:
+        if body.status not in {"unread", "read", "investigating", "resolved"}:
+            raise HTTPException(status_code=400, detail="Invalid alert status")
+        alert = alert_store.update_status(alert_id, body.status)
+        if alert is None:
+            raise HTTPException(status_code=404, detail="Alert not found")
+        return {"status": "ok", "alert": alert}
+
+    @app.post("/api/crons/{skill_name}/run")
+    async def run_scheduled_skill(skill_name: str) -> dict[str, Any]:
+        _validate_skill_name(skill_name)
+        runner = app.state.service.context.runner
+        if skill_name not in runner.scheduler.job_names:
+            raise HTTPException(status_code=404, detail="Enabled scheduled skill not found")
+        result = await asyncio.to_thread(runner.scheduler.dispatch, skill_name)
+        return {"status": "ok", "skill": skill_name, "result": result}
 
     @app.post("/api/restart")
     async def restart(_: RestartRequest | None = None) -> dict[str, str]:
@@ -557,6 +633,20 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
         done = asyncio.Event()
         result_box: dict[str, Any] = {}
         error_box: dict[str, str] = {}
+        timeline_events: list[dict[str, Any]] = []
+        guidance_queue = app.state.guidance_queues.setdefault(
+            conversation_id,
+            sync_queue.Queue(),
+        )
+
+        def guidance_provider() -> str:
+            guidance = []
+            while True:
+                try:
+                    guidance.append(guidance_queue.get_nowait())
+                except sync_queue.Empty:
+                    break
+            return "\n".join(guidance)
 
         def callback(event: str, data: dict[str, Any], step: int, max_steps: int) -> None:
             if event == "token":
@@ -575,6 +665,7 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
                 return
 
             payload = ChatStreamParser.to_step_payload(event, data, step, max_steps)
+            timeline_events.append(payload)
             loop.call_soon_threadsafe(queue.put_nowait, ("step", payload))
 
         def worker() -> None:
@@ -592,6 +683,7 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
                     step_callback=callback,
                     checkpointer=app.state.checkpointer,
                     thread_id=f"{conversation_id}-{uuid.uuid4().hex[:8]}",
+                    guidance_provider=guidance_provider,
                 )
                 result_box.update(orchestration)
                 add_assistant_message_to_history(
@@ -599,6 +691,8 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
                     orchestration.get("response", ""),
                     orchestration.get("routing", {}),
                     orchestration.get("skill_results", {}),
+                    trace=orchestration.get("trace", []),
+                    agent_timeline=timeline_events,
                 )
             except Exception as exc:
                 error_box["message"] = str(exc)
@@ -635,6 +729,7 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
                     "routing": result_box.get("routing", {}),
                     "trace": result_box.get("trace", []),
                     "skill_results": result_box.get("skill_results", {}),
+                    "agent_timeline": timeline_events,
                 })
             yield _sse("done", {"conversation_id": conversation_id})
 
@@ -647,6 +742,18 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
                 "X-Accel-Buffering": "no",
             },
         )
+
+    @app.post("/api/chat/guidance")
+    async def chat_guidance(body: GuidanceRequest) -> dict[str, str]:
+        message = body.message.strip()
+        if not message:
+            raise HTTPException(status_code=400, detail="Guidance message is required")
+        guidance_queue = app.state.guidance_queues.setdefault(
+            body.conversation_id,
+            sync_queue.Queue(),
+        )
+        guidance_queue.put(message)
+        return {"status": "queued", "conversation_id": body.conversation_id}
 
     if DIST_DIR.exists():
         assets_dir = DIST_DIR / "assets"

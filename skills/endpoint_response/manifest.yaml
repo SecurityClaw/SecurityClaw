@@ -1,0 +1,17 @@
+name: endpoint_response
+description: Performs explicitly authorized defensive containment actions on Linux and Windows, including process termination, IP blocking, neighbor-cache eviction, and file quarantine.
+routing_group: endpoint_response
+capability_groups: [endpoint_security, containment, host_actions]
+answer_types: [contain a process, block a remote IP, remove a suspicious ARP or NDP neighbor entry, quarantine a suspicious file]
+non_goals: [unattended remediation, destructive cleanup, actions without operator approval]
+supported_platforms: [linux, windows]
+risk_level: privileged_approval_required
+requires_operator_authorization: true
+parameters:
+  action: {type: string, enum: [terminate_process, block_ip, delete_neighbor_entry, quarantine_file], required: true}
+  pid: {type: integer, required: false}
+  ip: {type: string, required: false}
+  interface: {type: string, required: false}
+  path: {type: string, required: false}
+  authorization_token: {type: string, required: false}
+artifact_outputs: [containment_result, authorization_request]

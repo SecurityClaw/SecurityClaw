@@ -1,0 +1,13 @@
+name: software_inventory
+description: Collects installed operating-system software and versions for defensive inventory and vulnerability correlation.
+supported_platforms: [linux, windows]
+capability_groups: [endpoint_security, vulnerability_management, software_inventory]
+routing_group: endpoint_inventory
+answer_types: [installed software inventory, package versions, patch inventory]
+non_goals: [installing packages, removing software, claiming vulnerability status without advisory correlation]
+risk_level: read_only
+parameters:
+  limit: {type: integer, required: false, description: Maximum number of installed packages to collect.}
+artifact_outputs: [software_inventory]
+keywords: [installed software, packages, versions, patch inventory, applications]
+schedule: null

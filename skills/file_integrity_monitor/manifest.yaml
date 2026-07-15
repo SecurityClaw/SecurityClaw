@@ -1,0 +1,12 @@
+name: file_integrity_monitor
+description: Creates SHA-256 metadata snapshots for selected files on Linux and Windows to support integrity monitoring.
+routing_group: endpoint_file_integrity
+capability_groups: [endpoint_security, host_telemetry, file_integrity]
+answer_types: [file hashes, file integrity snapshot, sensitive file metadata]
+non_goals: [malware removal, quarantine, file restoration]
+supported_platforms: [linux, windows]
+risk_level: read_only
+parameters:
+  paths: {type: array, items: string, required: false}
+  max_files: {type: integer, minimum: 1, maximum: 5000, required: false}
+artifact_outputs: [file_integrity_snapshot]

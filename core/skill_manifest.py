@@ -2,12 +2,29 @@
 
 import importlib
 import logging
+import platform
 import re
 from pathlib import Path
 from typing import Any
 import yaml
 
 logger = logging.getLogger(__name__)
+
+
+def current_platform_name() -> str:
+    """Return the normalized platform identifier used by skill manifests."""
+    system = platform.system().strip().lower()
+    return "windows" if system == "windows" else "linux" if system == "linux" else system
+
+
+def manifest_supports_current_platform(manifest: dict[str, Any] | None) -> bool:
+    """Check a manifest platform contract without relying on skill names."""
+    supported = {
+        str(name).strip().lower()
+        for name in ((manifest or {}).get("supported_platforms") or [])
+        if str(name).strip()
+    }
+    return not supported or current_platform_name() in supported
 
 
 
@@ -771,4 +788,3 @@ def check_and_apply_auto_chain(
     except Exception as e:
         logger.error("[%s] Unexpected error in auto-chain: %s", last_skill_name, e)
         return None, None
-

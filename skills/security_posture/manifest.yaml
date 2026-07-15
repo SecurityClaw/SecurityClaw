@@ -1,0 +1,13 @@
+name: security_posture
+description: Inspects host services, firewall state, endpoint protection, failed units, and update posture without changing configuration.
+supported_platforms: [linux, windows]
+capability_groups: [endpoint_security, security_posture]
+routing_group: endpoint_posture
+answer_types: [firewall posture, endpoint protection state, service inventory, update posture]
+non_goals: [changing firewall rules, stopping services, installing updates]
+risk_level: read_only
+parameters:
+  limit: {type: integer, required: false, description: Maximum number of services to inspect.}
+artifact_outputs: [security_posture]
+keywords: [firewall, defender, services, hardening, security posture, updates]
+schedule: null

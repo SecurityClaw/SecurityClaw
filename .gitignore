@@ -411,4 +411,3 @@ FodyWeavers.xsd
 conversations/*
 tests/local_tests/
 data/*
-securityclaw.sh

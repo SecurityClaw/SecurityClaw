@@ -162,3 +162,70 @@ def test_decide_node_short_circuits_direct_response_without_plan_review(monkeypa
     assert result["response_mode"] == "direct"
     assert result["skill_plan"] == []
     assert result["plan_exhausted"] is True
+
+
+def test_decide_node_can_request_operator_clarification(monkeypatch):
+    monkeypatch.setattr(logic, "_supervisor_next_action", lambda **kwargs: {
+        "response_mode": "clarify",
+        "reasoning": "The target path is required",
+        "skills": [],
+        "parameters": {"question": "Which path should be inspected?"},
+    })
+    result = logic.decide_node(
+        {
+            "user_question": "Inspect it",
+            "messages": [], "skill_results": {}, "previously_run_skills": [],
+            "step_count": 0, "max_steps": 4, "evaluation": {}, "trace": [],
+        },
+        {"configurable": {"available_skills": [], "llm": object(), "instruction": ""}},
+    )
+    assert result["response_mode"] == "clarify"
+    assert result["pending_parameters"]["question"] == "Which path should be inspected?"
+
+
+def test_decide_node_applies_operator_guidance_on_next_round(monkeypatch):
+    captured = {}
+
+    def next_action(**kwargs):
+        captured["history"] = kwargs["conversation_history"]
+        return {
+            "response_mode": "direct",
+            "reasoning": "Operator requested completion",
+            "skills": [],
+            "parameters": {"question": kwargs["user_question"]},
+        }
+
+    monkeypatch.setattr(logic, "_supervisor_next_action", next_action)
+    result = logic.decide_node(
+        {
+            "user_question": "Inspect this host",
+            "messages": [], "skill_results": {}, "previously_run_skills": [],
+            "step_count": 1, "max_steps": 4, "evaluation": {"satisfied": False}, "trace": [],
+        },
+        {"configurable": {
+            "available_skills": [], "llm": object(), "instruction": "",
+            "guidance_provider": lambda: "Focus on persistence and then finish",
+        }},
+    )
+    assert result["response_mode"] == "direct"
+    assert "Focus on persistence" in captured["history"][-1]["content"]
+
+
+def test_endpoint_investigation_forces_complete_evidence_synthesis(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(logic, "format_response", lambda *args, **kwargs: captured.update(kwargs) or "assessment")
+    result = logic.format_response_node(
+        {
+            "user_question": "Assess this PC",
+            "messages": [],
+            "skill_results": {
+                "host_inventory": {"status": "ok", "platform": "linux"},
+                "process_monitor": {"status": "ok", "count": 10},
+            },
+            "trace": [], "evaluation": {}, "step_count": 1, "max_steps": 4,
+            "response_mode": "tools",
+        },
+        {"configurable": {"llm": object(), "cfg": None, "available_skills": []}},
+    )
+    assert result["response"] == "assessment"
+    assert captured["force_agent_synthesis"] is True

@@ -11,11 +11,13 @@ from __future__ import annotations
 import importlib.util
 import logging
 import sys
+import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from core.config import Config
+from core.skill_manifest import manifest_supports_current_platform
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +81,19 @@ class SkillLoader:
             interval = self._extract_interval(instruction)
             cron_expr = self._extract_cron_expr(instruction)
             run_on_first_startup = self._extract_run_on_first_startup(manifest_path)
+            manifest = {}
+            if manifest_path.exists():
+                try:
+                    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+                except Exception as exc:
+                    logger.warning("Skill %s has an invalid manifest: %s", skill_dir.name, exc)
+            if not manifest_supports_current_platform(manifest):
+                logger.info(
+                    "Skipping skill %s: unsupported on the current platform (supported=%s)",
+                    skill_dir.name,
+                    manifest.get("supported_platforms"),
+                )
+                continue
             
             skill = Skill(
                 name=skill_dir.name,
@@ -87,7 +102,7 @@ class SkillLoader:
                 schedule_interval_seconds=interval,
                 schedule_cron_expr=cron_expr,
                 run_on_first_startup=run_on_first_startup,
-                metadata={"dir": str(skill_dir)},
+                metadata={"dir": str(skill_dir), "manifest": manifest},
             )
             self._registry[skill.name] = skill
             log_schedule = cron_expr if cron_expr else f"{interval}s" if interval else "manual"
@@ -109,6 +124,19 @@ class SkillLoader:
     ) -> Optional[Callable[[dict], dict]]:
         module_name = f"skills.{skill_name}.logic"
         try:
+            existing = sys.modules.get(module_name)
+            existing_path = getattr(existing, "__file__", None)
+            if existing is not None and existing_path:
+                try:
+                    same_module = Path(existing_path).resolve() == logic_path.resolve()
+                except OSError:
+                    same_module = False
+                if same_module:
+                    if not hasattr(existing, "run"):
+                        logger.warning("Skill %s: logic.py has no `run` function", skill_name)
+                        return None
+                    return existing.run
+
             spec = importlib.util.spec_from_file_location(module_name, logic_path)
             module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
             sys.modules[module_name] = module

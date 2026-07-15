@@ -66,10 +66,10 @@ export default function SkillsPage() {
     <div className="space-y-6">
       <PageHeader title="Skills" subtitle="Inspect and edit every skill's manifest and instruction prompt." />
 
-      <div className="grid gap-6 xl:grid-cols-[320px_1fr]">
-        <div className="panel overflow-hidden">
+      <div className="grid items-start gap-6 xl:grid-cols-[320px_1fr]">
+        <div className="panel flex max-h-[calc(100vh-9rem)] flex-col overflow-hidden">
           <div className="border-b border-border px-4 py-3 font-mono text-xs uppercase tracking-[0.18em] text-cyan">Loaded Skills</div>
-          <div className="space-y-2 p-3">
+          <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
             {skills.length === 0 ? <div className="rounded-xl border border-border bg-panel2 p-3 font-mono text-xs text-dim">No skills discovered.</div> : null}
             {skills.map((skill) => (
               <button

@@ -470,7 +470,7 @@ def chat():
     available_skills = [
         {
             "name": name,
-            "description": skill.description if hasattr(skill, "description") else "Security analysis skill",
+            "description": str((skill.metadata.get("manifest") or {}).get("description") or "Security analysis skill"),
         }
         for name, skill in discovered_skills.items()
         if name != "chat_router"  # Don't route to ourselves

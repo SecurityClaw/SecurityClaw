@@ -49,14 +49,19 @@ export default function ConfigPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Config" subtitle="Edit core agent configuration and secret environment variables." actions={<button className="btn btn-primary" onClick={saveEnv} disabled={savingEnv}>{savingEnv ? 'SAVING ENV' : 'SAVE ENV'}</button>} />
+      <PageHeader title="Config" subtitle="Configure runtime behavior and provider credentials without exposing unrelated settings." />
 
       <div className="grid gap-6 xl:grid-cols-[1.1fr_0.9fr]">
-        <EditorPanel title="config.yaml" subtitle="Core agent, database, LLM, RAG, anomaly, and GeoIP settings." value={configRaw} onChange={setConfigRaw} onSave={saveConfig} saving={savingConfig} rows={28} />
+        <div className="max-h-[calc(100vh-9rem)] overflow-hidden">
+          <EditorPanel title="config.yaml" subtitle="Runtime settings. Provider secrets belong in .env." value={configRaw} onChange={setConfigRaw} onSave={saveConfig} saving={savingConfig} rows={28} />
+        </div>
 
-        <div className="panel p-4">
-          <div className="mb-4 font-mono text-xs uppercase tracking-[0.18em] text-cyan">.env Secrets</div>
-          <div className="space-y-4">
+        <div className="panel flex max-h-[calc(100vh-9rem)] flex-col overflow-hidden p-4">
+          <div className="mb-4 flex items-start justify-between gap-4">
+            <div><div className="font-mono text-xs uppercase tracking-[0.18em] text-cyan">.env Secrets</div><div className="mt-1 text-sm text-dim">API keys, endpoints, and CLI overrides used by the selected provider.</div></div>
+            <button className="btn btn-primary" onClick={saveEnv} disabled={savingEnv}>{savingEnv ? 'SAVING' : 'SAVE'}</button>
+          </div>
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
             {envEntries.length === 0 ? <div className="font-mono text-dim">No environment variables found.</div> : null}
             {envEntries.map(([key, meta]) => (
               <div key={key}>

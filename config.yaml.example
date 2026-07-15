@@ -18,12 +18,18 @@ db:
   verify_certs: false
   # Credentials loaded from .env: DB_USERNAME, DB_PASSWORD
 llm:
+  # ollama | openai | chatgpt | openai_compatible | anthropic | claude_api |
+  # codex_cli | claude_cli. Endpoints, models, and credentials can be overridden
+  # in .env without placing secrets in this file.
   provider: ollama
   ollama_base_url: http://localhost:11434
   # Current example runtime models:
   ollama_model: qwen2.5:7b-instruct-q4_K_M
   # Lightweight local model used in the current example config for auxiliary tasks.
   ollama_embed_model: nomic-embed-text:latest
+  # Remote and CLI provider settings can be supplied through .env:
+  # OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, ANTHROPIC_API_KEY,
+  # ANTHROPIC_BASE_URL, ANTHROPIC_MODEL, CODEX_CLI_PATH, CLAUDE_CLI_PATH.
   temperature: 0.2
   # Disable hidden reasoning by default to reduce local latency.
   think: false

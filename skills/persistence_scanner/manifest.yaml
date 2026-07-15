@@ -1,0 +1,9 @@
+name: persistence_scanner
+description: Inspects systemd, cron, Windows scheduled tasks, and other startup persistence evidence without changing the host.
+routing_group: endpoint_persistence
+capability_groups: [endpoint_security, host_telemetry, persistence_analysis]
+answer_types: [startup persistence, scheduled tasks, suspicious autostart entries]
+non_goals: [disabling services, deleting tasks, removing persistence]
+supported_platforms: [linux, windows]
+risk_level: read_only
+artifact_outputs: [persistence_snapshot]

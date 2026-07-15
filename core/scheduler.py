@@ -9,6 +9,7 @@ Supports:
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -34,10 +35,21 @@ class AgentScheduler:
         )
         self._jobs: dict[str, dict] = {}
         self._context_factory: Callable[[], dict] = dict
+        self._result_callback: Callable[[str, Any], None] | None = None
 
     def set_context_factory(self, factory: Callable[[], dict]) -> None:
         """Supply a callable that returns a fresh context dict per run."""
         self._context_factory = factory
+
+    def set_result_callback(self, callback: Callable[[str, Any], None] | None) -> None:
+        self._result_callback = callback
+
+    def _record_result(self, name: str, result: Any) -> None:
+        self._jobs[name]["last_result"] = result
+        self._jobs[name]["last_error"] = None
+        self._jobs[name]["last_run"] = datetime.now(timezone.utc).isoformat()
+        if self._result_callback:
+            self._result_callback(name, result)
 
     def register(
         self,
@@ -57,8 +69,11 @@ class AgentScheduler:
             try:
                 logger.debug("Running job: %s", name)
                 result = fn(ctx)
+                self._record_result(name, result)
                 logger.debug("Job %s completed: %s", name, result)
             except Exception as exc:
+                self._jobs[name]["last_error"] = str(exc)
+                self._jobs[name]["last_run"] = datetime.now(timezone.utc).isoformat()
                 logger.error("Job %s raised: %s", name, exc, exc_info=True)
 
         trigger = IntervalTrigger(seconds=interval_seconds)
@@ -86,8 +101,11 @@ class AgentScheduler:
         def _wrapper() -> None:
             ctx = self._context_factory()
             try:
-                fn(ctx)
+                result = fn(ctx)
+                self._record_result(name, result)
             except Exception as exc:
+                self._jobs[name]["last_error"] = str(exc)
+                self._jobs[name]["last_run"] = datetime.now(timezone.utc).isoformat()
                 logger.error("Cron job %s raised: %s", name, exc, exc_info=True)
 
         self._scheduler.add_job(
@@ -105,7 +123,14 @@ class AgentScheduler:
             raise KeyError(f"No job named {name!r}")
         fn = self._jobs[name]["fn"]
         ctx = context or self._context_factory()
-        return fn(ctx)
+        try:
+            result = fn(ctx)
+            self._record_result(name, result)
+            return result
+        except Exception as exc:
+            self._jobs[name]["last_error"] = str(exc)
+            self._jobs[name]["last_run"] = datetime.now(timezone.utc).isoformat()
+            raise
 
     def start(self) -> None:
         self._scheduler.start()
@@ -119,6 +144,14 @@ class AgentScheduler:
     @property
     def job_names(self) -> list[str]:
         return list(self._jobs.keys())
+
+    @property
+    def job_status(self) -> dict[str, dict]:
+        """Return serializable runtime status without exposing job callables."""
+        return {
+            name: {key: value for key, value in details.items() if key != "fn"}
+            for name, details in self._jobs.items()
+        }
 
     # ------------------------------------------------------------------
 

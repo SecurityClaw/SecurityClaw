@@ -1,0 +1,14 @@
+name: network_defense_monitor
+description: Monitors ARP and NDP neighbor integrity, interfaces, routes, and default gateways to identify potential spoofing and local network manipulation.
+routing_group: endpoint_network_defense
+capability_groups: [endpoint_security, network_defense, passive_monitoring, threat_hunting]
+answer_types: [ARP spoofing detection, NDP monitoring, gateway integrity, route changes, network defense]
+non_goals: [claiming spoofing from one observation, packet injection, automatic network isolation]
+supported_platforms: [linux, windows]
+risk_level: read_only
+artifact_outputs: [network_defense_findings, neighbor_inventory, route_inventory]
+alert_contract:
+  count_field: finding_count
+  findings_field: findings
+  default_severity: medium
+  title: Local network integrity changes require review
