@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -15,14 +16,15 @@ import yaml
 from dotenv import dotenv_values, load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from core.config import Config
 from core.skill_onboarding import discover_skill_requirements, get_missing_skill_variables
 from core.chat_router.logic import (
-    add_to_history,
+    add_assistant_message_to_history,
+    add_user_message_to_history,
     get_context_summary,
     list_conversations,
     load_conversation_history,
@@ -542,6 +544,7 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
     @app.post("/api/chat/stream")
     async def chat_stream(body: ChatRequest):
         conversation_id = body.conversation_id or str(uuid.uuid4())[:8]
+        add_user_message_to_history(conversation_id, body.message)
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
         done = asyncio.Event()
@@ -584,19 +587,27 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
                     thread_id=f"{conversation_id}-{uuid.uuid4().hex[:8]}",
                 )
                 result_box.update(orchestration)
-                add_to_history(
+                add_assistant_message_to_history(
                     conversation_id,
-                    body.message,
                     orchestration.get("response", ""),
                     orchestration.get("routing", {}),
                     orchestration.get("skill_results", {}),
                 )
             except Exception as exc:
                 error_box["message"] = str(exc)
+                add_assistant_message_to_history(
+                    conversation_id,
+                    f"The request could not be completed: {exc}",
+                    error=True,
+                )
             finally:
                 loop.call_soon_threadsafe(done.set)
 
-        asyncio.get_running_loop().run_in_executor(None, worker)
+        threading.Thread(
+            target=worker,
+            name=f"securityclaw-chat-{conversation_id}",
+            daemon=True,
+        ).start()
 
         async def event_stream():
             yield _sse("meta", {"conversation_id": conversation_id})
@@ -623,7 +634,26 @@ def create_app(*, enable_scheduler: bool = True) -> FastAPI:
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     if DIST_DIR.exists():
-        app.mount("/", StaticFiles(directory=str(DIST_DIR), html=True), name="web")
+        assets_dir = DIST_DIR / "assets"
+        if assets_dir.exists():
+            app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+        @app.get("/favicon.ico", include_in_schema=False)
+        async def favicon() -> Response:
+            favicon_path = DIST_DIR / "favicon.ico"
+            if favicon_path.is_file():
+                return FileResponse(favicon_path)
+            return Response(status_code=204)
+
+        @app.get("/{full_path:path}", include_in_schema=False)
+        async def spa_fallback(full_path: str):
+            if full_path.startswith("api/"):
+                raise HTTPException(status_code=404, detail="Not Found")
+
+            requested_path = (DIST_DIR / full_path).resolve()
+            if requested_path.is_relative_to(DIST_DIR.resolve()) and requested_path.is_file():
+                return FileResponse(requested_path)
+            return FileResponse(DIST_DIR / "index.html")
     else:
         @app.get("/")
         async def root() -> dict[str, str]:

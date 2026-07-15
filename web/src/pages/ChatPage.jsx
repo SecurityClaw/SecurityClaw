@@ -107,6 +107,19 @@ export default function ChatPage() {
     loadConversation(activeId)
   }, [activeId])
 
+  useEffect(() => {
+    if (!activeId) return undefined
+
+    const timer = window.setInterval(() => {
+      if (!isStreamingRef.current) {
+        loadConversation(activeId)
+        loadConversations()
+      }
+    }, 2000)
+
+    return () => window.clearInterval(timer)
+  }, [activeId])
+
   const newChat = () => {
     setMessages([])
     setSteps([])
@@ -232,6 +245,22 @@ export default function ChatPage() {
                 timestamp: responseTimestamp,
                 last_update: responseTimestamp,
               }))
+            }
+            await loadConversations()
+          }
+          if (event === 'error') {
+            const assistantMessageId = streamingMessageIdRef.current
+            if (assistantMessageId) {
+              setMessages((prev) => prev.map((message) => (
+                message.id === assistantMessageId
+                  ? {
+                      ...message,
+                      content: payload.message || 'The request could not be completed.',
+                      is_streaming: false,
+                      error: true,
+                    }
+                  : message
+              )))
             }
             await loadConversations()
           }

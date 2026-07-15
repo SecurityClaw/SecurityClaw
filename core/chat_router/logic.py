@@ -4103,6 +4103,44 @@ def add_to_history(conversation_id: str, question: str, answer: str,
     save_conversation_history(conversation_id, history)
 
 
+def add_user_message_to_history(conversation_id: str, question: str) -> None:
+    """Persist a user message before long-running chat processing begins."""
+    from datetime import datetime, timezone
+
+    history = load_conversation_history(conversation_id)
+    history.append({
+        "role": "user",
+        "content": question,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    save_conversation_history(conversation_id, history)
+
+
+def add_assistant_message_to_history(
+    conversation_id: str,
+    answer: str,
+    routing: dict | None = None,
+    skill_results: dict | None = None,
+    *,
+    error: bool = False,
+) -> None:
+    """Complete a previously persisted chat turn, including failed turns."""
+    from datetime import datetime, timezone
+
+    routing = routing or {}
+    history = load_conversation_history(conversation_id)
+    history.append({
+        "role": "assistant",
+        "content": answer,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "routing_skills": routing.get("skills", []),
+        "routing_reasoning": routing.get("reasoning", ""),
+        "skill_results": skill_results or {},
+        "error": error,
+    })
+    save_conversation_history(conversation_id, history)
+
+
 def get_context_summary(conversation_id: str, last_n: int = 3) -> str:
     """Get summary of recent conversation for context injection."""
     history = load_conversation_history(conversation_id)
