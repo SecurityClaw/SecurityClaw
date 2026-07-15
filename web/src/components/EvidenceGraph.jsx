@@ -69,13 +69,14 @@ function buildEvidenceGraph(skillResults = {}, annotations = {}) {
 }
 
 export default function EvidenceGraph({ skillResults = {}, storageKey = 'current' }) {
-  const graphRef = useRef()
+  const graph2DRef = useRef()
+  const graph3DRef = useRef()
   const wrapperRef = useRef()
   const previousNodeCountRef = useRef(0)
-  const fittedRendererRef = useRef(null)
+  const fittedRendererRef = useRef({ two: false, three: false })
   const stableGraphRef = useRef({ signature: '', graph: { nodes: [], links: [] } })
   const rendererGraphsRef = useRef({ two: { nodes: [], links: [] }, three: { nodes: [], links: [] } })
-  const [mode3d, setMode3d] = useState(false)
+  const [mode3d, setMode3d] = useState(true)
   const [labels, setLabels] = useState(false)
   const [query, setQuery] = useState('')
   const [typeFilter, setTypeFilter] = useState('all')
@@ -100,6 +101,7 @@ export default function EvidenceGraph({ skillResults = {}, storageKey = 'current
   useEffect(() => {
     stableGraphRef.current = { signature: '', graph: { nodes: [], links: [] } }
     rendererGraphsRef.current = { two: { nodes: [], links: [] }, three: { nodes: [], links: [] } }
+    fittedRendererRef.current = { two: false, three: false }
     previousNodeCountRef.current = 0
     setSelected(null)
     try { setAnnotations(JSON.parse(localStorage.getItem(annotationKey) || '{}')) } catch { setAnnotations({}) }
@@ -139,35 +141,41 @@ export default function EvidenceGraph({ skillResults = {}, storageKey = 'current
     const links = fullGraph.links.filter((link) => visible.has(typeof link.source === 'object' ? link.source.id : link.source) && visible.has(typeof link.target === 'object' ? link.target.id : link.target)).map((link) => ({ ...link, source: typeof link.source === 'object' ? link.source.id : link.source, target: typeof link.target === 'object' ? link.target.id : link.target }))
     return { nodes, links }
   }, [fullGraph, query, typeFilter])
-  const rendererGraph = useMemo(() => {
-    const rendererKey = mode3d ? 'three' : 'two'
-    const previousNodes = new Map(rendererGraphsRef.current[rendererKey].nodes.map((node) => [node.id, node]))
-    const next = {
-      nodes: graph.nodes.map((node) => {
-        const previous = previousNodes.get(node.id)
-        return previous ? { ...node, x: previous.x, y: previous.y, z: previous.z, vx: previous.vx, vy: previous.vy, vz: previous.vz, fx: previous.fx, fy: previous.fy, fz: previous.fz } : { ...node }
-      }),
-      links: graph.links.map((link) => ({
-        ...link,
-        source: typeof link.source === 'object' ? link.source.id : link.source,
-        target: typeof link.target === 'object' ? link.target.id : link.target,
-      })),
+  const rendererGraphs = useMemo(() => {
+    const updateRenderer = (rendererKey) => {
+      const previousNodes = new Map(rendererGraphsRef.current[rendererKey].nodes.map((node) => [node.id, node]))
+      const next = {
+        nodes: graph.nodes.map((node) => {
+          const previous = previousNodes.get(node.id)
+          return previous ? { ...node, x: previous.x, y: previous.y, z: previous.z, vx: previous.vx, vy: previous.vy, vz: previous.vz, fx: previous.fx, fy: previous.fy, fz: previous.fz } : { ...node }
+        }),
+        links: graph.links.map((link) => ({
+          ...link,
+          source: typeof link.source === 'object' ? link.source.id : link.source,
+          target: typeof link.target === 'object' ? link.target.id : link.target,
+        })),
+      }
+      rendererGraphsRef.current[rendererKey] = next
+      return next
     }
-    rendererGraphsRef.current[rendererKey] = next
-    return next
-  }, [graph, mode3d])
+    return { two: updateRenderer('two'), three: updateRenderer('three') }
+  }, [graph])
+
+  const activeGraphRef = () => mode3d ? graph3DRef.current : graph2DRef.current
 
   useEffect(() => {
     const firstEvidence = previousNodeCountRef.current <= 1 && graph.nodes.length > 1
     previousNodeCountRef.current = graph.nodes.length
     if (!firstEvidence) return undefined
-    const timer = window.setTimeout(() => graphRef.current?.zoomToFit?.(600, 70), 350)
+    const timer = window.setTimeout(() => {
+      graph2DRef.current?.zoomToFit?.(600, 70)
+      graph3DRef.current?.zoomToFit?.(600, 70)
+    }, 350)
     return () => window.clearTimeout(timer)
   }, [graph.nodes.length])
 
   useEffect(() => {
-    fittedRendererRef.current = null
-    const timer = window.setTimeout(() => graphRef.current?.zoomToFit?.(500, 70), 150)
+    const timer = window.setTimeout(() => activeGraphRef()?.zoomToFit?.(500, 70), 250)
     return () => window.clearTimeout(timer)
   }, [mode3d])
 
@@ -178,10 +186,10 @@ export default function EvidenceGraph({ skillResults = {}, storageKey = 'current
     if (mode3d && node.x != null) {
       const distance = 110
       const ratio = 1 + distance / Math.hypot(node.x || 1, node.y || 1, node.z || 1)
-      graphRef.current?.cameraPosition({ x: node.x * ratio, y: node.y * ratio, z: (node.z || 1) * ratio }, node, 900)
+      graph3DRef.current?.cameraPosition({ x: node.x * ratio, y: node.y * ratio, z: (node.z || 1) * ratio }, node, 900)
     } else {
-      graphRef.current?.centerAt(node.x, node.y, 700)
-      graphRef.current?.zoom(3.5, 700)
+      graph2DRef.current?.centerAt(node.x, node.y, 700)
+      graph2DRef.current?.zoom(3.5, 700)
     }
   }
   const exportGraph = () => {
@@ -198,13 +206,14 @@ export default function EvidenceGraph({ skillResults = {}, storageKey = 'current
     setEditing(false)
   }
   const resetLayout = () => {
-    rendererGraph.nodes.forEach((node) => { node.fx = undefined; node.fy = undefined; node.fz = undefined })
-    graphRef.current?.d3ReheatSimulation?.()
-    window.setTimeout(() => graphRef.current?.zoomToFit?.(700, 60), 500)
+    const activeGraph = mode3d ? rendererGraphs.three : rendererGraphs.two
+    activeGraph.nodes.forEach((node) => { node.fx = undefined; node.fy = undefined; node.fz = undefined })
+    activeGraphRef()?.d3ReheatSimulation?.()
+    window.setTimeout(() => activeGraphRef()?.zoomToFit?.(700, 60), 500)
   }
 
   if (fullGraph.nodes.length === 1) return <div className="p-6 text-sm text-dim">Run an endpoint investigation to generate an evidence graph.</div>
-  const common = { ref: graphRef, graphData: rendererGraph, width: size.width, height: size.height, nodeLabel, nodeColor, nodeVal: (node) => node.type === 'host' ? 8 : node.type === 'vulnerability' ? 6 : 3, linkLabel: (link) => link.type, linkColor: () => '#334155', linkDirectionalArrowLength: 4, linkDirectionalArrowRelPos: 1, onNodeClick: focusNode, onNodeDragEnd: (node) => { node.fx = node.x; node.fy = node.y; if (mode3d) node.fz = node.z }, backgroundColor: '#070d18', cooldownTicks: 120, cooldownTime: 4000, warmupTicks: 25, d3AlphaDecay: 0.06, d3VelocityDecay: 0.45 }
+  const common = { width: size.width, height: size.height, nodeLabel, nodeColor, nodeVal: (node) => node.type === 'host' ? 8 : node.type === 'vulnerability' ? 6 : 3, linkLabel: (link) => link.type, linkColor: () => '#334155', linkDirectionalArrowLength: 4, linkDirectionalArrowRelPos: 1, onNodeClick: focusNode, backgroundColor: '#070d18', cooldownTicks: 120, cooldownTime: 4000, warmupTicks: 25, d3AlphaDecay: 0.06, d3VelocityDecay: 0.45 }
 
   return (
     <div className={`relative flex min-h-0 flex-1 overflow-hidden bg-[#070d18] ${fullscreen ? 'fixed inset-0 z-50' : ''}`}>
@@ -214,14 +223,19 @@ export default function EvidenceGraph({ skillResults = {}, storageKey = 'current
           <select className="input" value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)}><option value="all">All node types</option>{types.map((type) => <option key={type}>{type}</option>)}</select>
           <button className={`btn ${mode3d ? 'btn-primary' : ''}`} onClick={() => setMode3d((value) => !value)}><Box className="h-4 w-4" /> {mode3d ? '3D' : '2D'}</button>
           <button className={`btn ${labels ? 'btn-primary' : ''}`} onClick={() => setLabels((value) => !value)}><Tags className="h-4 w-4" /> Labels</button>
-          <button className="btn" onClick={() => graphRef.current?.zoomToFit?.(700, 50)}><Focus className="h-4 w-4" /> Fit</button>
+          <button className="btn" onClick={() => activeGraphRef()?.zoomToFit?.(700, 50)}><Focus className="h-4 w-4" /> Fit</button>
           <button className="btn" onClick={resetLayout}><RotateCcw className="h-4 w-4" /> Reset</button>
           <button className="btn" onClick={() => setDetailsOpen((value) => !value)}>{detailsOpen ? <PanelRightClose className="h-4 w-4" /> : <PanelRightOpen className="h-4 w-4" />} Details</button>
           <button className="btn" onClick={() => setFullscreen((value) => !value)}>{fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />} {fullscreen ? 'Exit' : 'Expand'}</button>
           <button className="btn" onClick={exportGraph}><Download className="h-4 w-4" /> JSON</button>
         </div>
-        <div ref={wrapperRef} className="min-h-[520px] flex-1 overflow-hidden">
-          {mode3d ? <Suspense fallback={<div className="p-6 text-sm text-dim">Loading 3D renderer…</div>}><ForceGraph3D {...common} nodeLabel={nodeLabel} onEngineStop={() => { const controls = graphRef.current?.controls?.(); if (controls) controls.autoRotate = false; if (fittedRendererRef.current !== '3d') { fittedRendererRef.current = '3d'; graphRef.current?.zoomToFit?.(600, 70) } }} /></Suspense> : <ForceGraph2D {...common} nodeCanvasObjectMode={() => 'after'} nodeCanvasObject={(node, context, scale) => { if (!labels && rendererGraph.nodes.length > 24 && selected?.id !== node.id) return; context.font = `${Math.max(10 / scale, 2)}px sans-serif`; context.fillStyle = '#cbd5e1'; context.textAlign = 'center'; context.fillText(node.name.slice(0, 34), node.x, node.y + 8) }} />}
+        <div ref={wrapperRef} className="relative min-h-[520px] flex-1 overflow-hidden">
+          <div className={`absolute inset-0 ${mode3d ? 'visible pointer-events-auto' : 'invisible pointer-events-none'}`} aria-hidden={!mode3d}>
+            <Suspense fallback={<div className="p-6 text-sm text-dim">Loading 3D renderer…</div>}><ForceGraph3D ref={graph3DRef} {...common} graphData={rendererGraphs.three} onNodeDragEnd={(node) => { node.fx = node.x; node.fy = node.y; node.fz = node.z }} onEngineStop={() => { const controls = graph3DRef.current?.controls?.(); if (controls) controls.autoRotate = false; if (!fittedRendererRef.current.three) { fittedRendererRef.current.three = true; graph3DRef.current?.zoomToFit?.(600, 70) } }} /></Suspense>
+          </div>
+          <div className={`absolute inset-0 ${mode3d ? 'invisible pointer-events-none' : 'visible pointer-events-auto'}`} aria-hidden={mode3d}>
+            <ForceGraph2D ref={graph2DRef} {...common} graphData={rendererGraphs.two} onNodeDragEnd={(node) => { node.fx = node.x; node.fy = node.y }} nodeCanvasObjectMode={() => 'after'} nodeCanvasObject={(node, context, scale) => { if (!labels && rendererGraphs.two.nodes.length > 24 && selected?.id !== node.id) return; context.font = `${Math.max(10 / scale, 2)}px sans-serif`; context.fillStyle = '#cbd5e1'; context.textAlign = 'center'; context.fillText(node.name.slice(0, 34), node.x, node.y + 8) }} />
+          </div>
         </div>
       </div>
       {detailsOpen ? <aside className="absolute inset-y-0 right-0 z-20 w-80 overflow-auto border-l border-border bg-panel2/95 p-4 shadow-2xl backdrop-blur">
