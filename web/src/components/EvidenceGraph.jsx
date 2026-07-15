@@ -71,7 +71,7 @@ function buildEvidenceGraph(skillResults = {}, annotations = {}) {
 export default function EvidenceGraph({ skillResults = {}, storageKey = 'current' }) {
   const graph2DRef = useRef()
   const graph3DRef = useRef()
-  const wrapperRef = useRef()
+  const initialMeasurementRef = useRef(false)
   const previousNodeCountRef = useRef(0)
   const fittedRendererRef = useRef({ two: false, three: false })
   const stableGraphRef = useRef({ signature: '', graph: { nodes: [], links: [] } })
@@ -84,24 +84,37 @@ export default function EvidenceGraph({ skillResults = {}, storageKey = 'current
   const [editing, setEditing] = useState(false)
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [fullscreen, setFullscreen] = useState(false)
+  const [wrapperElement, setWrapperElement] = useState(null)
   const [size, setSize] = useState({ width: 900, height: 620 })
   const annotationKey = `securityclaw:graph-annotations:${storageKey}`
   const [annotations, setAnnotations] = useState(() => {
     try { return JSON.parse(localStorage.getItem(annotationKey) || '{}') } catch { return {} }
   })
   useEffect(() => {
+    if (!wrapperElement) return undefined
     const observer = new ResizeObserver(([entry]) => {
-      const next = { width: Math.max(620, Math.floor(entry.contentRect.width)), height: Math.max(520, Math.floor(entry.contentRect.height)) }
+      const next = { width: Math.max(1, Math.floor(entry.contentRect.width)), height: Math.max(1, Math.floor(entry.contentRect.height)) }
       setSize((current) => current.width === next.width && current.height === next.height ? current : next)
     })
-    if (wrapperRef.current) observer.observe(wrapperRef.current)
+    observer.observe(wrapperElement)
     return () => observer.disconnect()
-  }, [])
+  }, [wrapperElement])
+
+  useEffect(() => {
+    if (!wrapperElement || initialMeasurementRef.current) return undefined
+    initialMeasurementRef.current = true
+    const timer = window.setTimeout(() => {
+      graph2DRef.current?.zoomToFit?.(500, 60)
+      graph3DRef.current?.zoomToFit?.(500, 60)
+    }, 350)
+    return () => window.clearTimeout(timer)
+  }, [wrapperElement, size.width, size.height])
   useEffect(() => { localStorage.setItem(annotationKey, JSON.stringify(annotations)) }, [annotationKey, annotations])
   useEffect(() => {
     stableGraphRef.current = { signature: '', graph: { nodes: [], links: [] } }
     rendererGraphsRef.current = { two: { nodes: [], links: [] }, three: { nodes: [], links: [] } }
     fittedRendererRef.current = { two: false, three: false }
+    initialMeasurementRef.current = false
     previousNodeCountRef.current = 0
     setSelected(null)
     try { setAnnotations(JSON.parse(localStorage.getItem(annotationKey) || '{}')) } catch { setAnnotations({}) }
@@ -229,7 +242,7 @@ export default function EvidenceGraph({ skillResults = {}, storageKey = 'current
           <button className="btn" onClick={() => setFullscreen((value) => !value)}>{fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />} {fullscreen ? 'Exit' : 'Expand'}</button>
           <button className="btn" onClick={exportGraph}><Download className="h-4 w-4" /> JSON</button>
         </div>
-        <div ref={wrapperRef} className="relative min-h-[520px] flex-1 overflow-hidden">
+        <div ref={setWrapperElement} className="relative min-h-[520px] flex-1 overflow-hidden">
           <div className={`absolute inset-0 ${mode3d ? 'visible pointer-events-auto' : 'invisible pointer-events-none'}`} aria-hidden={!mode3d}>
             <Suspense fallback={<div className="p-6 text-sm text-dim">Loading 3D renderer…</div>}><ForceGraph3D ref={graph3DRef} {...common} graphData={rendererGraphs.three} onNodeDragEnd={(node) => { node.fx = node.x; node.fy = node.y; node.fz = node.z }} onEngineStop={() => { const controls = graph3DRef.current?.controls?.(); if (controls) controls.autoRotate = false; if (!fittedRendererRef.current.three) { fittedRendererRef.current.three = true; graph3DRef.current?.zoomToFit?.(600, 70) } }} /></Suspense>
           </div>
