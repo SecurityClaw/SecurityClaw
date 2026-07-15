@@ -100,6 +100,8 @@ export default function ChatPage() {
   const isNewConversationRef = useRef(false)
   const isStreamingRef = useRef(false)
   const isSendingRef = useRef(false)
+  const activeConversationRef = useRef(activeId)
+  const conversationLoadSequenceRef = useRef(0)
 
   const scrollToMessagesBottom = (behavior = 'auto') => {
     messagesEndRef.current?.scrollIntoView({ behavior, block: 'end' })
@@ -124,6 +126,7 @@ export default function ChatPage() {
   }
 
   const loadConversation = async (id) => {
+    const sequence = ++conversationLoadSequenceRef.current
     if (!id) {
       setMessages([])
       return
@@ -133,13 +136,18 @@ export default function ChatPage() {
       ...msg,
       id: msg.id || `${msg.timestamp}-${idx}`,
     }))
-    setMessages(loadedMessages)
+    if (sequence === conversationLoadSequenceRef.current && activeConversationRef.current === id) {
+      setMessages(loadedMessages)
+    }
   }
 
   useEffect(() => { loadConversations() }, [])
   useEffect(() => {
+    activeConversationRef.current = activeId
+    conversationLoadSequenceRef.current += 1
     if (!activeId) {
       setMessages([])
+      setSteps([])
       return
     }
     // Skip reloading if this conversation is currently receiving a stream
@@ -147,6 +155,8 @@ export default function ChatPage() {
       return
     }
     shouldAutoScrollRef.current = true
+    setMessages([])
+    setSteps([])
     loadConversation(activeId)
   }, [activeId])
 
@@ -363,14 +373,20 @@ export default function ChatPage() {
   }, [conversations])
 
   const currentStep = steps[steps.length - 1] || null
-  const latestEvidenceMessage = [...messages].reverse().find((message) => message.role === 'assistant' && message.skill_results) || {}
+  const conversationEvidenceResults = useMemo(() => {
+    const merged = {}
+    messages.forEach((message) => {
+      if (message.role === 'assistant' && message.skill_results) Object.assign(merged, message.skill_results)
+    })
+    return merged
+  }, [messages])
   const liveEvidenceResults = useMemo(() => {
-    const merged = { ...(latestEvidenceMessage.skill_results || {}) }
+    const merged = { ...conversationEvidenceResults }
     steps.forEach((step) => {
       if (step.kind === 'tool' && step.debug && typeof step.debug === 'object') Object.assign(merged, step.debug)
     })
     return merged
-  }, [latestEvidenceMessage, steps])
+  }, [conversationEvidenceResults, steps])
   const activity = getActivityCopy(currentStep)
   const activityPhrases = getActivityPhrases(currentStep)
   const activityPhrase = activityPhrases[activityPhraseIndex % activityPhrases.length]
@@ -414,7 +430,7 @@ export default function ChatPage() {
         <div className="min-h-0 flex-1 overflow-auto p-3 space-y-2">
           {orderedConversations.map((conv) => (
             <div key={conv.id} className={`rounded-xl border p-3 ${activeId === conv.id ? 'border-cyan bg-cyan/10' : 'border-border bg-panel2'}`}>
-              <button className="w-full text-left" onClick={() => navigate(`/agent/${conv.id}`)}>
+              <button className="w-full text-left" onClick={() => { setConversationsOpen(false); navigate(`/agent/${conv.id}`) }}>
                 <div className="truncate font-mono text-xs uppercase tracking-[0.14em] text-cyan">{conv.id}</div>
                 <div className="mt-1 line-clamp-2 text-sm text-text">{conv.first_question || conv.preview || 'Conversation'}</div>
                 <div className="mt-2 font-mono text-[11px] text-dim">{conv.messages} entries</div>
