@@ -1359,7 +1359,8 @@ def decide_node(state: AgentState, config: RunnableConfig) -> dict:
         manifests=all_manifests,
     )
     decision["skills"] = selected
-    # STEP 2: Review and refine the plan (review+repair cycle with deterministic grounding)
+    # Review and refine the proposed action before it can touch a tool. The
+    # supervisor will still receive the resulting observation on the next loop.
     decision = _review_and_refine_supervisor_plan(
         decision=decision,
         user_question=state["user_question"],
@@ -1504,6 +1505,7 @@ def decide_node(state: AgentState, config: RunnableConfig) -> dict:
         "pending_parameters": dict(decision.get("parameters") or {"question": state["user_question"]}),
         "pending_reasoning": str(decision.get("reasoning", "")),
         "pending_question_grounding": dict(decision.get("question_grounding") or {}),
+        "response_mode": "tools",
         "plan_exhausted": plan_exhausted,
     }
 
@@ -1551,11 +1553,26 @@ def execute_node(state: AgentState, config: RunnableConfig) -> dict:
     aggregated_results.update(step_results)
     previously_run_skills.append(_plan_signature(skill_plan, pending_parameters))
 
+    trace = list(state.get("trace") or [])
+    trace.append({
+        "step": step_count,
+        "decision": {
+            "reasoning": pending_reasoning,
+            "skills": skill_plan,
+            "parameters": pending_parameters,
+        },
+        "observations": {
+            name: _compact_prompt_value(result)
+            for name, result in step_results.items()
+        },
+    })
+
     mem_updates = graph_memory.to_dict()
 
     return {
         "skill_results": aggregated_results,
         "previously_run_skills": previously_run_skills,
+        "trace": trace,
         **mem_updates,
     }
 
@@ -1605,13 +1622,25 @@ def evaluate_node(state: AgentState, config: RunnableConfig) -> dict:
         planned_skills=skill_plan,
     )
 
-    trace.append({
+    evaluation_trace = {
         "step": step_count,
         "decision": {"skills": skill_plan},
         "selected_skills": skill_plan,
         "step_result_keys": list((state.get("skill_results") or {}).keys()),
         "evaluation": last_eval,
-    })
+    }
+    if (
+        trace
+        and trace[-1].get("step") == step_count
+        and "observations" in trace[-1]
+    ):
+        trace[-1].update({
+            "selected_skills": skill_plan,
+            "step_result_keys": evaluation_trace["step_result_keys"],
+            "evaluation": last_eval,
+        })
+    else:
+        trace.append(evaluation_trace)
 
     logger.info(
         "[%s] Graph step %d/%d | skills=%s | satisfied=%s (%.2f)",
@@ -1678,6 +1707,10 @@ def format_response_node(state: AgentState, config: RunnableConfig) -> dict:
         available_skills=available_skills,
         token_callback=token_callback if step_callback else None,
         conversation_history=list(state.get("messages") or []),
+        execution_trace=trace,
+        force_agent_synthesis=(
+            bool(aggregated_results) and state.get("response_mode") == "direct"
+        ),
     )
 
     return {
@@ -3214,6 +3247,8 @@ def format_response(
     available_skills: list[dict] | None = None,
     token_callback: Any = None,
     conversation_history: list[dict] | None = None,
+    execution_trace: list[dict] | None = None,
+    force_agent_synthesis: bool = False,
 ) -> str:
     """
     Format skill results into a natural language response with thinking-action-reflection loop.
@@ -3227,6 +3262,35 @@ def format_response(
     Uses manifest-declared response_formatter hooks when available.
     Falls back to hardcoded logic for backward compatibility.
     """
+    if force_agent_synthesis and skill_results:
+        synthesis_prompt = (
+            f"User request:\n{user_question}\n\n"
+            "Relevant recent conversation:\n"
+            f"{_build_conversation_context(conversation_history)}\n\n"
+            "Agent actions and observations:\n"
+            f"{json.dumps(execution_trace or [], indent=2, default=str)[:14000]}\n\n"
+            "Latest results by skill:\n"
+            f"{_build_result_context(skill_results, max_chars=14000)}\n\n"
+            "Answer the original request using all gathered evidence. Explain what the findings mean, "
+            "state uncertainty and gaps explicitly, and give proportionate next actions. Do not expose "
+            "internal planning, raw tool names, or unsupported conclusions. Reply in the user's language."
+        )
+        return _chat_response(
+            llm,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are SecurityClaw, an autonomous defensive security agent. "
+                        "Synthesize a clear, evidence-grounded final answer from the complete investigation."
+                    ),
+                },
+                {"role": "user", "content": synthesis_prompt},
+            ],
+            token_callback=token_callback,
+            phase="answer",
+        )
+
     if not routing_decision.get("skills"):
         # An empty plan is valid for conversational, identity, capability, and
         # explanatory questions. Let the model answer directly instead of

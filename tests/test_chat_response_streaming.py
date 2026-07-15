@@ -84,3 +84,28 @@ def test_no_tool_plan_answers_capability_question_instead_of_returning_error():
     assert "geoip_lookup" in llm.messages[1]["content"]
     assert "threat_analyst" in llm.messages[1]["content"]
     assert "The previous scan found port 443" in llm.messages[1]["content"]
+
+
+def test_agent_synthesis_uses_all_actions_and_observations():
+    llm = _DirectAnswerLLM()
+
+    response = format_response(
+        "Assess this host",
+        {"skills": ["search"]},
+        {"search": {"status": "ok", "results_count": 3}},
+        llm,
+        execution_trace=[
+            {
+                "step": 1,
+                "decision": {"skills": ["search"]},
+                "observations": {"search": {"results_count": 3}},
+            }
+        ],
+        force_agent_synthesis=True,
+        token_callback=lambda *_: None,
+    )
+
+    assert response.startswith("I am SecurityClaw")
+    assert "Agent actions and observations" in llm.messages[1]["content"]
+    assert '"results_count": 3' in llm.messages[1]["content"]
+    assert "complete investigation" in llm.messages[0]["content"]
