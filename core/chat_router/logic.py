@@ -3199,13 +3199,38 @@ def format_response(
     Falls back to hardcoded logic for backward compatibility.
     """
     if not routing_decision.get("skills"):
-        # Generate dynamic list of available skills instead of hardcoded fallback
-        if available_skills:
-            skill_names = [s.get("name") for s in available_skills if s.get("name")]
-            skills_str = ", ".join(sorted(skill_names))
-        else:
-            skills_str = "network_baseliner, anomaly_triage, threat_analyst"
-        return f"I couldn't determine which skills would help with that question. Available skills are: {skills_str}."
+        # An empty plan is valid for conversational, identity, capability, and
+        # explanatory questions. Let the model answer directly instead of
+        # treating the absence of a tool call as a routing failure.
+        skill_catalog = [
+            {
+                "name": skill.get("name"),
+                "description": skill.get("description", ""),
+            }
+            for skill in (available_skills or [])
+            if skill.get("name")
+        ]
+        direct_system_prompt = (
+            "You are SecurityClaw, a defensive security operations assistant. "
+            "Answer the user's question directly and in the same language as the user. "
+            "You may explain your identity, purpose, architecture, limitations, and available skills. "
+            "Do not invent capabilities, claim that a tool ran, or force a tool call when none is needed. "
+            "When describing skills, translate their purpose into clear user-facing language."
+        )
+        direct_user_prompt = (
+            f"User question:\n{user_question}\n\n"
+            "Currently available SecurityClaw skills:\n"
+            f"{json.dumps(skill_catalog, indent=2, default=str)}"
+        )
+        return _chat_response(
+            llm,
+            [
+                {"role": "system", "content": direct_system_prompt},
+                {"role": "user", "content": direct_user_prompt},
+            ],
+            token_callback=token_callback,
+            phase="answer",
+        )
     
     # ══════════════════════════════════════════════════════════════════════════════
     # PHASE 0: TRY MANIFEST-DECLARED FORMATTERS (NEW ARCHITECTURE)
