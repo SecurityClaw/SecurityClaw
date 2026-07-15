@@ -72,14 +72,16 @@ export default function EvidenceGraph({ skillResults = {}, storageKey = 'current
   const graphRef = useRef()
   const wrapperRef = useRef()
   const previousNodeCountRef = useRef(0)
+  const fittedRendererRef = useRef(null)
   const stableGraphRef = useRef({ signature: '', graph: { nodes: [], links: [] } })
+  const rendererGraphsRef = useRef({ two: { nodes: [], links: [] }, three: { nodes: [], links: [] } })
   const [mode3d, setMode3d] = useState(false)
   const [labels, setLabels] = useState(false)
   const [query, setQuery] = useState('')
   const [typeFilter, setTypeFilter] = useState('all')
   const [selected, setSelected] = useState(null)
   const [editing, setEditing] = useState(false)
-  const [detailsOpen, setDetailsOpen] = useState(true)
+  const [detailsOpen, setDetailsOpen] = useState(false)
   const [fullscreen, setFullscreen] = useState(false)
   const [size, setSize] = useState({ width: 900, height: 620 })
   const annotationKey = `securityclaw:graph-annotations:${storageKey}`
@@ -97,6 +99,7 @@ export default function EvidenceGraph({ skillResults = {}, storageKey = 'current
   useEffect(() => { localStorage.setItem(annotationKey, JSON.stringify(annotations)) }, [annotationKey, annotations])
   useEffect(() => {
     stableGraphRef.current = { signature: '', graph: { nodes: [], links: [] } }
+    rendererGraphsRef.current = { two: { nodes: [], links: [] }, three: { nodes: [], links: [] } }
     previousNodeCountRef.current = 0
     setSelected(null)
     try { setAnnotations(JSON.parse(localStorage.getItem(annotationKey) || '{}')) } catch { setAnnotations({}) }
@@ -136,6 +139,23 @@ export default function EvidenceGraph({ skillResults = {}, storageKey = 'current
     const links = fullGraph.links.filter((link) => visible.has(typeof link.source === 'object' ? link.source.id : link.source) && visible.has(typeof link.target === 'object' ? link.target.id : link.target)).map((link) => ({ ...link, source: typeof link.source === 'object' ? link.source.id : link.source, target: typeof link.target === 'object' ? link.target.id : link.target }))
     return { nodes, links }
   }, [fullGraph, query, typeFilter])
+  const rendererGraph = useMemo(() => {
+    const rendererKey = mode3d ? 'three' : 'two'
+    const previousNodes = new Map(rendererGraphsRef.current[rendererKey].nodes.map((node) => [node.id, node]))
+    const next = {
+      nodes: graph.nodes.map((node) => {
+        const previous = previousNodes.get(node.id)
+        return previous ? { ...node, x: previous.x, y: previous.y, z: previous.z, vx: previous.vx, vy: previous.vy, vz: previous.vz, fx: previous.fx, fy: previous.fy, fz: previous.fz } : { ...node }
+      }),
+      links: graph.links.map((link) => ({
+        ...link,
+        source: typeof link.source === 'object' ? link.source.id : link.source,
+        target: typeof link.target === 'object' ? link.target.id : link.target,
+      })),
+    }
+    rendererGraphsRef.current[rendererKey] = next
+    return next
+  }, [graph, mode3d])
 
   useEffect(() => {
     const firstEvidence = previousNodeCountRef.current <= 1 && graph.nodes.length > 1
@@ -146,6 +166,7 @@ export default function EvidenceGraph({ skillResults = {}, storageKey = 'current
   }, [graph.nodes.length])
 
   useEffect(() => {
+    fittedRendererRef.current = null
     const timer = window.setTimeout(() => graphRef.current?.zoomToFit?.(500, 70), 150)
     return () => window.clearTimeout(timer)
   }, [mode3d])
@@ -177,16 +198,16 @@ export default function EvidenceGraph({ skillResults = {}, storageKey = 'current
     setEditing(false)
   }
   const resetLayout = () => {
-    graph.nodes.forEach((node) => { node.fx = undefined; node.fy = undefined; node.fz = undefined })
+    rendererGraph.nodes.forEach((node) => { node.fx = undefined; node.fy = undefined; node.fz = undefined })
     graphRef.current?.d3ReheatSimulation?.()
     window.setTimeout(() => graphRef.current?.zoomToFit?.(700, 60), 500)
   }
 
   if (fullGraph.nodes.length === 1) return <div className="p-6 text-sm text-dim">Run an endpoint investigation to generate an evidence graph.</div>
-  const common = { ref: graphRef, graphData: graph, width: size.width, height: size.height, nodeLabel, nodeColor, nodeVal: (node) => node.type === 'host' ? 8 : node.type === 'vulnerability' ? 6 : 3, linkLabel: (link) => link.type, linkColor: () => '#334155', linkDirectionalArrowLength: 4, linkDirectionalArrowRelPos: 1, onNodeClick: focusNode, onNodeDragEnd: (node) => { node.fx = node.x; node.fy = node.y; if (mode3d) node.fz = node.z }, backgroundColor: '#070d18', cooldownTicks: 120, cooldownTime: 4000, warmupTicks: 25, d3AlphaDecay: 0.06, d3VelocityDecay: 0.45 }
+  const common = { ref: graphRef, graphData: rendererGraph, width: size.width, height: size.height, nodeLabel, nodeColor, nodeVal: (node) => node.type === 'host' ? 8 : node.type === 'vulnerability' ? 6 : 3, linkLabel: (link) => link.type, linkColor: () => '#334155', linkDirectionalArrowLength: 4, linkDirectionalArrowRelPos: 1, onNodeClick: focusNode, onNodeDragEnd: (node) => { node.fx = node.x; node.fy = node.y; if (mode3d) node.fz = node.z }, backgroundColor: '#070d18', cooldownTicks: 120, cooldownTime: 4000, warmupTicks: 25, d3AlphaDecay: 0.06, d3VelocityDecay: 0.45 }
 
   return (
-    <div className={`flex min-h-0 flex-1 overflow-hidden bg-[#070d18] ${fullscreen ? 'fixed inset-0 z-50' : ''}`}>
+    <div className={`relative flex min-h-0 flex-1 overflow-hidden bg-[#070d18] ${fullscreen ? 'fixed inset-0 z-50' : ''}`}>
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="flex flex-wrap items-center gap-2 border-b border-border p-3">
           <div className="relative min-w-56 flex-1"><Search className="absolute left-3 top-2.5 h-4 w-4 text-dim" /><input className="input w-full pl-9" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search nodes, evidence or CVE…" /></div>
@@ -200,10 +221,10 @@ export default function EvidenceGraph({ skillResults = {}, storageKey = 'current
           <button className="btn" onClick={exportGraph}><Download className="h-4 w-4" /> JSON</button>
         </div>
         <div ref={wrapperRef} className="min-h-[520px] flex-1 overflow-hidden">
-          {mode3d ? <Suspense fallback={<div className="p-6 text-sm text-dim">Loading 3D renderer…</div>}><ForceGraph3D {...common} nodeLabel={nodeLabel} onEngineStop={() => { const controls = graphRef.current?.controls?.(); if (controls) controls.autoRotate = false }} /></Suspense> : <ForceGraph2D {...common} nodeCanvasObjectMode={() => 'after'} nodeCanvasObject={(node, context, scale) => { if (!labels && graph.nodes.length > 24 && selected?.id !== node.id) return; context.font = `${Math.max(10 / scale, 2)}px sans-serif`; context.fillStyle = '#cbd5e1'; context.textAlign = 'center'; context.fillText(node.name.slice(0, 34), node.x, node.y + 8) }} />}
+          {mode3d ? <Suspense fallback={<div className="p-6 text-sm text-dim">Loading 3D renderer…</div>}><ForceGraph3D {...common} nodeLabel={nodeLabel} onEngineStop={() => { const controls = graphRef.current?.controls?.(); if (controls) controls.autoRotate = false; if (fittedRendererRef.current !== '3d') { fittedRendererRef.current = '3d'; graphRef.current?.zoomToFit?.(600, 70) } }} /></Suspense> : <ForceGraph2D {...common} nodeCanvasObjectMode={() => 'after'} nodeCanvasObject={(node, context, scale) => { if (!labels && rendererGraph.nodes.length > 24 && selected?.id !== node.id) return; context.font = `${Math.max(10 / scale, 2)}px sans-serif`; context.fillStyle = '#cbd5e1'; context.textAlign = 'center'; context.fillText(node.name.slice(0, 34), node.x, node.y + 8) }} />}
         </div>
       </div>
-      {detailsOpen ? <aside className="w-80 shrink-0 overflow-auto border-l border-border bg-panel2 p-4">
+      {detailsOpen ? <aside className="absolute inset-y-0 right-0 z-20 w-80 overflow-auto border-l border-border bg-panel2/95 p-4 shadow-2xl backdrop-blur">
         {!selected ? <div className="text-sm text-dim">Select a node to inspect its evidence and add analyst annotations.</div> : <>
           <div className="flex items-start justify-between gap-2"><div><span className="badge badge-green">{selected.type}</span><h3 className="mt-2 break-words text-lg font-semibold text-text">{selected.name}</h3></div><button className="btn" onClick={() => setEditing((value) => !value)}><Pencil className="h-4 w-4" /></button></div>
           <p className="mt-3 text-sm text-dim">{selected.description}</p>

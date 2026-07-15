@@ -5,7 +5,7 @@ import { useEffect, useState } from 'react'
 
 const links = [
   { to: '/status', label: 'STATUS', icon: Activity },
-  { to: '/agent', label: 'GRAPH', icon: Bot },
+  { to: '/agent', label: 'AGENT', icon: Bot },
   { to: '/alerts', label: 'ALERTS', icon: BellRing },
   { to: '/skills', label: 'SKILLS', icon: Cpu },
   { to: '/config', label: 'CONFIG', icon: Settings },
