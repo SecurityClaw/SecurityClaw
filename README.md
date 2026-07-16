@@ -1,4 +1,7 @@
 # SecurityClaw — Autonomous SOC Agentic Framework
+<!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
+[![All Contributors](https://img.shields.io/badge/all_contributors-2-orange.svg?style=flat-square)](#contributors-)
+<!-- ALL-CONTRIBUTORS-BADGE:END -->
 
 A modular, skill-based autonomous Security Operations Center (SOC) agent that monitors OpenSearch/Elasticsearch data, builds RAG-based behavioral memory, and validates real-time anomalies using LLMs.
 
@@ -725,4 +728,34 @@ For issues, questions, or feature requests, open an issue or contact the Securit
   git grep -nEI '(password|api[_-]?key|BEGIN [A-Z ]*PRIVATE KEY|sk-)' -- .
   git log --all -G 'password|api[_-]?key|sk-' --oneline
 
+## Contributors ✨
 
+Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/docs/en/emoji-key)):
+
+<!-- ALL-CONTRIBUTORS-LIST:START - Do not remove or modify this section -->
+<!-- prettier-ignore-start -->
+<!-- markdownlint-disable -->
+<table>
+  <tbody>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="http://michael.tsikerdekis.com/"><img src="https://avatars.githubusercontent.com/u/232134?v=4?s=100" width="100px;" alt="Michael Tsikerdekis"/><br /><sub><b>Michael Tsikerdekis</b></sub></a><br /><a href="https://github.com/tsikerdekis/SecurityClaw/commits?author=tsikerdekis" title="Code">💻</a> <a href="https://github.com/tsikerdekis/SecurityClaw/commits?author=tsikerdekis" title="Documentation">📖</a> <a href="#design-tsikerdekis" title="Design">🎨</a> <a href="#ideas-tsikerdekis" title="Ideas, Planning, & Feedback">🤔</a> <a href="#infra-tsikerdekis" title="Infrastructure (Hosting, Build-Tools, etc)">🚇</a> <a href="https://github.com/tsikerdekis/SecurityClaw/commits?author=tsikerdekis" title="Tests">⚠️</a> <a href="#maintenance-tsikerdekis" title="Maintenance">🚧</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://kroryandev.com/"><img src="https://avatars.githubusercontent.com/u/69607760?v=4?s=100" width="100px;" alt="KroX"/><br /><sub><b>KroX</b></sub></a><br /><a href="https://github.com/tsikerdekis/SecurityClaw/commits?author=kroryan" title="Code">💻</a> <a href="https://github.com/tsikerdekis/SecurityClaw/commits?author=kroryan" title="Documentation">📖</a> <a href="#ideas-kroryan" title="Ideas, Planning, & Feedback">🤔</a></td>
+    </tr>
+  </tbody>
+  <tfoot>
+    <tr>
+      <td align="center" size="13px" colspan="7">
+        <img src="https://raw.githubusercontent.com/all-contributors/all-contributors-cli/1b8533af435da9854653492b1327a23a4dbd0a10/assets/logo-small.svg">
+          <a href="https://all-contributors.js.org/docs/en/bot/usage">Add your contributions</a>
+        </img>
+      </td>
+    </tr>
+  </tfoot>
+</table>
+
+<!-- markdownlint-restore -->
+<!-- prettier-ignore-end -->
+
+<!-- ALL-CONTRIBUTORS-LIST:END -->
+
+This project follows the [all-contributors](https://github.com/all-contributors/all-contributors) specification. Contributions of any kind welcome!
