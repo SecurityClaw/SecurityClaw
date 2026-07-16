@@ -1,4 +1,9 @@
-"""Read-only endpoint telemetry collectors for Linux and Windows."""
+"""Read-only endpoint telemetry collectors for Linux and Windows.
+
+Moved from core/endpoint_security.py to a proper skill to eliminate the
+core middle-layer anti-pattern. Skills that need endpoint telemetry should
+declare a prerequisite on the endpoint_telemetry routing group.
+"""
 
 from __future__ import annotations
 
@@ -476,3 +481,46 @@ def classify_vulnerability_severity(vulnerability: dict[str, Any]) -> tuple[floa
         if label in {"critical", "high", "medium", "moderate", "low"}:
             return None, "medium" if label == "moderate" else label, "published_severity"
     return None, "unknown", "not_provided"
+
+
+def run(context: dict) -> dict:
+    """Dispatch to the requested telemetry collection function based on parameters."""
+    parameters = context.get("parameters") or {}
+    collection = str(parameters.get("collection") or "").strip()
+    limit = int(parameters.get("limit", 500))
+
+    if collection == "inventory":
+        return collect_inventory()
+    elif collection == "processes":
+        return collect_processes(limit=limit)
+    elif collection == "network_connections":
+        return collect_network_connections(limit=limit)
+    elif collection == "network_defense":
+        return collect_network_defense(limit=limit)
+    elif collection == "persistence":
+        return collect_persistence(limit=limit)
+    elif collection == "file_integrity":
+        paths = parameters.get("paths")
+        if isinstance(paths, str):
+            paths = [paths]
+        return collect_file_integrity(paths=paths, max_files=int(parameters.get("max_files", 1000)))
+    elif collection == "software_inventory":
+        return collect_software_inventory(limit=limit)
+    elif collection == "security_posture":
+        return collect_security_posture(limit=limit)
+    elif collection == "vulnerabilities":
+        packages = (context.get("previous_results") or {}).get("software_inventory", {}).get("packages") or []
+        return scan_vulnerabilities(packages, max_packages=int(parameters.get("max_packages", 300)))
+    else:
+        # Return all telemetry as a comprehensive snapshot
+        return {
+            "status": "ok",
+            "inventory": collect_inventory(),
+            "processes": collect_processes(limit=limit),
+            "network_connections": collect_network_connections(limit=limit),
+            "network_defense": collect_network_defense(limit=limit),
+            "persistence": collect_persistence(limit=limit),
+            "file_integrity": collect_file_integrity(max_files=int(parameters.get("max_files", 1000))),
+            "software_inventory": collect_software_inventory(limit=limit),
+            "security_posture": collect_security_posture(limit=limit),
+        }

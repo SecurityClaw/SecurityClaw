@@ -1,4 +1,4 @@
-from core.endpoint_security import collect_processes
+from skills.endpoint_telemetry.logic import collect_processes
 
 _previous_processes: set[tuple] | None = None
 

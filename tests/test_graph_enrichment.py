@@ -73,7 +73,7 @@ def test_private_network_nodes_never_trigger_public_reputation_queries(monkeypat
     monkeypatch.setattr(module, "CACHE_PATH", tmp_path / "cache.json")
     monkeypatch.setattr(module, "_cache", {})
     reputation = Mock()
-    monkeypatch.setattr(module, "get_ip_reputation", reputation)
+    monkeypatch.setattr(module, "_enrichers", {"geoip": None, "ip_reputation": reputation, "domain_reputation": None})
     llm = SimpleNamespace(chat=lambda *args, **kwargs: "[]")
     nodes = [{"id": "network:private", "name": "10.0.0.5:443", "type": "network", "evidence": {"remote": "10.0.0.5:443"}}]
 

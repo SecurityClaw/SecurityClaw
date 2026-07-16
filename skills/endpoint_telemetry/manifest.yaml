@@ -1,0 +1,9 @@
+name: endpoint_telemetry
+description: Collects read-only endpoint telemetry from Linux and Windows hosts including processes, network connections, persistence, file integrity, software inventory, and security posture.
+routing_group: endpoint_telemetry
+capability_groups: [endpoint_security, host_telemetry, system_inventory]
+answer_types: [host inventory, running processes, network connections, persistence mechanisms, file integrity, software inventory, security posture, vulnerability scan]
+non_goals: [modifying the host, terminating processes, changing firewall rules, installing software]
+supported_platforms: [linux, windows]
+risk_level: read_only
+artifact_outputs: [host_inventory, process_snapshot, network_snapshot, persistence_snapshot, file_integrity_snapshot, software_inventory, security_posture, vulnerability_findings]

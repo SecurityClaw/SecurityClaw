@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from core.endpoint_security import collect_network_defense
+from skills.endpoint_telemetry.logic import collect_network_defense
 
 STATE_PATH = Path("data/network_defense_state.json")
 

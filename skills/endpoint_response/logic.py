@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 from core.action_authorization import consume_authorization, request_authorization
-from core.endpoint_security import platform_name
+from skills.endpoint_telemetry.logic import platform_name
 
 
 def _arguments(action: str, parameters: dict) -> dict:
@@ -66,8 +66,12 @@ def _execute(action: str, arguments: dict) -> dict:
         ip = arguments["ip"]
         interface = arguments["interface"]
         if platform_name() == "windows":
-            script = f"Get-NetNeighbor -IPAddress '{ip}' -ErrorAction Stop | Remove-NetNeighbor -Confirm:$false"
-            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "param($ip); Get-NetNeighbor -IPAddress $ip -ErrorAction Stop | Remove-NetNeighbor -Confirm:$false",
+                 "-ip", ip],
+                check=True, capture_output=True, text=True,
+            )
         else:
             subprocess.run(["ip", "neigh", "del", ip, "dev", interface], check=True, capture_output=True, text=True)
         return {"status": "ok", "action": action, "ip": ip, "interface": interface}

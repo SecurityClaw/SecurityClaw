@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from core.endpoint_security import (
+from skills.endpoint_telemetry.logic import (
     collect_file_integrity,
     collect_network_connections,
     collect_persistence,

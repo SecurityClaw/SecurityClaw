@@ -1,4 +1,4 @@
-from core.endpoint_security import collect_network_connections, filter_securityclaw_connections
+from skills.endpoint_telemetry.logic import collect_network_connections, filter_securityclaw_connections
 
 _previous_connections: set[str] | None = None
 

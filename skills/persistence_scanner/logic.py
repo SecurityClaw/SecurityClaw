@@ -1,4 +1,4 @@
-from core.endpoint_security import collect_persistence
+from skills.endpoint_telemetry.logic import collect_persistence
 
 
 def run(context: dict) -> dict:

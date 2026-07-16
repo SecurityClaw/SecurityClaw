@@ -5,6 +5,10 @@ module adds context in a strict order: local evidence, specialist threat
 intelligence/GeoIP/OSV data, and finally a narrowly scoped DuckDuckGo instant
 answer when the security sources have no useful context.  An LLM only
 summarizes the structured evidence; it is never used as a source of facts.
+
+Enrichment functions are injected at startup via set_enrichers() to avoid
+hardcoded skill imports in core. Callers should register enrichment callables
+from the skill registry rather than importing skills directly.
 """
 from __future__ import annotations
 
@@ -17,14 +21,32 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
-from skills.geoip_lookup.logic import run as run_geoip_lookup
-from skills.threat_analyst.reputation_intel import get_domain_reputation, get_ip_reputation
-
 logger = logging.getLogger(__name__)
+
+# Enrichment function registry — populated at startup by the application layer
+# to avoid hardcoded skill imports in core. Each enricher is a callable that
+# accepts (ip_or_domain: str) -> dict.
+_enrichers: dict[str, Callable[..., dict[str, Any]]] = {
+    "geoip": None,       # fn(ip: str, cfg: Any) -> dict
+    "ip_reputation": None,   # fn(ip: str) -> dict
+    "domain_reputation": None,  # fn(domain: str) -> dict
+}
+
+
+def set_enrichers(*, geoip: Callable | None = None,
+                  ip_reputation: Callable | None = None,
+                  domain_reputation: Callable | None = None) -> None:
+    """Register enrichment callables at startup. Called by the application layer."""
+    if geoip is not None:
+        _enrichers["geoip"] = geoip
+    if ip_reputation is not None:
+        _enrichers["ip_reputation"] = ip_reputation
+    if domain_reputation is not None:
+        _enrichers["domain_reputation"] = domain_reputation
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE_PATH = ROOT / "data" / "graph_enrichment_cache.json"
@@ -151,7 +173,10 @@ def _cve(node: dict[str, Any]) -> str | None:
 
 
 def _geoip(ip: str, cfg: Any) -> dict[str, Any]:
-    result = run_geoip_lookup({"parameters": {"ip": ip}, "config": cfg})
+    geoip_fn = _enrichers.get("geoip")
+    if not geoip_fn:
+        return {}
+    result = geoip_fn({"parameters": {"ip": ip}, "config": cfg})
     if result.get("status") != "ok":
         return {}
     return {
@@ -216,19 +241,25 @@ def _specialist_context(node: dict[str, Any], cfg: Any, timeout: float, web_fall
     cve = _cve(node)
     try:
         if ip:
-            reputation = get_ip_reputation(ip)
-            if reputation.get("queries"):
-                context["reputation"] = _trim(reputation)
-                context["sources"].extend(reputation["queries"])
-            geo = _geoip(ip, cfg)
-            if geo:
-                context["geoip"] = _trim(geo)
-                context["sources"].append(str(geo.get("provider") or "geoip"))
+            ip_reputation_fn = _enrichers.get("ip_reputation")
+            if ip_reputation_fn:
+                reputation = ip_reputation_fn(ip)
+                if reputation.get("queries"):
+                    context["reputation"] = _trim(reputation)
+                    context["sources"].extend(reputation["queries"])
+            geoip_fn = _enrichers.get("geoip")
+            if geoip_fn:
+                geo = geoip_fn(ip, cfg)
+                if geo:
+                    context["geoip"] = _trim(geo)
+                    context["sources"].append(str(geo.get("provider") or "geoip"))
         elif domain:
-            reputation = get_domain_reputation(domain)
-            if reputation.get("queries"):
-                context["reputation"] = _trim(reputation)
-                context["sources"].extend(reputation["queries"])
+            domain_reputation_fn = _enrichers.get("domain_reputation")
+            if domain_reputation_fn:
+                reputation = domain_reputation_fn(domain)
+                if reputation.get("queries"):
+                    context["reputation"] = _trim(reputation)
+                    context["sources"].extend(reputation["queries"])
         if cve:
             osv = _osv(cve, timeout)
             if osv:

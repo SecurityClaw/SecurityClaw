@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from core import endpoint_security
+from skills.endpoint_telemetry import logic as endpoint_security
 from core.action_authorization import consume_authorization, request_authorization, revoke_authorization
 from core.chat_router.logic import _build_skill_catalog
 from core.skill_loader import SkillLoader

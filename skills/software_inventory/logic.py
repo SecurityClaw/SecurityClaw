@@ -1,6 +1,6 @@
 """Versioned software inventory skill."""
 
-from core.endpoint_security import collect_software_inventory
+from skills.endpoint_telemetry.logic import collect_software_inventory
 
 
 def run(context: dict) -> dict:

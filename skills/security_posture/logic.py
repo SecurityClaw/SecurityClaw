@@ -1,6 +1,6 @@
 """Endpoint defensive posture skill."""
 
-from core.endpoint_security import collect_security_posture
+from skills.endpoint_telemetry.logic import collect_security_posture
 
 
 def run(context: dict) -> dict:

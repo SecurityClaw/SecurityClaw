@@ -1,4 +1,4 @@
-from core.endpoint_security import collect_file_integrity
+from skills.endpoint_telemetry.logic import collect_file_integrity
 
 _previous_hashes: dict[str, str] | None = None
 

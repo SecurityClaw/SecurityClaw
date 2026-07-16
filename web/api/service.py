@@ -7,6 +7,7 @@ from typing import Any
 
 from core.config import Config
 from core.db_connector import OpenSearchConnector
+from core.graph_enrichment import set_enrichers
 from core.llm_provider import build_llm_provider
 from core.runner import Runner
 from core.skill_loader import SkillLoader
@@ -52,6 +53,15 @@ class SecurityClawService:
                 runner=runner,
                 skill_loader=SkillLoader(),
                 manifest_loader=SkillManifestLoader(),
+            )
+
+            # Register enrichment callables to avoid hardcoded skill imports in core.
+            from skills.geoip_lookup.logic import run as geoip_run
+            from skills.threat_analyst.reputation_intel import get_domain_reputation, get_ip_reputation
+            set_enrichers(
+                geoip=geoip_run,
+                ip_reputation=get_ip_reputation,
+                domain_reputation=get_domain_reputation,
             )
 
     def stop(self) -> None:

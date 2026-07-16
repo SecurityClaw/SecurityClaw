@@ -1,4 +1,4 @@
-from core.endpoint_security import collect_inventory
+from skills.endpoint_telemetry.logic import collect_inventory
 
 
 def run(context: dict) -> dict:
